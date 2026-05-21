@@ -1,0 +1,6 @@
+// Windows resource script for ngsm.exe.
+//
+// `IDI_ICON1` (numeric ID 1) is the convention Explorer/the Shell uses
+// when displaying an executable's file icon. We point it at the
+// multi-resolution .ico we generate from the source logo.
+1 ICON "assets/logo.ico"

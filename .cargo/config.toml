@@ -1,0 +1,9 @@
+# Statically link the Visual C++ runtime (vcruntime140.dll, msvcp_win, etc.)
+# so the produced binary has zero non-system dependencies. Required for
+# "drop the .exe on any Windows machine" portability.
+#
+# The `cfg(windows)` filter applies the flag to every Windows target triple
+# (x86_64, aarch64, i686) rather than just `x86_64-pc-windows-msvc`, so the
+# portability guarantee holds regardless of which Windows target is built.
+[target.'cfg(windows)']
+rustflags = ["-C", "target-feature=+crt-static"]

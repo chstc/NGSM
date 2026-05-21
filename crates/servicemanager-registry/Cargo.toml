@@ -1,0 +1,16 @@
+[package]
+name = "servicemanager-registry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NSSM-compatible registry layout read/write adapter."
+publish = false
+
+[dependencies]
+servicemanager-core = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }

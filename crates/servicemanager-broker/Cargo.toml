@@ -1,0 +1,20 @@
+[package]
+name = "servicemanager-broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Elevated named-pipe broker that serves privileged requests from the GUI."
+publish = false
+
+[dependencies]
+servicemanager-core = { workspace = true }
+servicemanager-win32 = { workspace = true }
+servicemanager-registry = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }

@@ -1,0 +1,17 @@
+[package]
+name = "servicemanager-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Domain models, validation, and shared types for NGSM."
+# Application workspace, not a library distribution — never published.
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

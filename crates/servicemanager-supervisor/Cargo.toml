@@ -1,0 +1,15 @@
+[package]
+name = "servicemanager-supervisor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Runtime supervision of managed child processes (Phase 2)."
+publish = false
+
+[dependencies]
+servicemanager-core = { workspace = true }
+servicemanager-win32 = { workspace = true }
+thiserror = { workspace = true }
+os_pipe = { workspace = true }

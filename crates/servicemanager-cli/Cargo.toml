@@ -1,0 +1,34 @@
+[package]
+name = "servicemanager-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NGSM command-line interface (Phase 1: list / dump)."
+publish = false
+
+[[bin]]
+name = "ngsm"
+path = "src/main.rs"
+
+[build-dependencies]
+embed-resource = "3"
+
+[dependencies]
+servicemanager-core = { workspace = true }
+servicemanager-win32 = { workspace = true }
+servicemanager-registry = { workspace = true }
+servicemanager-runner = { workspace = true }
+servicemanager-gui = { workspace = true }
+servicemanager-broker = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+
+[features]
+default = []
+# Bundle the elevated named-pipe broker. Off by default to keep the
+# binary minimal; opt in with `cargo build --features broker` when you
+# want headless automation against a running broker.
+broker = ["dep:servicemanager-broker"]

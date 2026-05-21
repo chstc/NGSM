@@ -1,0 +1,17 @@
+# Build output
+/target/
+
+# Editor / OS noise
+*.rs.bk
+*.swp
+*.swo
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local working files — code-review notes and scratch build logs.
+# Not part of the project.
+/Findings.md
+/build.log
+/check.log

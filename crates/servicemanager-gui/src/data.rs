@@ -1,0 +1,447 @@
+//! Background worker for the egui thread.
+//!
+//! Win32 calls (SCM enumerate, registry read, install, etc.) can take
+//! tens to hundreds of milliseconds; running them on the UI thread would
+//! freeze the frame. We send `Job`s to a worker and post `JobResult`s
+//! back, requesting a repaint after each so egui picks them up promptly.
+
+use std::sync::mpsc::{Receiver, Sender};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use eframe::egui;
+use servicemanager_core::{
+    IoRedirectionConfig, IoStream, ManagedApplicationConfig, ServiceDefinition,
+};
+use servicemanager_win32::{
+    build_run_service_command, control_service, enumerate_descendants, enumerate_services,
+    install_service, query_service, remove_service, start_service, update_native_config,
+    InstallOptions, InstallStartType, ProcessInfo, ServiceControlSignal, SERVICE_CONTROL_ROTATE,
+};
+
+/// Wrap a log-file path in a plain [`IoStream`] (default share/disposition).
+fn io_stream(path: String) -> IoStream {
+    IoStream {
+        path,
+        share_mode: None,
+        creation_disposition: None,
+        flags_and_attributes: None,
+        copy_and_truncate: None,
+    }
+}
+
+/// A unit of work the UI hands to the worker thread.
+pub enum Job {
+    Refresh,
+    Install(InstallSpec),
+    Edit(EditSpec),
+    Start(String),
+    Stop(String),
+    Restart(String),
+    Pause(String),
+    Continue(String),
+    Rotate(String),
+    Remove(String),
+    Processes(String),
+}
+
+/// A result the worker posts back to the UI.
+pub enum JobResult {
+    Services {
+        defs: Vec<ServiceDefinition>,
+        /// Per-service managed-config read failures (access denied, corrupt
+        /// values, ...). The rows are still shown; these are surfaced as a
+        /// status-bar warning instead of being silently dropped.
+        warnings: Vec<String>,
+    },
+    Processes {
+        service: String,
+        root_pid: u32,
+        processes: Vec<ProcessInfo>,
+    },
+    /// A privileged action ran (e.g. `Install`). Stash the success message;
+    /// the UI shows it in the status bar.
+    Acted(String),
+    Error(String),
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct InstallSpec {
+    pub name: String,
+    pub display_name: Option<String>,
+    pub application: String,
+    pub app_parameters: Option<String>,
+    pub app_directory: Option<String>,
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
+    pub start_type: InstallStartType,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct EditSpec {
+    pub name: String,
+    pub display_name: Option<String>,
+    pub application: Option<String>,
+    pub app_parameters: Option<String>,
+    pub app_directory: Option<String>,
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
+    pub start_type: Option<InstallStartType>,
+}
+
+/// Spawn the worker thread. Returns the job sender; results land on
+/// `result_tx`. The worker requests an egui repaint after each result.
+pub fn spawn_worker(result_tx: Sender<JobResult>, ctx: egui::Context) -> Sender<Job> {
+    let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
+    thread::spawn(move || worker_loop(job_rx, result_tx, ctx));
+    job_tx
+}
+
+fn worker_loop(rx: Receiver<Job>, tx: Sender<JobResult>, ctx: egui::Context) {
+    while let Ok(job) = rx.recv() {
+        let result = execute(job);
+        let _ = tx.send(result);
+        ctx.request_repaint();
+    }
+}
+
+fn execute(job: Job) -> JobResult {
+    match job {
+        Job::Refresh => match list_services() {
+            Ok((defs, warnings)) => JobResult::Services { defs, warnings },
+            Err(e) => JobResult::Error(format!("enumerate: {e}")),
+        },
+        Job::Install(spec) => match install(spec) {
+            Ok(msg) => JobResult::Acted(msg),
+            Err(e) => JobResult::Error(e),
+        },
+        Job::Edit(spec) => match edit(spec) {
+            Ok(msg) => JobResult::Acted(msg),
+            Err(e) => JobResult::Error(e),
+        },
+        Job::Start(n) => simple(&n, "Start requested", || {
+            ensure_ngsm_managed(&n)?;
+            start_service(&n)
+        }),
+        Job::Stop(n) => simple_with(&n, "Stop requested", || {
+            ensure_ngsm_managed(&n)?;
+            control_service(&n, ServiceControlSignal::Stop).map(|_| ())
+        }),
+        Job::Pause(n) => simple_with(&n, "Pause requested", || {
+            ensure_ngsm_managed(&n)?;
+            control_service(&n, ServiceControlSignal::Pause).map(|_| ())
+        }),
+        Job::Continue(n) => simple_with(&n, "Continue requested", || {
+            ensure_ngsm_managed(&n)?;
+            control_service(&n, ServiceControlSignal::Continue).map(|_| ())
+        }),
+        Job::Rotate(n) => match rotate(&n) {
+            Ok(msg) => JobResult::Acted(msg),
+            Err(e) => JobResult::Error(e),
+        },
+        Job::Restart(n) => match restart(&n) {
+            Ok(msg) => JobResult::Acted(msg),
+            Err(e) => JobResult::Error(e),
+        },
+        Job::Remove(n) => match remove(&n) {
+            Ok(msg) => JobResult::Acted(msg),
+            Err(e) => JobResult::Error(e),
+        },
+        Job::Processes(n) => match processes(&n) {
+            Ok(r) => r,
+            Err(e) => JobResult::Error(e),
+        },
+    }
+}
+
+fn simple(
+    name: &str,
+    label: &str,
+    f: impl FnOnce() -> servicemanager_core::Result<()>,
+) -> JobResult {
+    match f() {
+        Ok(()) => JobResult::Acted(format!("{label} for '{name}'.")),
+        Err(e) => JobResult::Error(format!("{name}: {e}")),
+    }
+}
+
+fn simple_with(
+    name: &str,
+    label: &str,
+    f: impl FnOnce() -> servicemanager_core::Result<()>,
+) -> JobResult {
+    simple(name, label, f)
+}
+
+#[allow(clippy::type_complexity)]
+pub fn list_services() -> servicemanager_core::Result<(Vec<ServiceDefinition>, Vec<String>)> {
+    let mut warnings: Vec<String> = Vec::new();
+    let mut defs: Vec<ServiceDefinition> = enumerate_services()?
+        .into_iter()
+        .map(|s| {
+            // A failed SCM config query during enumeration left this entry
+            // with only partial data — surface it rather than silently
+            // classifying the service from incomplete fields.
+            if let Some(w) = s.query_error {
+                warnings.push(w);
+            }
+            // A genuine managed-config read failure (access denied, corrupt
+            // value) is kept as a warning rather than collapsed into "not
+            // managed".
+            let managed = match servicemanager_registry::read_managed_config(&s.config.name) {
+                Ok(m) => m,
+                Err(e) => {
+                    warnings.push(format!(
+                        "{}: managed config unreadable ({e})",
+                        s.config.name
+                    ));
+                    None
+                }
+            };
+            ServiceDefinition {
+                native: s.config,
+                managed,
+                runtime: s.runtime,
+            }
+        })
+        .collect();
+    defs.sort_by(|a, b| {
+        a.native
+            .name
+            .to_lowercase()
+            .cmp(&b.native.name.to_lowercase())
+    });
+    Ok((defs, warnings))
+}
+
+fn install(spec: InstallSpec) -> Result<String, String> {
+    if spec.application.trim().is_empty() {
+        return Err("Application path is required.".into());
+    }
+    let binary_path = build_run_service_command(&spec.name).map_err(|e| e.to_string())?;
+
+    // Build the managed config before creating the SCM service.
+    let managed = ManagedApplicationConfig {
+        application: Some(spec.application),
+        app_parameters: spec.app_parameters,
+        app_directory: spec.app_directory,
+        io: IoRedirectionConfig {
+            stdin: None,
+            stdout: spec.stdout.map(io_stream),
+            stderr: spec.stderr.map(io_stream),
+            timestamp_log: None,
+        },
+        ..Default::default()
+    };
+
+    install_service(&InstallOptions {
+        name: spec.name.clone(),
+        display_name: spec
+            .display_name
+            .clone()
+            .unwrap_or_else(|| spec.name.clone()),
+        binary_path,
+        start_type: spec.start_type,
+    })
+    .map_err(|e| e.to_string())?;
+
+    // Roll the SCM service back if the managed config cannot be written.
+    if let Err(e) = servicemanager_registry::create_managed_config(&spec.name, &managed) {
+        return Err(match remove_service(&spec.name) {
+            Ok(()) => format!("install failed, service rolled back: {e}"),
+            Err(re) => format!("install failed ({e}); rollback also failed ({re})"),
+        });
+    }
+    Ok(format!("Installed '{}'.", spec.name))
+}
+
+fn edit(spec: EditSpec) -> Result<String, String> {
+    let touches_managed = spec.application.is_some()
+        || spec.app_parameters.is_some()
+        || spec.app_directory.is_some()
+        || spec.stdout.is_some()
+        || spec.stderr.is_some();
+
+    // `edit` only mutates NGSM-managed services. Re-validate ownership
+    // against current registry state — the UI button may be stale, and a
+    // native-only edit must not slip through unchecked.
+    let Some(mut managed) =
+        servicemanager_registry::read_managed_config(&spec.name).map_err(|e| e.to_string())?
+    else {
+        return Err(format!(
+            "'{}' is not an NGSM-managed service — refusing to edit it",
+            spec.name
+        ));
+    };
+
+    // Managed (NSSM-owned) changes go first: validate every managed value
+    // and complete the registry write *before* touching native SCM state,
+    // so a rejected value or a failed write cannot leave a half-applied
+    // edit with the display name / start type already changed.
+    if touches_managed {
+        if let Some(v) = spec.application {
+            // Defence in depth — the edit form already rejects an empty
+            // application, but never write one even if that changes.
+            if v.trim().is_empty() {
+                return Err("Application path must not be empty.".into());
+            }
+            managed.application = Some(v);
+        }
+        if let Some(v) = spec.app_parameters {
+            managed.app_parameters = Some(v);
+        }
+        if let Some(v) = spec.app_directory {
+            managed.app_directory = Some(v);
+        }
+        if let Some(v) = spec.stdout {
+            // An empty path clears the value; the registry reconcile drops it.
+            managed.io.stdout = if v.is_empty() {
+                None
+            } else {
+                Some(io_stream(v))
+            };
+        }
+        if let Some(v) = spec.stderr {
+            managed.io.stderr = if v.is_empty() {
+                None
+            } else {
+                Some(io_stream(v))
+            };
+        }
+        servicemanager_registry::write_managed_config(&spec.name, &managed)
+            .map_err(|e| e.to_string())?;
+    }
+
+    if spec.display_name.is_some() || spec.start_type.is_some() {
+        update_native_config(&spec.name, spec.display_name.as_deref(), spec.start_type)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(format!("Edited '{}'.", spec.name))
+}
+
+/// Re-validate, against current SCM/registry state, that a service is
+/// NGSM-managed before the worker issues a lifecycle control. The UI gates
+/// the buttons too, but its snapshot can be stale — the worker must not
+/// trust it for start/stop/restart of (potentially native) services.
+fn ensure_ngsm_managed(name: &str) -> servicemanager_core::Result<()> {
+    let native = query_service(name)?;
+    let managed = servicemanager_registry::read_managed_config(name)
+        .ok()
+        .flatten();
+    let def = ServiceDefinition {
+        native: native.config,
+        managed,
+        runtime: native.runtime,
+    };
+    if def.is_managed() {
+        Ok(())
+    } else {
+        Err(servicemanager_core::Error::other(format!(
+            "'{name}' is not an NGSM-managed service — refusing the lifecycle operation"
+        )))
+    }
+}
+
+/// Worker-side rotate: re-read managed config and require online rotation
+/// before issuing `SERVICE_CONTROL_ROTATE`, matching the CLI/broker
+/// preflight (the UI snapshot may be stale).
+fn rotate(name: &str) -> Result<String, String> {
+    match servicemanager_registry::read_managed_config(name).map_err(|e| e.to_string())? {
+        Some(cfg) if cfg.has_online_rotation() => {}
+        Some(_) => {
+            return Err(format!(
+                "'{name}' does not use online log rotation — its logs rotate on restart, \
+                 not on demand"
+            ))
+        }
+        None => return Err(format!("'{name}' is not an NGSM-managed service")),
+    }
+    control_service(name, ServiceControlSignal::User(SERVICE_CONTROL_ROTATE))
+        .map_err(|e| e.to_string())?;
+    Ok(format!("Rotate requested for '{name}'."))
+}
+
+fn restart(name: &str) -> Result<String, String> {
+    use servicemanager_core::ServiceState;
+    ensure_ngsm_managed(name).map_err(|e| e.to_string())?;
+    let snapshot = query_service(name).map_err(|e| e.to_string())?;
+    let initial = snapshot.runtime.as_ref().map(|r| r.state);
+    let needs_stop = !matches!(initial, Some(ServiceState::Stopped) | None);
+    if needs_stop {
+        match control_service(name, ServiceControlSignal::Stop) {
+            Ok(_) => {}
+            Err(e) => {
+                let msg = e.to_string();
+                if !(msg.contains("0x80070426") || msg.contains("has not been started")) {
+                    return Err(msg);
+                }
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let s = query_service(name).map_err(|e| e.to_string())?;
+            if matches!(
+                s.runtime.as_ref().map(|r| r.state),
+                Some(ServiceState::Stopped)
+            ) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("'{name}' did not stop within 30 s"));
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    start_service(name).map_err(|e| e.to_string())?;
+    Ok(format!("Restarted '{name}'."))
+}
+
+fn remove(name: &str) -> Result<String, String> {
+    // Re-query and re-validate managed ownership against the *current*
+    // SCM/registry state. The UI enabled the button from a possibly-stale
+    // service list, so the worker must not trust that authorization.
+    let native = query_service(name).map_err(|e| e.to_string())?;
+    // Fail closed: an unreadable managed config means ownership cannot be
+    // confirmed, so refuse rather than collapsing the error into "native".
+    let managed = match servicemanager_registry::read_managed_config(name) {
+        Ok(m) => m,
+        Err(e) => {
+            return Err(format!(
+                "'{name}': managed ownership cannot be determined — its managed config \
+                 is unreadable ({e}); refusing to remove it"
+            ));
+        }
+    };
+    let def = ServiceDefinition {
+        native: native.config,
+        managed,
+        runtime: native.runtime,
+    };
+    if !def.is_managed() {
+        return Err(format!(
+            "'{name}' is not an NGSM-managed service — refusing to remove it"
+        ));
+    }
+    // Remove the SCM service first, then scrub the registry; surface a
+    // cleanup failure instead of silently dropping it.
+    remove_service(name).map_err(|e| e.to_string())?;
+    servicemanager_registry::delete_managed_config(name)
+        .map_err(|e| format!("service removed, but managed config cleanup failed: {e}"))?;
+    Ok(format!("Removed '{name}'."))
+}
+
+fn processes(name: &str) -> Result<JobResult, String> {
+    let snap = query_service(name).map_err(|e| e.to_string())?;
+    let pid = snap
+        .runtime
+        .as_ref()
+        .and_then(|r| r.pid)
+        .ok_or_else(|| format!("service '{name}' is not running"))?;
+    let descendants = enumerate_descendants(pid).map_err(|e| e.to_string())?;
+    Ok(JobResult::Processes {
+        service: name.to_string(),
+        root_pid: pid,
+        processes: descendants,
+    })
+}

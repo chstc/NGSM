@@ -1,0 +1,17 @@
+[package]
+name = "servicemanager-win32"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Thin, safe wrappers around the Windows APIs NGSM depends on."
+publish = false
+
+[dependencies]
+servicemanager-core = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }

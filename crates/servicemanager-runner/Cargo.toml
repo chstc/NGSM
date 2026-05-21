@@ -1,0 +1,15 @@
+[package]
+name = "servicemanager-runner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Windows service entrypoint that bridges SCM controls into the supervisor (Phase 2)."
+publish = false
+
+[dependencies]
+servicemanager-core = { workspace = true }
+servicemanager-win32 = { workspace = true }
+servicemanager-registry = { workspace = true }
+servicemanager-supervisor = { workspace = true }
