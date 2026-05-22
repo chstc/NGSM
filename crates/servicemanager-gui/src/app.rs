@@ -515,6 +515,8 @@ fn apply_snapshot(win: &MainWindow, st: &mut AppState) {
     win.set_stat_attention(stats.attention.to_string().into());
 
     // Recent Events come from the OS event log, re-read after every scan.
+    // `st.defs` is already populated above, and the worker is single-threaded, so
+    // the resulting `Events` result is always mapped against an up-to-date snapshot.
     let _ = st.job_tx.send(Job::ReadEvents);
 }
 

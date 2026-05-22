@@ -1,7 +1,8 @@
-//! Pure view-model logic: filtering, dashboard stats, and event diffing.
+//! Pure view-model logic: filtering, dashboard stats, and event mapping.
 //! No Slint or Win32 calls — every function here is unit-tested.
 
 use servicemanager_core::{ServiceDefinition, ServiceState};
+use servicemanager_win32::{ScmEvent, ScmEventKind};
 
 use crate::{EventEntry, ProcessRow, ServiceRow};
 
@@ -67,15 +68,15 @@ pub fn dashboard_stats(defs: &[ServiceDefinition]) -> DashboardStats {
 /// preserves the newest-first order, and caps the result at `limit` rows.
 /// `kind`: 0 started (green), 1 stopped (amber), 2 terminated/failed (red).
 pub fn scm_events_to_entries(
-    events: &[servicemanager_win32::ScmEvent],
+    events: &[ScmEvent],
     defs: &[ServiceDefinition],
     limit: usize,
 ) -> Vec<EventEntry> {
-    use servicemanager_win32::ScmEventKind;
     let managed_displays: std::collections::HashSet<String> = defs
         .iter()
         .filter(|d| d.is_managed())
         .map(|d| d.native.display_name.to_lowercase())
+        .filter(|n| !n.is_empty())
         .collect();
     events
         .iter()
@@ -410,6 +411,7 @@ mod tests {
         assert_eq!(entries[1].kind, 2); // terminated -> red
         assert_eq!(entries[2].kind, 2); // start failed -> red
         assert_eq!(entries[0].label, "Demo Worker A — started");
+        assert_eq!(entries[0].time, "2026-05-21 09:00:00");
     }
 
     #[test]
