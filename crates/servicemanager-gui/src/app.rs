@@ -639,7 +639,7 @@ fn drain_results() {
                         .into(),
                     );
                     let shared: Vec<slint::SharedString> =
-                        st.warnings.iter().map(|w| w.clone().into()).collect();
+                        st.warnings.iter().map(|w| w.as_str().into()).collect();
                     win.set_warnings(slint::ModelRc::new(slint::VecModel::from(shared)));
                     apply_snapshot(&win, st);
                 }

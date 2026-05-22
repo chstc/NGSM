@@ -375,7 +375,7 @@ export component WarningsDialog inherits Rectangle {
 
     Card {
         width: 640px;
-        height: 420px;
+        height: min(420px, parent.height - 48px);
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         VerticalLayout {
@@ -393,13 +393,16 @@ export component WarningsDialog inherits Rectangle {
                 font-size: 12px;
             }
             Rectangle { height: 4px; }
-            ListView {
+            ScrollView {
                 vertical-stretch: 1;
-                for w in root.rows : Text {
-                    text: w;
-                    color: Theme.text-dim;
-                    font-size: 12px;
-                    wrap: word-wrap;
+                VerticalLayout {
+                    spacing: 6px;
+                    for w in root.rows : Text {
+                        text: w;
+                        color: Theme.text-dim;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
                 }
             }
             HorizontalLayout {
