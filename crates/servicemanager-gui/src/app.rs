@@ -135,14 +135,47 @@ fn drain_results() {
     });
 }
 
-/// Rebuild the service model and Dashboard stats from the cached defs.
+/// Rebuild the service model, Dashboard stats, and Recent Events feed from
+/// the cached defs.
 fn apply_snapshot(win: &MainWindow, st: &mut AppState) {
     refresh_service_model(win, st);
+
     let stats = adapter::dashboard_stats(&st.defs);
     win.set_stat_total(stats.total.to_string().into());
     win.set_stat_running(stats.running.to_string().into());
     win.set_stat_stopped(stats.stopped.to_string().into());
     win.set_stat_attention(stats.attention.to_string().into());
+
+    // Recent Events: diff this scan against the previous one, newest first.
+    let changes = adapter::diff_events(&st.prev_states, &st.defs);
+    if !changes.is_empty() {
+        let now = local_hms();
+        for change in changes {
+            let (verb, kind) = match change.kind {
+                adapter::EventKind::Started => ("started", 0),
+                adapter::EventKind::Stopped => ("stopped", 1),
+            };
+            st.events.insert(
+                0,
+                EventEntry {
+                    label: format!("{} — {verb}", change.service).into(),
+                    time: now.clone().into(),
+                    kind,
+                },
+            );
+        }
+        st.events.truncate(12);
+    }
+    st.prev_states = adapter::state_snapshot(&st.defs);
+    win.set_events(slint::ModelRc::new(slint::VecModel::from(st.events.clone())));
+}
+
+/// Current local time formatted `HH:MM:SS`, for event timestamps.
+fn local_hms() -> String {
+    use windows::Win32::System::SystemInformation::GetLocalTime;
+    // SAFETY: `GetLocalTime` returns a fully-initialised `SYSTEMTIME`.
+    let t = unsafe { GetLocalTime() };
+    format!("{:02}:{:02}:{:02}", t.wHour, t.wMinute, t.wSecond)
 }
 
 /// Rebuild the `services` model from the cached defs + current filter/search.
