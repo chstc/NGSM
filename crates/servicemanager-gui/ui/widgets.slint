@@ -1,0 +1,376 @@
+import { Theme } from "theme.slint";
+
+// Base surface for every panel.
+export component Card inherits Rectangle {
+    background: Theme.card-bg;
+    border-color: Theme.card-border;
+    border-width: 1px;
+    border-radius: Theme.radius;
+    drop-shadow-color: #00000066;
+    drop-shadow-blur: 18px;
+    drop-shadow-offset-y: 6px;
+}
+
+// Small tinted status pill: dot + label.
+export component Pill inherits Rectangle {
+    in property <string> text;
+    in property <color> tint: Theme.green;
+    height: 23px;
+    border-radius: 11.5px;
+    background: tint.with-alpha(0.14);
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 11px;
+        spacing: 6px;
+        Rectangle {
+            width: 6px;
+            Rectangle {
+                width: 6px;
+                height: 6px;
+                border-radius: 3px;
+                background: tint;
+                x: 0px;
+                y: (parent.height - self.height) / 2;
+            }
+        }
+        Text {
+            text: root.text;
+            color: tint;
+            font-size: 11px;
+            font-weight: 700;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// Solid accent button.
+export component AccentButton inherits Rectangle {
+    in property <string> text;
+    in property <color> tint: Theme.green;
+    callback clicked;
+    height: 36px;
+    border-radius: Theme.radius-sm;
+    background: ta.has-hover ? tint.brighter(0.15) : tint;
+    animate background { duration: 110ms; }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    HorizontalLayout {
+        padding-left: 18px;
+        padding-right: 18px;
+        Text {
+            text: root.text;
+            color: #08140d;
+            font-size: 13px;
+            font-weight: 700;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+// Outlined / ghost button.
+export component GhostButton inherits Rectangle {
+    in property <string> text;
+    in property <color> tint: Theme.text;
+    callback clicked;
+    height: 36px;
+    border-radius: Theme.radius-sm;
+    border-width: 1px;
+    border-color: ta.has-hover ? tint.with-alpha(0.55) : Theme.card-border;
+    background: ta.has-hover ? Theme.hover : transparent;
+    animate border-color, background { duration: 110ms; }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        Text {
+            text: root.text;
+            color: root.tint;
+            font-size: 13px;
+            font-weight: 600;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+// Small downward chevron, drawn as a filled triangle (font-glyph free).
+export component Caret inherits Path {
+    in property <color> tint: Theme.text-dim;
+    width: 10px;
+    height: 6px;
+    viewbox-width: 10;
+    viewbox-height: 7;
+    commands: "M 0 0 L 10 0 L 5 7 Z";
+    fill: tint;
+}
+
+// Simple geometric sidebar icons, drawn from primitives.
+component NavIcon inherits Rectangle {
+    in property <string> kind;
+    in property <color> tint: Theme.text-dim;
+    width: 20px;
+    height: 20px;
+
+    if kind == "dashboard": Rectangle {
+        Rectangle { x: 0px;  y: 0px;  width: 8px; height: 8px; border-radius: 2px; background: tint; }
+        Rectangle { x: 11px; y: 0px;  width: 8px; height: 8px; border-radius: 2px; background: tint; }
+        Rectangle { x: 0px;  y: 11px; width: 8px; height: 8px; border-radius: 2px; background: tint; }
+        Rectangle { x: 11px; y: 11px; width: 8px; height: 8px; border-radius: 2px; background: tint; }
+    }
+    if kind == "services": Rectangle {
+        Rectangle { x: 0px; y: 1px;  width: 20px; height: 4px; border-radius: 2px; background: tint; }
+        Rectangle { x: 0px; y: 8px;  width: 20px; height: 4px; border-radius: 2px; background: tint; }
+        Rectangle { x: 0px; y: 15px; width: 20px; height: 4px; border-radius: 2px; background: tint; }
+    }
+    if kind == "logs": Rectangle {
+        Rectangle { x: 1px; y: 2px;  width: 18px; height: 3px; border-radius: 1.5px; background: tint; }
+        Rectangle { x: 1px; y: 8px;  width: 12px; height: 3px; border-radius: 1.5px; background: tint; }
+        Rectangle { x: 1px; y: 14px; width: 16px; height: 3px; border-radius: 1.5px; background: tint; }
+    }
+    if kind == "recovery": Rectangle {
+        Rectangle {
+            x: 1px; y: 1px; width: 18px; height: 18px;
+            border-radius: 9px;
+            border-width: 3px;
+            border-color: tint;
+            background: transparent;
+        }
+        Rectangle { x: 8px; y: 0px; width: 4px; height: 4px; border-radius: 2px; background: tint; }
+    }
+    if kind == "settings": Rectangle {
+        Rectangle { x: 1px;  y: 3px;  width: 18px; height: 2px; background: tint; }
+        Rectangle { x: 1px;  y: 9px;  width: 18px; height: 2px; background: tint; }
+        Rectangle { x: 1px;  y: 15px; width: 18px; height: 2px; background: tint; }
+        Rectangle { x: 12px; y: 1px;  width: 6px; height: 6px; border-radius: 3px; background: tint; }
+        Rectangle { x: 3px;  y: 7px;  width: 6px; height: 6px; border-radius: 3px; background: tint; }
+        Rectangle { x: 9px;  y: 13px; width: 6px; height: 6px; border-radius: 3px; background: tint; }
+    }
+}
+
+// Sidebar navigation row.
+export component NavItem inherits Rectangle {
+    in property <string> label;
+    in property <string> icon;
+    in property <bool> active;
+    callback clicked;
+    height: 44px;
+    border-radius: Theme.radius-sm;
+    background: active ? Theme.sel : ta.has-hover ? Theme.hover : transparent;
+    animate background { duration: 90ms; }
+
+    Rectangle {
+        x: 0px;
+        width: 3px;
+        y: 9px;
+        height: parent.height - 18px;
+        border-radius: 1.5px;
+        background: Theme.green;
+        opacity: active ? 1.0 : 0.0;
+        animate opacity { duration: 120ms; }
+    }
+    HorizontalLayout {
+        padding-left: 15px;
+        padding-right: 12px;
+        spacing: 13px;
+        Rectangle {
+            width: 20px;
+            NavIcon {
+                kind: root.icon;
+                tint: active ? Theme.text : Theme.text-dim;
+                x: 0px;
+                y: (parent.height - self.height) / 2;
+            }
+        }
+        Text {
+            text: root.label;
+            color: active ? Theme.text : Theme.text-dim;
+            font-size: 14px;
+            font-weight: active ? 700 : 500;
+            vertical-alignment: center;
+        }
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Dashboard stat tile — big number plus a caption or a sparkline.
+export component StatCard inherits Card {
+    in property <string> title;
+    in property <string> value;
+    in property <color> accent: Theme.green;
+    in property <string> caption;
+    in property <string> caption-value;
+    in property <bool> show-chart: false;
+    in property <string> chart-line;
+    in property <string> chart-area;
+    height: 140px;
+
+    VerticalLayout {
+        padding: 20px;
+        alignment: start;
+        spacing: 0px;
+        Text {
+            text: root.title;
+            color: Theme.text-dim;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        Rectangle { height: 8px; }
+        Text {
+            text: root.value;
+            color: Theme.text;
+            font-size: 33px;
+            font-weight: 800;
+        }
+        Rectangle { height: 12px; }
+        if !root.show-chart : HorizontalLayout {
+            spacing: 7px;
+            alignment: start;
+            Rectangle {
+                width: 7px;
+                Rectangle {
+                    width: 7px;
+                    height: 7px;
+                    border-radius: 3.5px;
+                    background: root.accent;
+                    x: 0px;
+                    y: (parent.height - self.height) / 2;
+                }
+            }
+            Text {
+                text: root.caption;
+                color: Theme.text-dim;
+                font-size: 12px;
+                vertical-alignment: center;
+            }
+            Text {
+                text: root.caption-value;
+                color: root.accent;
+                font-size: 12px;
+                font-weight: 800;
+                vertical-alignment: center;
+            }
+        }
+        if root.show-chart : Rectangle {
+            height: 30px;
+            Path {
+                commands: root.chart-area;
+                viewbox-width: 100;
+                viewbox-height: 28;
+                fill: root.accent.with-alpha(0.16);
+            }
+            Path {
+                commands: root.chart-line;
+                viewbox-width: 100;
+                viewbox-height: 28;
+                stroke: root.accent;
+                stroke-width: 2px;
+            }
+        }
+    }
+}
+
+// Dashboard line-chart card (CPU / Memory).
+export component ChartCard inherits Card {
+    in property <string> title;
+    in property <string> value;
+    in property <color> accent: Theme.cyan;
+    in property <string> line;
+    in property <string> area;
+
+    VerticalLayout {
+        padding: 20px;
+        spacing: 14px;
+        HorizontalLayout {
+            Text {
+                text: root.title;
+                color: Theme.text-dim;
+                font-size: 13px;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+            Rectangle { }
+            Text {
+                text: root.value;
+                color: root.accent;
+                font-size: 17px;
+                font-weight: 800;
+                vertical-alignment: center;
+            }
+        }
+        Rectangle {
+            for gy in [0.2, 0.4, 0.6, 0.8] : Rectangle {
+                x: 0px;
+                width: parent.width;
+                height: 1px;
+                y: parent.height * gy;
+                background: Theme.divider;
+            }
+            Path {
+                commands: root.area;
+                viewbox-width: 100;
+                viewbox-height: 40;
+                fill: root.accent.with-alpha(0.14);
+            }
+            Path {
+                commands: root.line;
+                viewbox-width: 100;
+                viewbox-height: 40;
+                stroke: root.accent;
+                stroke-width: 2px;
+            }
+        }
+    }
+}
+
+// One row in the Recent Events list.
+export component EventRow inherits Rectangle {
+    in property <string> label;
+    in property <string> time;
+    in property <color> tint: Theme.green;
+    in property <bool> last: false;
+    height: 46px;
+
+    HorizontalLayout {
+        spacing: 12px;
+        padding-left: 2px;
+        Rectangle {
+            width: 9px;
+            Rectangle {
+                width: 9px;
+                height: 9px;
+                border-radius: 4.5px;
+                background: root.tint;
+                x: 0px;
+                y: (parent.height - self.height) / 2;
+            }
+        }
+        Text {
+            text: root.label;
+            color: Theme.text;
+            font-size: 13px;
+            vertical-alignment: center;
+        }
+        Rectangle { }
+        Text {
+            text: root.time;
+            color: Theme.text-faint;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+    }
+    Rectangle {
+        y: parent.height - 1px;
+        height: 1px;
+        background: Theme.divider;
+        opacity: root.last ? 0.0 : 1.0;
+    }
+}
