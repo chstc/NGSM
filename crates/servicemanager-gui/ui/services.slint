@@ -1,6 +1,6 @@
 import { Theme } from "theme.slint";
 import { Card, Pill, AccentButton, GhostButton, Caret, SortHeader, CheckBox } from "widgets.slint";
-import { ScrollView } from "std-widgets.slint";
+import { ListView } from "std-widgets.slint";
 
 export struct ServiceRow {
     name: string,
@@ -272,68 +272,64 @@ export component ServicesView inherits Rectangle {
                             }
                         }
                     }
-                    sv := ScrollView {
-                        VerticalLayout {
-                            width: sv.visible-width;
-                            alignment: start;
-                            spacing: 2px;
-                            for svc[idx] in root.rows : Rectangle {
-                                height: 46px;
-                                border-radius: 7px;
-                                background: idx == root.selected ? Theme.sel
-                                    : rta.has-hover ? Theme.hover
-                                    : transparent;
-                                rta := TouchArea {
-                                    mouse-cursor: pointer;
-                                    clicked => {
-                                        root.selected = idx;
-                                        root.row-selected(idx);
+                    ListView {
+                        vertical-stretch: 1;
+                        for svc[idx] in root.rows : Rectangle {
+                            height: 46px;
+                            border-radius: 7px;
+                            background: idx == root.selected ? Theme.sel
+                                : rta.has-hover ? Theme.hover
+                                : transparent;
+                            rta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    root.selected = idx;
+                                    root.row-selected(idx);
+                                }
+                            }
+                            HorizontalLayout {
+                                padding-left: 14px;
+                                padding-right: 14px;
+                                spacing: 12px;
+                                Text {
+                                    text: svc.name;
+                                    color: Theme.text;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    width: 148px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: svc.display;
+                                    color: Theme.text-dim;
+                                    font-size: 13px;
+                                    horizontal-stretch: 1;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: svc.kind;
+                                    color: Theme.text-faint;
+                                    font-size: 12px;
+                                    width: 74px;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle {
+                                    width: 104px;
+                                    Pill {
+                                        x: 0px;
+                                        y: (parent.height - self.height) / 2;
+                                        text: svc.state;
+                                        tint: svc.running ? Theme.green : Theme.amber;
                                     }
                                 }
-                                HorizontalLayout {
-                                    padding-left: 14px;
-                                    padding-right: 14px;
-                                    spacing: 12px;
-                                    Text {
-                                        text: svc.name;
-                                        color: Theme.text;
-                                        font-size: 13px;
-                                        font-weight: 600;
-                                        width: 148px;
-                                        vertical-alignment: center;
-                                        overflow: elide;
-                                    }
-                                    Text {
-                                        text: svc.display;
-                                        color: Theme.text-dim;
-                                        font-size: 13px;
-                                        horizontal-stretch: 1;
-                                        vertical-alignment: center;
-                                        overflow: elide;
-                                    }
-                                    Text {
-                                        text: svc.kind;
-                                        color: Theme.text-faint;
-                                        font-size: 12px;
-                                        width: 74px;
-                                        vertical-alignment: center;
-                                    }
-                                    Rectangle {
-                                        width: 104px;
-                                        Pill {
-                                            x: 0px;
-                                            y: (parent.height - self.height) / 2;
-                                            text: svc.state;
-                                            tint: svc.running ? Theme.green : Theme.amber;
-                                        }
-                                    }
-                                    Text {
-                                        text: svc.startup;
-                                        color: Theme.text-dim;
-                                        font-size: 12px;
-                                        width: 88px;
-                                        vertical-alignment: center;
-                                    }
+                                Text {
+                                    text: svc.startup;
+                                    color: Theme.text-dim;
+                                    font-size: 12px;
+                                    width: 88px;
+                                    vertical-alignment: center;
                                 }
                             }
                         }
