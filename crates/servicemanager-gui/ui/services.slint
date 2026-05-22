@@ -1,5 +1,5 @@
 import { Theme } from "theme.slint";
-import { Card, Pill, AccentButton, GhostButton, Caret, SortHeader } from "widgets.slint";
+import { Card, Pill, AccentButton, GhostButton, Caret, SortHeader, CheckBox } from "widgets.slint";
 import { ScrollView } from "std-widgets.slint";
 
 export struct ServiceRow {
@@ -65,6 +65,8 @@ export component ServicesView inherits Rectangle {
     callback install();
     callback action(string, string);
     callback filter-changed(bool);
+    callback running-changed(bool);
+    in-out property <bool> running-only;
     callback row-selected(int);
     callback sort-changed(int);
     in property <int> sort-column;
@@ -209,6 +211,11 @@ export component ServicesView inherits Rectangle {
                             }
                         }
                     }
+                }
+                CheckBox {
+                    label: "Running only";
+                    checked <=> root.running-only;
+                    toggled(v) => { root.running-changed(v); }
                 }
                 Rectangle { }
             }

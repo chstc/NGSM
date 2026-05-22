@@ -22,6 +22,8 @@ export component MainWindow inherits Window {
     in property <[ServiceRow]> services;
     in-out property <int> selected-service: 0;
     in-out property <bool> auto-refresh: false;
+    in-out property <bool> running-only;
+    callback running-changed(bool);
     in property <string> stat-total: "0";
     in property <string> stat-running: "0";
     in property <string> stat-stopped: "0";
@@ -256,6 +258,7 @@ export component MainWindow inherits Window {
                         rows: root.services;
                         elevated: root.elevated;
                         auto-refresh <=> root.auto-refresh;
+                        running-only <=> root.running-only;
                         selected <=> root.selected-service;
                         sort-column: root.sort-column;
                         sort-ascending: root.sort-ascending;
@@ -263,6 +266,7 @@ export component MainWindow inherits Window {
                         install => { root.install(); }
                         action(verb, name) => { root.action(verb, name); }
                         filter-changed(managed) => { root.filter-changed(managed); }
+                        running-changed(v) => { root.running-changed(v); }
                         row-selected(idx) => { root.row-selected(idx); }
                         sort-changed(c) => { root.sort-changed(c); }
                     }

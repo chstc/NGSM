@@ -7,10 +7,19 @@ use servicemanager_core::{ServiceDefinition, ServiceState};
 
 use crate::{ProcessRow, ServiceRow};
 
-/// True if `def` should be shown given the managed-only toggle and search box.
-/// Search matches the service name or display name, case-insensitively.
-pub fn matches_filter(def: &ServiceDefinition, managed_only: bool, search: &str) -> bool {
+/// True if `def` should be shown given the managed-only / running-only
+/// toggles and the search box. Search matches the service name or display
+/// name, case-insensitively.
+pub fn matches_filter(
+    def: &ServiceDefinition,
+    managed_only: bool,
+    running_only: bool,
+    search: &str,
+) -> bool {
     if managed_only && !def.is_managed() {
+        return false;
+    }
+    if running_only && def.runtime.as_ref().map(|r| r.state) != Some(ServiceState::Running) {
         return false;
     }
     let q = search.trim().to_lowercase();
@@ -278,9 +287,9 @@ mod tests {
             StartupType::Manual,
             Some(ServiceState::Running),
         );
-        assert!(!matches_filter(&native, true, ""));
-        assert!(matches_filter(&managed, true, ""));
-        assert!(matches_filter(&native, false, ""));
+        assert!(!matches_filter(&native, true, false, ""));
+        assert!(matches_filter(&managed, true, false, ""));
+        assert!(matches_filter(&native, false, false, ""));
     }
 
     #[test]
@@ -292,15 +301,36 @@ mod tests {
             StartupType::Automatic,
             Some(ServiceState::Running),
         );
-        assert!(matches_filter(&d, false, "ingest"));
-        assert!(matches_filter(&d, false, "SMINGEST"));
-        assert!(!matches_filter(&d, false, "spooler"));
+        assert!(matches_filter(&d, false, false, "ingest"));
+        assert!(matches_filter(&d, false, false, "SMINGEST"));
+        assert!(!matches_filter(&d, false, false, "spooler"));
     }
 
     #[test]
     fn blank_search_matches_everything() {
         let d = def("X", "X", "C:\\x.exe", StartupType::Manual, None);
-        assert!(matches_filter(&d, false, "   "));
+        assert!(matches_filter(&d, false, false, "   "));
+    }
+
+    #[test]
+    fn running_only_excludes_non_running_services() {
+        let running = def(
+            "A",
+            "A",
+            "C:\\a.exe",
+            StartupType::Manual,
+            Some(ServiceState::Running),
+        );
+        let stopped = def(
+            "B",
+            "B",
+            "C:\\b.exe",
+            StartupType::Manual,
+            Some(ServiceState::Stopped),
+        );
+        assert!(matches_filter(&running, false, true, ""));
+        assert!(!matches_filter(&stopped, false, true, ""));
+        assert!(matches_filter(&stopped, false, false, ""));
     }
 
     #[test]

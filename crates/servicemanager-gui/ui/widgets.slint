@@ -156,6 +156,56 @@ export component SortHeader inherits Rectangle {
     }
 }
 
+// Reusable checkbox: a box that fills with a tick when checked, plus a label.
+export component CheckBox inherits Rectangle {
+    in property <string> label;
+    in-out property <bool> checked;
+    callback toggled(bool);
+    height: 36px;
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: start;
+        Rectangle {
+            width: 18px;
+            Rectangle {
+                width: 18px;
+                height: 18px;
+                x: 0px;
+                y: (parent.height - self.height) / 2;
+                border-radius: 5px;
+                border-width: 1.5px;
+                border-color: root.checked ? Theme.green : Theme.card-border;
+                background: root.checked ? Theme.green : transparent;
+                Path {
+                    x: 4px;
+                    y: 5px;
+                    width: 10px;
+                    height: 8px;
+                    viewbox-width: 11;
+                    viewbox-height: 9;
+                    commands: "M 0 4 L 4 8 L 11 0";
+                    stroke: #06210f;
+                    stroke-width: 2px;
+                    visible: root.checked;
+                }
+            }
+        }
+        Text {
+            text: root.label;
+            color: root.checked ? Theme.text : Theme.text-dim;
+            font-size: 13px;
+            vertical-alignment: center;
+        }
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.checked = !root.checked;
+            root.toggled(root.checked);
+        }
+    }
+}
+
 // Simple geometric sidebar icons, drawn from primitives.
 component NavIcon inherits Rectangle {
     in property <string> kind;

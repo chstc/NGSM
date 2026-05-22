@@ -23,6 +23,7 @@ struct AppState {
     defs: Vec<ServiceDefinition>,
     prev_states: HashMap<String, ServiceState>,
     managed_only: bool,
+    running_only: bool,
     search: String,
     sort_column: i32,
     sort_ascending: bool,
@@ -85,6 +86,7 @@ pub fn build_ui() -> Result<MainWindow, slint::PlatformError> {
             defs: Vec::new(),
             prev_states: HashMap::new(),
             managed_only: true,
+            running_only: false,
             search: String::new(),
             sort_column: 0,
             sort_ascending: true,
@@ -120,6 +122,16 @@ fn wire_callbacks(window: &MainWindow) {
             let mut guard = s.borrow_mut();
             let Some(st) = guard.as_mut() else { return };
             st.managed_only = managed_only;
+            if let Some(win) = st.window.upgrade() {
+                refresh_service_model(&win, st);
+            }
+        });
+    });
+    window.on_running_changed(|running_only| {
+        STATE.with(|s| {
+            let mut guard = s.borrow_mut();
+            let Some(st) = guard.as_mut() else { return };
+            st.running_only = running_only;
             if let Some(win) = st.window.upgrade() {
                 refresh_service_model(&win, st);
             }
@@ -503,7 +515,7 @@ fn refresh_service_model(win: &MainWindow, st: &AppState) {
     let mut rows: Vec<ServiceRow> = st
         .defs
         .iter()
-        .filter(|d| adapter::matches_filter(d, st.managed_only, &st.search))
+        .filter(|d| adapter::matches_filter(d, st.managed_only, st.running_only, &st.search))
         .map(|d| adapter::to_service_row(d, elevated))
         .collect();
     adapter::sort_service_rows(&mut rows, st.sort_column, st.sort_ascending);
