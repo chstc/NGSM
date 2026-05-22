@@ -7,6 +7,7 @@
 #[cfg(not(windows))]
 compile_error!("servicemanager-gui builds only for Windows targets.");
 
+mod adapter;
 mod data;
 
 slint::include_modules!();
