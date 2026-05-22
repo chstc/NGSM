@@ -25,6 +25,8 @@ pub struct ScmEvent {
     pub service: String,
     pub kind: ScmEventKind,
     /// `YYYY-MM-DD HH:MM:SS`, UTC (the event log stores timestamps in UTC).
+    /// Empty string when the event carries no usable `SystemTime` attribute —
+    /// callers should treat an empty timestamp as "timestamp unavailable".
     pub timestamp: String,
 }
 
@@ -73,6 +75,10 @@ pub fn parse_scm_event_xml(xml: &str) -> Option<ScmEvent> {
 }
 
 /// Text content of the first `<tag ...>...</tag>` element.
+///
+/// NOTE: This relies on `EventID` appearing only in the `<System>` section of
+/// OS-generated event XML — `<Data>` text content is XML-escaped, so it cannot
+/// contain a literal `<EventID>`.
 fn tag_text(xml: &str, tag: &str) -> Option<String> {
     let open = xml.find(&format!("<{tag}"))?;
     let content_start = xml[open..].find('>')? + open + 1;
@@ -114,6 +120,7 @@ fn extract_attr(xml: &str, attr: &str) -> Option<String> {
     if quote != b'"' && quote != b'\'' {
         return None;
     }
+    // The byte at `start` is `b'"'` or `b'\''` — single-byte ASCII — so `start + 1` is a valid char boundary.
     let value = &xml[start + 1..];
     let end = value.find(quote as char)?;
     Some(value[..end].to_string())
@@ -142,8 +149,12 @@ struct EvtGuard(EVT_HANDLE);
 impl Drop for EvtGuard {
     fn drop(&mut self) {
         // SAFETY: `self.0` came from a successful Evt* call and is closed once.
-        unsafe {
-            let _ = EvtClose(self.0);
+        // Guard against an invalid handle for consistency with the other RAII
+        // guards in this crate (`ScHandle`, `HandleGuard`).
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = EvtClose(self.0);
+            }
         }
     }
 }
@@ -293,6 +304,7 @@ mod tests {
         let e = parse_scm_event_xml(E_7000).expect("should parse");
         assert_eq!(e.service, "Demo Worker C");
         assert_eq!(e.kind, ScmEventKind::StartFailed);
+        assert_eq!(e.timestamp, "2026-05-21 08:00:00");
     }
 
     #[test]
