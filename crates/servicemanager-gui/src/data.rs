@@ -55,7 +55,6 @@ pub enum JobResult {
     },
     Processes {
         service: String,
-        root_pid: u32,
         processes: Vec<ProcessInfo>,
     },
     /// A privileged action ran (e.g. `Install`). Stash the success message;
@@ -441,7 +440,6 @@ fn processes(name: &str) -> Result<JobResult, String> {
     let descendants = enumerate_descendants(pid).map_err(|e| e.to_string())?;
     Ok(JobResult::Processes {
         service: name.to_string(),
-        root_pid: pid,
         processes: descendants,
     })
 }

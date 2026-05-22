@@ -126,18 +126,41 @@ fn wire_callbacks(window: &MainWindow) {
         STATE.with(|s| {
             let mut guard = s.borrow_mut();
             let Some(st) = guard.as_mut() else { return };
-            let Some(win) = st.window.upgrade() else { return };
+            let Some(win) = st.window.upgrade() else {
+                return;
+            };
             let name = name.to_string();
             match verb.as_str() {
-                "start" => dispatch(st, &win, Job::Start(name.clone()), format!("Starting '{name}'…")),
-                "stop" => dispatch(st, &win, Job::Stop(name.clone()), format!("Stopping '{name}'…")),
-                "restart" => {
-                    dispatch(st, &win, Job::Restart(name.clone()), format!("Restarting '{name}'…"))
-                }
-                "pause" => dispatch(st, &win, Job::Pause(name.clone()), format!("Pausing '{name}'…")),
-                "continue" => {
-                    dispatch(st, &win, Job::Continue(name.clone()), format!("Resuming '{name}'…"))
-                }
+                "start" => dispatch(
+                    st,
+                    &win,
+                    Job::Start(name.clone()),
+                    format!("Starting '{name}'…"),
+                ),
+                "stop" => dispatch(
+                    st,
+                    &win,
+                    Job::Stop(name.clone()),
+                    format!("Stopping '{name}'…"),
+                ),
+                "restart" => dispatch(
+                    st,
+                    &win,
+                    Job::Restart(name.clone()),
+                    format!("Restarting '{name}'…"),
+                ),
+                "pause" => dispatch(
+                    st,
+                    &win,
+                    Job::Pause(name.clone()),
+                    format!("Pausing '{name}'…"),
+                ),
+                "continue" => dispatch(
+                    st,
+                    &win,
+                    Job::Continue(name.clone()),
+                    format!("Resuming '{name}'…"),
+                ),
                 "rotate" => dispatch(
                     st,
                     &win,
@@ -214,7 +237,9 @@ fn wire_callbacks(window: &MainWindow) {
         STATE.with(|s| {
             let guard = s.borrow();
             let Some(st) = guard.as_ref() else { return };
-            let Some(win) = st.window.upgrade() else { return };
+            let Some(win) = st.window.upgrade() else {
+                return;
+            };
             let form = forms::InstallForm {
                 name: win.get_modal_name().to_string(),
                 display_name: win.get_modal_display().to_string(),
@@ -224,7 +249,6 @@ fn wire_callbacks(window: &MainWindow) {
                 stdout: win.get_modal_stdout().to_string(),
                 stderr: win.get_modal_stderr().to_string(),
                 start_type: int_to_start_type(win.get_modal_start_type()),
-                error: None,
             };
             match form.to_spec() {
                 Ok(spec) => {
@@ -240,8 +264,12 @@ fn wire_callbacks(window: &MainWindow) {
         STATE.with(|s| {
             let mut guard = s.borrow_mut();
             let Some(st) = guard.as_mut() else { return };
-            let Some(win) = st.window.upgrade() else { return };
-            let Some(form) = st.edit_form.as_mut() else { return };
+            let Some(win) = st.window.upgrade() else {
+                return;
+            };
+            let Some(form) = st.edit_form.as_mut() else {
+                return;
+            };
             form.display_name = win.get_modal_display().to_string();
             form.application = win.get_modal_application().to_string();
             form.app_parameters = win.get_modal_arguments().to_string();
@@ -264,7 +292,9 @@ fn wire_callbacks(window: &MainWindow) {
         STATE.with(|s| {
             let guard = s.borrow();
             let Some(st) = guard.as_ref() else { return };
-            let Some(win) = st.window.upgrade() else { return };
+            let Some(win) = st.window.upgrade() else {
+                return;
+            };
             let name = win.get_modal_service_name().to_string();
             win.set_status_text(format!("Removing '{name}'…").into());
             let _ = st.job_tx.send(Job::Remove(name));
@@ -331,7 +361,9 @@ fn drain_results() {
     STATE.with(|s| {
         let mut guard = s.borrow_mut();
         let Some(st) = guard.as_mut() else { return };
-        let Some(win) = st.window.upgrade() else { return };
+        let Some(win) = st.window.upgrade() else {
+            return;
+        };
         while let Ok(result) = st.result_rx.try_recv() {
             match result {
                 JobResult::Services { defs, warnings } => {
@@ -351,9 +383,7 @@ fn drain_results() {
                     win.set_status_text(msg.into());
                     let _ = st.job_tx.send(Job::Refresh);
                 }
-                JobResult::Processes {
-                    service, processes, ..
-                } => {
+                JobResult::Processes { service, processes } => {
                     let rows: Vec<ProcessRow> = processes
                         .iter()
                         .map(|p| ProcessRow {
@@ -407,7 +437,9 @@ fn apply_snapshot(win: &MainWindow, st: &mut AppState) {
         st.events.truncate(12);
     }
     st.prev_states = adapter::state_snapshot(&st.defs);
-    win.set_events(slint::ModelRc::new(slint::VecModel::from(st.events.clone())));
+    win.set_events(slint::ModelRc::new(slint::VecModel::from(
+        st.events.clone(),
+    )));
 }
 
 /// Current local time formatted `HH:MM:SS`, for event timestamps.

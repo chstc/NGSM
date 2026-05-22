@@ -264,7 +264,13 @@ mod tests {
     #[test]
     fn dashboard_stats_counts_only_managed_services() {
         let ngsm = |n: &str, st, state| {
-            def(n, n, &format!("C:\\NGSM\\ngsm.exe run-service {n}"), st, state)
+            def(
+                n,
+                n,
+                &format!("C:\\NGSM\\ngsm.exe run-service {n}"),
+                st,
+                state,
+            )
         };
         let defs = vec![
             ngsm("A", StartupType::Manual, Some(ServiceState::Running)),
@@ -312,8 +318,14 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                EventChange { service: "A".into(), kind: EventKind::Started },
-                EventChange { service: "B".into(), kind: EventKind::Stopped },
+                EventChange {
+                    service: "A".into(),
+                    kind: EventKind::Started
+                },
+                EventChange {
+                    service: "B".into(),
+                    kind: EventKind::Stopped
+                },
             ]
         );
     }

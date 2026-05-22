@@ -19,7 +19,6 @@ pub struct InstallForm {
     pub stdout: String,
     pub stderr: String,
     pub start_type: InstallStartType,
-    pub error: Option<String>,
 }
 
 impl InstallForm {
@@ -62,8 +61,6 @@ pub struct EditForm {
     pub orig_stdout: String,
     pub orig_stderr: String,
     pub orig_start_type: InstallStartType,
-
-    pub error: Option<String>,
 }
 
 impl EditForm {
@@ -117,8 +114,6 @@ impl EditForm {
             orig_stdout: stdout,
             orig_stderr: stderr,
             orig_start_type: start_type,
-
-            error: None,
         }
     }
 
@@ -154,6 +149,7 @@ fn empty_to_none(s: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
