@@ -279,6 +279,15 @@ impl Supervisor {
                 .unwrap_or(DEFAULT_THROTTLE_DELAY_MS) as u64,
         );
 
+        let writer = event_log::EventWriter::for_service(self.name.clone());
+
+        // Track restart bookkeeping: `is_first_generation` distinguishes
+        // the initial spawn from a restart, and `last_delay_ms` is the
+        // delay we just slept so the upcoming `restarted` event can
+        // report it.
+        let mut is_first_generation = true;
+        let mut last_delay_ms: u64 = 0;
+
         // Set once the first child generation is up, so the startup signal
         // to the runner fires exactly once (not again on every restart).
         let mut startup_reported = false;
@@ -357,6 +366,12 @@ impl Supervisor {
                     }
                     self.spawn_exit_watcher();
                     self.fire_hook(HookPoint::StartPost, Some(pid), None);
+                    if is_first_generation {
+                        writer.started(pid);
+                        is_first_generation = false;
+                    } else {
+                        writer.restarted(pid, last_delay_ms);
+                    }
                     // The application is now genuinely running — let the
                     // runner report SERVICE_RUNNING to SCM.
                     if !startup_reported {
@@ -410,6 +425,7 @@ impl Supervisor {
                     // path can actually run.
                     self.resume_tree();
                     self.stop_child_gracefully();
+                    writer.stopped(servicemanager_core::events::StopReason::ScmStop);
                     return Ok(ExitReason::Stopped);
                 }
                 Ok(SupervisorMessage::Rotate)
@@ -420,6 +436,7 @@ impl Supervisor {
                     let lived = spawn_started.elapsed();
                     let exit_code = exit_code_of(&result);
                     self.record_child_exit(exit_code);
+                    writer.child_exited(exit_code, lived.as_millis() as u64);
 
                     // A configured `AppExit\<code>` action takes precedence
                     // over the default; fall back to the default action when
@@ -438,8 +455,13 @@ impl Supervisor {
                             } else {
                                 restart_delay
                             };
-                            if delay.as_millis() > 0 && !self.sleep_or_stop(delay)? {
-                                return Ok(ExitReason::Stopped);
+                            let delay_ms = delay.as_millis() as u64;
+                            last_delay_ms = delay_ms;
+                            if delay_ms > 0 {
+                                writer.throttled(delay_ms);
+                                if !self.sleep_or_stop(delay)? {
+                                    return Ok(ExitReason::Stopped);
+                                }
                             }
                             continue;
                         }
