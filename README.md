@@ -117,7 +117,7 @@ A Cargo workspace of focused crates:
 | `servicemanager-supervisor` | Child-process supervision, hooks, log rotation |
 | `servicemanager-runner` | Windows service entry point (SCM dispatcher) |
 | `servicemanager-broker` | Optional elevated named-pipe broker |
-| `servicemanager-gui` | egui desktop interface |
+| `servicemanager-gui` | Slint desktop interface |
 | `servicemanager-cli` | `ngsm.exe` — the CLI and the launcher for everything above |
 
 ## License

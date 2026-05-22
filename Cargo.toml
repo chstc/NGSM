@@ -15,7 +15,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 # Real minimum: the resolved dependency graph (image 1.88, clap 1.85,
-# eframe/egui/embed-resource 1.76) needs 1.88. Declaring less would make a
+# slint/embed-resource) needs 1.88. Declaring less would make a
 # build on the stated toolchain fail despite this metadata claiming support.
 rust-version = "1.88"
 # BSD Zero Clause License — a permissive, OSI-approved license that requires
