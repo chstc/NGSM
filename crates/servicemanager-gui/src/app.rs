@@ -239,7 +239,9 @@ fn wire_callbacks(window: &MainWindow) {
                     win.set_modal_service_name(name.clone().into());
                     win.set_active_modal(3);
                 }
-                _ => {}
+                other => {
+                    win.set_status_text(format!("Unknown action '{other}' — ignored.").into());
+                }
             }
         });
     });
