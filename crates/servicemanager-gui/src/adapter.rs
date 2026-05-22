@@ -17,6 +17,40 @@ pub fn matches_filter(def: &ServiceDefinition, managed_only: bool, search: &str)
         || def.native.display_name.to_lowercase().contains(&q)
 }
 
+/// Counts shown on the Dashboard stat cards. Only managed services count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DashboardStats {
+    pub total: usize,
+    pub running: usize,
+    pub stopped: usize,
+    /// Managed, Automatic-start, currently stopped — "needs attention".
+    pub attention: usize,
+}
+
+/// Tally the Dashboard stat-card counts across the managed services.
+pub fn dashboard_stats(defs: &[ServiceDefinition]) -> DashboardStats {
+    let mut s = DashboardStats::default();
+    for d in defs.iter().filter(|d| d.is_managed()) {
+        s.total += 1;
+        let state = d.runtime.as_ref().map(|r| r.state);
+        match state {
+            Some(ServiceState::Running) => s.running += 1,
+            Some(ServiceState::Stopped) => {
+                s.stopped += 1;
+                if matches!(
+                    d.native.startup,
+                    servicemanager_core::StartupType::Automatic
+                        | servicemanager_core::StartupType::AutomaticDelayed
+                ) {
+                    s.attention += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +130,29 @@ mod tests {
     fn blank_search_matches_everything() {
         let d = def("X", "X", "C:\\x.exe", StartupType::Manual, None);
         assert!(matches_filter(&d, false, "   "));
+    }
+
+    #[test]
+    fn dashboard_stats_counts_only_managed_services() {
+        let ngsm = |n: &str, st, state| {
+            def(n, n, &format!("C:\\NGSM\\ngsm.exe run-service {n}"), st, state)
+        };
+        let defs = vec![
+            ngsm("A", StartupType::Manual, Some(ServiceState::Running)),
+            ngsm("B", StartupType::Automatic, Some(ServiceState::Stopped)),
+            ngsm("C", StartupType::Manual, Some(ServiceState::Stopped)),
+            def(
+                "Spooler",
+                "Spooler",
+                "C:\\Windows\\spoolsv.exe",
+                StartupType::Automatic,
+                Some(ServiceState::Stopped),
+            ),
+        ];
+        let s = dashboard_stats(&defs);
+        assert_eq!(s.total, 3); // native Spooler excluded
+        assert_eq!(s.running, 1);
+        assert_eq!(s.stopped, 2);
+        assert_eq!(s.attention, 1); // only B: managed + Automatic + Stopped
     }
 }
