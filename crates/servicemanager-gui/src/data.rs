@@ -1,15 +1,14 @@
-//! Background worker for the egui thread.
+//! Background worker for the UI thread.
 //!
 //! Win32 calls (SCM enumerate, registry read, install, etc.) can take
 //! tens to hundreds of milliseconds; running them on the UI thread would
 //! freeze the frame. We send `Job`s to a worker and post `JobResult`s
-//! back, requesting a repaint after each so egui picks them up promptly.
+//! back, calling a `wake` callback after each so the UI drains them promptly.
 
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use eframe::egui;
 use servicemanager_core::{
     IoRedirectionConfig, IoStream, ManagedApplicationConfig, ServiceDefinition,
 };
@@ -90,18 +89,19 @@ pub struct EditSpec {
 }
 
 /// Spawn the worker thread. Returns the job sender; results land on
-/// `result_tx`. The worker requests an egui repaint after each result.
-pub fn spawn_worker(result_tx: Sender<JobResult>, ctx: egui::Context) -> Sender<Job> {
+/// `result_tx`. The worker calls `wake` after each result so the UI thread
+/// can drain and apply them.
+pub fn spawn_worker(result_tx: Sender<JobResult>, wake: Box<dyn Fn() + Send>) -> Sender<Job> {
     let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
-    thread::spawn(move || worker_loop(job_rx, result_tx, ctx));
+    thread::spawn(move || worker_loop(job_rx, result_tx, wake));
     job_tx
 }
 
-fn worker_loop(rx: Receiver<Job>, tx: Sender<JobResult>, ctx: egui::Context) {
+fn worker_loop(rx: Receiver<Job>, tx: Sender<JobResult>, wake: Box<dyn Fn() + Send>) {
     while let Ok(job) = rx.recv() {
         let result = execute(job);
         let _ = tx.send(result);
-        ctx.request_repaint();
+        wake();
     }
 }
 
