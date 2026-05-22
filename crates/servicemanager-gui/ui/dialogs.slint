@@ -1,5 +1,6 @@
 import { Theme } from "theme.slint";
 import { Card, AccentButton, GhostButton, SortHeader } from "widgets.slint";
+import { ScrollView } from "std-widgets.slint";
 
 export struct ProcessRow {
     pid: string,
@@ -133,7 +134,7 @@ export component InstallDialog inherits Rectangle {
 
     Card {
         width: 560px;
-        height: 712px;
+        height: min(712px, parent.height - 48px);
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         VerticalLayout {
@@ -146,20 +147,25 @@ export component InstallDialog inherits Rectangle {
                 font-weight: 800;
             }
             Rectangle { height: 4px; }
-            Field { label: "Service name"; text <=> root.name; }
-            Field { label: "Display name"; text <=> root.display-name; }
-            Field { label: "Application"; text <=> root.application; }
-            HorizontalLayout {
-                alignment: start;
-                GhostButton { text: "Browse for executable…"; clicked => { root.browse-app(); } }
+            ScrollView {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    spacing: 8px;
+                    Field { label: "Service name"; text <=> root.name; }
+                    Field { label: "Display name"; text <=> root.display-name; }
+                    Field { label: "Application"; text <=> root.application; }
+                    HorizontalLayout {
+                        alignment: start;
+                        GhostButton { text: "Browse for executable…"; clicked => { root.browse-app(); } }
+                    }
+                    Field { label: "Arguments"; text <=> root.arguments; }
+                    Field { label: "Working directory"; text <=> root.working-dir; }
+                    Field { label: "stdout log"; text <=> root.stdout-path; }
+                    Field { label: "stderr log"; text <=> root.stderr-path; }
+                    StartTypePick { value <=> root.start-type; }
+                }
             }
-            Field { label: "Arguments"; text <=> root.arguments; }
-            Field { label: "Working directory"; text <=> root.working-dir; }
-            Field { label: "stdout log"; text <=> root.stdout-path; }
-            Field { label: "stderr log"; text <=> root.stderr-path; }
-            StartTypePick { value <=> root.start-type; }
             ErrorText { text: root.error; visible: root.error != ""; }
-            Rectangle { }
             HorizontalLayout {
                 spacing: 8px;
                 Rectangle { }
@@ -191,7 +197,7 @@ export component EditDialog inherits Rectangle {
 
     Card {
         width: 560px;
-        height: 712px;
+        height: min(712px, parent.height - 48px);
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         VerticalLayout {
@@ -204,25 +210,30 @@ export component EditDialog inherits Rectangle {
                 font-weight: 800;
             }
             Rectangle { height: 4px; }
-            ReadField { label: "Service name"; value: root.service-name; }
-            Field { label: "Display name"; text <=> root.display-name; }
-            Field { label: "Application"; text <=> root.application; }
-            HorizontalLayout {
-                alignment: start;
-                GhostButton { text: "Browse for executable…"; clicked => { root.browse-app(); } }
-            }
-            Field { label: "Arguments"; text <=> root.arguments; }
-            Field { label: "Working directory"; text <=> root.working-dir; }
-            Field { label: "stdout log"; text <=> root.stdout-path; }
-            Field { label: "stderr log"; text <=> root.stderr-path; }
-            StartTypePick { value <=> root.start-type; }
-            Text {
-                text: "Only fields you change are written.";
-                color: Theme.text-faint;
-                font-size: 12px;
+            ScrollView {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    spacing: 8px;
+                    ReadField { label: "Service name"; value: root.service-name; }
+                    Field { label: "Display name"; text <=> root.display-name; }
+                    Field { label: "Application"; text <=> root.application; }
+                    HorizontalLayout {
+                        alignment: start;
+                        GhostButton { text: "Browse for executable…"; clicked => { root.browse-app(); } }
+                    }
+                    Field { label: "Arguments"; text <=> root.arguments; }
+                    Field { label: "Working directory"; text <=> root.working-dir; }
+                    Field { label: "stdout log"; text <=> root.stdout-path; }
+                    Field { label: "stderr log"; text <=> root.stderr-path; }
+                    StartTypePick { value <=> root.start-type; }
+                    Text {
+                        text: "Only fields you change are written.";
+                        color: Theme.text-faint;
+                        font-size: 12px;
+                    }
+                }
             }
             ErrorText { text: root.error; visible: root.error != ""; }
-            Rectangle { }
             HorizontalLayout {
                 spacing: 8px;
                 Rectangle { }
