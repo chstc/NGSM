@@ -78,6 +78,10 @@ pub enum JobResult {
     /// Outcome of a `SaveRecovery` job — routed to the Recovery view's own
     /// status line. `Ok` carries the success message, `Err` the failure.
     RecoverySaved(Result<String, String>),
+    /// Outcome of an `Install` job — routed back to the Install dialog.
+    Installed(Result<String, String>),
+    /// Outcome of an `Edit` job — routed back to the Edit dialog.
+    Edited(Result<String, String>),
     Error(String),
 }
 
@@ -140,14 +144,8 @@ fn execute(job: Job) -> JobResult {
             Ok((defs, warnings)) => JobResult::Services { defs, warnings },
             Err(e) => JobResult::Error(format!("enumerate: {e}")),
         },
-        Job::Install(spec) => match install(spec) {
-            Ok(msg) => JobResult::Acted(msg),
-            Err(e) => JobResult::Error(e),
-        },
-        Job::Edit(spec) => match edit(spec) {
-            Ok(msg) => JobResult::Acted(msg),
-            Err(e) => JobResult::Error(e),
-        },
+        Job::Install(spec) => JobResult::Installed(install(spec)),
+        Job::Edit(spec) => JobResult::Edited(edit(spec)),
         Job::Start(n) => simple(&n, "Start requested", || {
             ensure_ngsm_managed(&n)?;
             ensure_enabled(&n)?;

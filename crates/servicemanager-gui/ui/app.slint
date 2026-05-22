@@ -51,6 +51,7 @@ export component MainWindow inherits Window {
     in-out property <string> modal-stderr;
     in-out property <int> modal-start-type;
     in property <string> modal-error;
+    in property <bool> modal-busy;
     in property <string> modal-service-name;
     in property <[ProcessRow]> modal-processes;
     callback modal-install-submit();
@@ -351,6 +352,7 @@ export component MainWindow inherits Window {
         stderr-path <=> root.modal-stderr;
         start-type <=> root.modal-start-type;
         error: root.modal-error;
+        busy: root.modal-busy;
         submit => { root.modal-install-submit(); }
         cancel => { root.modal-cancel(); }
         browse-app => { root.modal-browse-app(); }
@@ -365,6 +367,7 @@ export component MainWindow inherits Window {
         stderr-path <=> root.modal-stderr;
         start-type <=> root.modal-start-type;
         error: root.modal-error;
+        busy: root.modal-busy;
         submit => { root.modal-edit-submit(); }
         cancel => { root.modal-cancel(); }
         browse-app => { root.modal-browse-app(); }

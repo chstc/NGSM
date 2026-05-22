@@ -125,6 +125,7 @@ export component InstallDialog inherits Rectangle {
     in-out property <string> stderr-path;
     in-out property <int> start-type;
     in property <string> error;
+    in property <bool> busy;
     callback submit();
     callback cancel();
     callback browse-app();
@@ -170,7 +171,7 @@ export component InstallDialog inherits Rectangle {
                 spacing: 8px;
                 Rectangle { }
                 GhostButton { text: "Cancel"; clicked => { root.cancel(); } }
-                AccentButton { text: "Install"; clicked => { root.submit(); } }
+                AccentButton { text: "Install"; enabled: !root.busy; clicked => { root.submit(); } }
             }
         }
     }
@@ -188,6 +189,7 @@ export component EditDialog inherits Rectangle {
     in-out property <string> stderr-path;
     in-out property <int> start-type;
     in property <string> error;
+    in property <bool> busy;
     callback submit();
     callback cancel();
     callback browse-app();
@@ -238,7 +240,7 @@ export component EditDialog inherits Rectangle {
                 spacing: 8px;
                 Rectangle { }
                 GhostButton { text: "Cancel"; clicked => { root.cancel(); } }
-                AccentButton { text: "Save"; clicked => { root.submit(); } }
+                AccentButton { text: "Save"; enabled: !root.busy; clicked => { root.submit(); } }
             }
         }
     }

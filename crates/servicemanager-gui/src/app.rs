@@ -264,6 +264,7 @@ fn wire_callbacks(window: &MainWindow) {
                     clear_modal_fields(&win);
                     win.set_modal_start_type(0);
                     win.set_modal_error("".into());
+                    win.set_modal_busy(false);
                     win.set_active_modal(1);
                 }
             }
@@ -276,6 +277,7 @@ fn wire_callbacks(window: &MainWindow) {
             st.edit_form = None;
             if let Some(win) = st.window.upgrade() {
                 win.set_active_modal(0);
+                win.set_modal_busy(false);
             }
         });
     });
@@ -316,8 +318,9 @@ fn wire_callbacks(window: &MainWindow) {
             match form.to_spec() {
                 Ok(spec) => {
                     win.set_status_text(format!("Installing '{}'…", spec.name).into());
+                    win.set_modal_error("".into());
+                    win.set_modal_busy(true);
                     let _ = st.job_tx.send(Job::Install(spec));
-                    win.set_active_modal(0);
                 }
                 Err(e) => win.set_modal_error(e.into()),
             }
@@ -343,9 +346,9 @@ fn wire_callbacks(window: &MainWindow) {
             match form.to_spec() {
                 Ok(spec) => {
                     win.set_status_text(format!("Editing '{}'…", spec.name).into());
+                    win.set_modal_error("".into());
+                    win.set_modal_busy(true);
                     let _ = st.job_tx.send(Job::Edit(spec));
-                    st.edit_form = None;
-                    win.set_active_modal(0);
                 }
                 Err(e) => win.set_modal_error(e.into()),
             }
@@ -556,6 +559,7 @@ fn open_edit_modal(st: &mut AppState, win: &MainWindow, name: &str) {
     win.set_modal_stderr(form.stderr.clone().into());
     win.set_modal_start_type(start_type_to_int(form.start_type));
     win.set_modal_error("".into());
+    win.set_modal_busy(false);
     st.edit_form = Some(form);
     win.set_active_modal(2);
 }
@@ -653,6 +657,31 @@ fn drain_results() {
                     }
                     Err(e) => {
                         win.set_recovery_status(format!("Error: {e}").into());
+                    }
+                },
+                JobResult::Installed(result) => match result {
+                    Ok(msg) => {
+                        win.set_modal_busy(false);
+                        win.set_active_modal(0);
+                        win.set_status_text(msg.into());
+                        let _ = st.job_tx.send(Job::Refresh);
+                    }
+                    Err(e) => {
+                        win.set_modal_busy(false);
+                        win.set_modal_error(e.into());
+                    }
+                },
+                JobResult::Edited(result) => match result {
+                    Ok(msg) => {
+                        win.set_modal_busy(false);
+                        st.edit_form = None;
+                        win.set_active_modal(0);
+                        win.set_status_text(msg.into());
+                        let _ = st.job_tx.send(Job::Refresh);
+                    }
+                    Err(e) => {
+                        win.set_modal_busy(false);
+                        win.set_modal_error(e.into());
                     }
                 },
                 JobResult::Error(e) => {
