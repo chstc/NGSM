@@ -1,6 +1,6 @@
 import { Theme } from "theme.slint";
 import { Card, AccentButton, GhostButton, SortHeader } from "widgets.slint";
-import { ScrollView } from "std-widgets.slint";
+import { ScrollView, ListView } from "std-widgets.slint";
 
 export struct ProcessRow {
     pid: string,
@@ -341,17 +341,19 @@ export component ProcessesDialog inherits Rectangle {
                     horizontal-stretch: 1;
                 }
             }
-            for p in root.rows : Rectangle {
-                height: 28px;
-                HorizontalLayout {
-                    padding-left: 4px;
-                    spacing: 14px;
-                    Text { text: p.pid; color: Theme.text; font-family: "Consolas"; font-size: 12px; width: 70px; vertical-alignment: center; }
-                    Text { text: p.ppid; color: Theme.text-dim; font-family: "Consolas"; font-size: 12px; width: 70px; vertical-alignment: center; }
-                    Text { text: p.image; color: Theme.text; font-size: 12px; vertical-alignment: center; }
+            ListView {
+                vertical-stretch: 1;
+                for p in root.rows : Rectangle {
+                    height: 28px;
+                    HorizontalLayout {
+                        padding-left: 4px;
+                        spacing: 14px;
+                        Text { text: p.pid; color: Theme.text; font-family: "Consolas"; font-size: 12px; width: 70px; vertical-alignment: center; }
+                        Text { text: p.ppid; color: Theme.text-dim; font-family: "Consolas"; font-size: 12px; width: 70px; vertical-alignment: center; }
+                        Text { text: p.image; color: Theme.text; font-size: 12px; vertical-alignment: center; }
+                    }
                 }
             }
-            Rectangle { }
             HorizontalLayout {
                 Rectangle { }
                 GhostButton { text: "Close"; clicked => { root.close(); } }
