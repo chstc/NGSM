@@ -117,7 +117,14 @@ impl EventWriter {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         line.push('\n');
         append_one(&path, line.as_bytes())?;
-        maybe_rotate(&path)?;
+        // The record is already on disk; rotation failure is a housekeeping
+        // problem, not a write failure. Log and continue.
+        if let Err(e) = maybe_rotate(&path) {
+            eprintln!(
+                "[supervisor:{}] event log rotation failed (ignored): {e}",
+                self.service
+            );
+        }
         Ok(())
     }
 }
