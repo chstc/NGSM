@@ -37,6 +37,8 @@ use servicemanager_win32::{
     send_ctrl_break, suspend_process, terminate_process, JobObject,
 };
 
+pub mod event_log;
+
 pub const DEFAULT_RESTART_DELAY_MS: u32 = 0;
 pub const DEFAULT_THROTTLE_DELAY_MS: u32 = 1500;
 pub const THROTTLE_THRESHOLD_MS: u128 = 1500;
