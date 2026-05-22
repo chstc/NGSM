@@ -404,6 +404,26 @@ export component ServicesView inherits Rectangle {
                         spacing: 8px;
                         alignment: start;
                         GhostButton {
+                            text: "Pause";
+                            enabled: root.current.can-pause;
+                            clicked => { root.action("pause", root.current.name); }
+                        }
+                        GhostButton {
+                            text: "Continue";
+                            enabled: root.current.can-continue;
+                            clicked => { root.action("continue", root.current.name); }
+                        }
+                        GhostButton {
+                            text: "Rotate logs";
+                            enabled: root.current.can-rotate;
+                            clicked => { root.action("rotate", root.current.name); }
+                        }
+                    }
+                    Rectangle { height: 9px; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        GhostButton {
                             text: "Edit…";
                             enabled: root.current.can-edit;
                             clicked => { root.action("edit", root.current.name); }
