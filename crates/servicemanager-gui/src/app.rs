@@ -680,9 +680,16 @@ fn apply_snapshot(win: &MainWindow, st: &mut AppState) {
     let _ = st.job_tx.send(Job::ReadEvents);
 }
 
-/// Rebuild the `services` model from the cached defs + current filter/search.
+/// Rebuild the `services` model from the cached defs + current filter/search,
+/// preserving the user's selection by service name across the rebuild.
 fn refresh_service_model(win: &MainWindow, st: &mut AppState) {
     let elevated = win.get_elevated();
+    // Capture the selected service name before the model (and visible_names)
+    // are replaced, so the selection can follow the service, not the index.
+    let selected_name = {
+        let idx = win.get_selected_service().max(0) as usize;
+        st.visible_names.get(idx).cloned()
+    };
     let mut rows: Vec<ServiceRow> = st
         .defs
         .iter()
@@ -691,7 +698,9 @@ fn refresh_service_model(win: &MainWindow, st: &mut AppState) {
         .collect();
     adapter::sort_service_rows(&mut rows, st.sort_column, st.sort_ascending);
     st.visible_names = rows.iter().map(|r| r.name.to_string()).collect();
+    let selected = adapter::remap_selection(selected_name.as_deref(), &st.visible_names);
     win.set_services(slint::ModelRc::new(slint::VecModel::from(rows)));
+    win.set_selected_service(selected);
 }
 
 /// Re-read the currently-selected service's log into the Logs view.

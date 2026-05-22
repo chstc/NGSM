@@ -72,7 +72,7 @@ export component ServicesView inherits Rectangle {
     in property <int> sort-column;
     in property <bool> sort-ascending;
 
-    property <ServiceRow> current: root.rows[root.selected];
+    property <ServiceRow> current: root.rows.length > 0 ? root.rows[root.selected] : {};
 
     HorizontalLayout {
         spacing: Theme.gap;

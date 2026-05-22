@@ -193,6 +193,16 @@ pub fn sort_service_rows(rows: &mut [ServiceRow], column: i32, ascending: bool) 
     });
 }
 
+/// Find the new row index for a previously-selected service after the model
+/// was rebuilt. Returns the index of `selected` in `names`, or `0` when there
+/// is no prior selection or the service is no longer present. The caller must
+/// still guard against indexing an empty model.
+pub fn remap_selection(selected: Option<&str>, names: &[String]) -> i32 {
+    selected
+        .and_then(|name| names.iter().position(|n| n == name))
+        .unwrap_or(0) as i32
+}
+
 /// Sort the process-tree rows in place. Columns 0 (pid) and 1 (parent pid)
 /// sort numerically; column 2 (image) sorts as text.
 pub fn sort_process_rows(rows: &mut [ProcessRow], column: i32, ascending: bool) {
@@ -431,6 +441,24 @@ mod tests {
             to_service_row(&stopped, true).can_remove,
             "a stopped managed service stays removable"
         );
+    }
+
+    #[test]
+    fn remap_selection_follows_the_name() {
+        let names = vec![
+            "alpha".to_string(),
+            "bravo".to_string(),
+            "charlie".to_string(),
+        ];
+        // The selected service moved to a new index.
+        assert_eq!(remap_selection(Some("charlie"), &names), 2);
+        assert_eq!(remap_selection(Some("alpha"), &names), 0);
+        // The selected service is gone -> fall back to the first row.
+        assert_eq!(remap_selection(Some("ghost"), &names), 0);
+        // No prior selection -> first row.
+        assert_eq!(remap_selection(None, &names), 0);
+        // Empty list -> 0 (callers must guard indexing an empty model).
+        assert_eq!(remap_selection(Some("alpha"), &[]), 0);
     }
 
     #[test]
