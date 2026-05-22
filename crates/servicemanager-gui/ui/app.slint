@@ -62,6 +62,13 @@ export component MainWindow inherits Window {
     in property <bool> modal-sort-ascending;
     callback modal-sort-changed(int);
 
+    in property <string> log-service-name;
+    in property <bool> log-stderr;
+    in property <string> log-status;
+    in property <[string]> log-lines;
+    callback logs-reload();
+    callback logs-set-stderr(bool);
+
     HorizontalLayout {
         spacing: 0px;
 
@@ -122,7 +129,7 @@ export component MainWindow inherits Window {
 
                 NavItem { label: "Dashboard"; icon: "dashboard"; active: root.view == 0; clicked => { root.view = 0; } }
                 NavItem { label: "Services";  icon: "services";  active: root.view == 1; clicked => { root.view = 1; } }
-                NavItem { label: "Logs";      icon: "logs";      active: root.view == 2; clicked => { root.view = 2; } }
+                NavItem { label: "Logs";      icon: "logs";      active: root.view == 2; clicked => { root.view = 2; root.logs-reload(); } }
                 NavItem { label: "Recovery";  icon: "recovery";  active: root.view == 3; clicked => { root.view = 3; } }
                 NavItem { label: "Settings";  icon: "settings";  active: root.view == 4; clicked => { root.view = 4; } }
 
@@ -270,7 +277,14 @@ export component MainWindow inherits Window {
                         row-selected(idx) => { root.row-selected(idx); }
                         sort-changed(c) => { root.sort-changed(c); }
                     }
-                    if root.view == 2 : LogsView { }
+                    if root.view == 2 : LogsView {
+                        service-name: root.log-service-name;
+                        stderr: root.log-stderr;
+                        status: root.log-status;
+                        lines: root.log-lines;
+                        reload => { root.logs-reload(); }
+                        set-stderr(v) => { root.logs-set-stderr(v); }
+                    }
                     if root.view == 3 : RecoveryView { }
                     if root.view == 4 : SettingsView { }
                 }

@@ -42,6 +42,7 @@ pub enum Job {
     Rotate(String),
     Remove(String),
     Processes(String),
+    ReadLog { service: String, stderr: bool },
 }
 
 /// A result the worker posts back to the UI.
@@ -60,6 +61,13 @@ pub enum JobResult {
     /// A privileged action ran (e.g. `Install`). Stash the success message;
     /// the UI shows it in the status bar.
     Acted(String),
+    /// A tail of a service's stdout/stderr log.
+    Log {
+        service: String,
+        stderr: bool,
+        status: String,
+        lines: Vec<String>,
+    },
     Error(String),
 }
 
@@ -150,6 +158,7 @@ fn execute(job: Job) -> JobResult {
             Ok(r) => r,
             Err(e) => JobResult::Error(e),
         },
+        Job::ReadLog { service, stderr } => read_log(&service, stderr),
     }
 }
 
@@ -442,4 +451,70 @@ fn processes(name: &str) -> Result<JobResult, String> {
         service: name.to_string(),
         processes: descendants,
     })
+}
+
+/// Read the tail of a managed service's stdout or stderr log file.
+fn read_log(service: &str, stderr: bool) -> JobResult {
+    let which = if stderr { "stderr" } else { "stdout" };
+    let log = |status: String, lines: Vec<String>| JobResult::Log {
+        service: service.to_string(),
+        stderr,
+        status,
+        lines,
+    };
+    let cfg = match servicemanager_registry::read_managed_config(service) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            return log(
+                format!("'{service}' is not an NGSM-managed service."),
+                Vec::new(),
+            )
+        }
+        Err(e) => return log(format!("Cannot read '{service}' config: {e}"), Vec::new()),
+    };
+    let path = if stderr {
+        cfg.io.stderr.as_ref().map(|s| s.path.clone())
+    } else {
+        cfg.io.stdout.as_ref().map(|s| s.path.clone())
+    };
+    let Some(path) = path else {
+        return log(
+            format!("No {which} log is configured for '{service}'."),
+            Vec::new(),
+        );
+    };
+    match tail_file(&path) {
+        Ok(lines) => log(
+            format!("{which}  ·  {path}  ·  {} lines", lines.len()),
+            lines,
+        ),
+        Err(e) => log(format!("Cannot read {which} log '{path}': {e}"), Vec::new()),
+    }
+}
+
+/// Read the last ~64 KiB of a file and return up to its last 400 lines.
+fn tail_file(path: &str) -> std::io::Result<Vec<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 64 * 1024;
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    let partial = len > TAIL;
+    if partial {
+        f.seek(SeekFrom::Start(len - TAIL))?;
+    }
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    let mut lines: Vec<String> = String::from_utf8_lossy(&buf)
+        .lines()
+        .map(|l| l.to_string())
+        .collect();
+    // A mid-file seek leaves the first line truncated — drop it.
+    if partial && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let extra = lines.len().saturating_sub(400);
+    if extra > 0 {
+        lines.drain(0..extra);
+    }
+    Ok(lines)
 }

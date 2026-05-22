@@ -1,8 +1,9 @@
 import { Theme } from "theme.slint";
-import { Card } from "widgets.slint";
+import { Card, GhostButton } from "widgets.slint";
+import { ScrollView } from "std-widgets.slint";
 
-// R1 placeholder for views whose full implementation is deferred (Logs and
-// Recovery to R2/R3, Settings to R3). Keeps the shell coherent and navigable.
+// Placeholder for views whose full implementation is deferred (Recovery and
+// Settings to R3). Keeps the shell coherent and navigable.
 component StubView inherits Rectangle {
     in property <string> view-title;
     background: transparent;
@@ -27,8 +28,104 @@ component StubView inherits Rectangle {
     }
 }
 
-export component LogsView inherits StubView {
-    view-title: "Logs";
+// One stdout/stderr selector chip.
+component StreamChip inherits Rectangle {
+    in property <string> label;
+    in property <bool> active;
+    callback clicked;
+    width: 88px;
+    height: 36px;
+    border-radius: Theme.radius-sm;
+    border-width: 1px;
+    border-color: root.active ? Theme.cyan : Theme.card-border;
+    background: root.active ? Theme.cyan.with-alpha(0.14) : Theme.card-bg;
+    Text {
+        text: root.label;
+        color: root.active ? Theme.cyan : Theme.text-dim;
+        font-size: 13px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Tails the selected service's redirected stdout / stderr log.
+export component LogsView inherits Rectangle {
+    in property <string> service-name;
+    in property <bool> stderr;
+    in property <string> status;
+    in property <[string]> lines;
+    callback reload();
+    callback set-stderr(bool);
+    background: transparent;
+
+    VerticalLayout {
+        spacing: Theme.gap;
+
+        HorizontalLayout {
+            spacing: 10px;
+            alignment: start;
+            Rectangle {
+                height: 36px;
+                border-radius: Theme.radius-sm;
+                border-width: 1px;
+                border-color: Theme.card-border;
+                background: Theme.card-bg;
+                HorizontalLayout {
+                    padding-left: 13px;
+                    padding-right: 16px;
+                    Text {
+                        text: root.service-name == "" ? "(no service selected)" : root.service-name;
+                        color: root.service-name == "" ? Theme.text-faint : Theme.text;
+                        font-size: 13px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+            StreamChip {
+                label: "stdout";
+                active: !root.stderr;
+                clicked => { root.set-stderr(false); }
+            }
+            StreamChip {
+                label: "stderr";
+                active: root.stderr;
+                clicked => { root.set-stderr(true); }
+            }
+            GhostButton {
+                text: "Reload";
+                clicked => { root.reload(); }
+            }
+            Rectangle { }
+        }
+
+        Card {
+            VerticalLayout {
+                padding: 14px;
+                spacing: 8px;
+                Text {
+                    text: root.status;
+                    color: Theme.text-faint;
+                    font-size: 12px;
+                }
+                ScrollView {
+                    VerticalLayout {
+                        alignment: start;
+                        for line in root.lines : Text {
+                            text: line;
+                            color: Theme.text-dim;
+                            font-family: "Consolas";
+                            font-size: 12px;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 export component RecoveryView inherits StubView {

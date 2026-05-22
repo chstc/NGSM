@@ -27,6 +27,11 @@ struct AppState {
     search: String,
     sort_column: i32,
     sort_ascending: bool,
+    /// Service names in current display order — maps the selected row index
+    /// (used by the Logs view) back to a service.
+    visible_names: Vec<String>,
+    /// Whether the Logs view is showing stderr (vs stdout).
+    log_stderr: bool,
     events: Vec<EventEntry>,
     /// In-progress edit form — holds the originals so `to_spec` can diff.
     edit_form: Option<forms::EditForm>,
@@ -90,6 +95,8 @@ pub fn build_ui() -> Result<MainWindow, slint::PlatformError> {
             search: String::new(),
             sort_column: 0,
             sort_ascending: true,
+            visible_names: Vec::new(),
+            log_stderr: false,
             events: Vec::new(),
             edit_form: None,
             proc_rows: Vec::new(),
@@ -360,6 +367,26 @@ fn wire_callbacks(window: &MainWindow) {
             }
         });
     });
+    window.on_logs_reload(|| {
+        STATE.with(|s| {
+            let guard = s.borrow();
+            let Some(st) = guard.as_ref() else { return };
+            if let Some(win) = st.window.upgrade() {
+                request_log(&win, st);
+            }
+        });
+    });
+    window.on_logs_set_stderr(|stderr| {
+        STATE.with(|s| {
+            let mut guard = s.borrow_mut();
+            let Some(st) = guard.as_mut() else { return };
+            st.log_stderr = stderr;
+            if let Some(win) = st.window.upgrade() {
+                win.set_log_stderr(stderr);
+                request_log(&win, st);
+            }
+        });
+    });
 }
 
 /// Send a worker job and show a pending message in the status bar.
@@ -456,6 +483,19 @@ fn drain_results() {
                     apply_process_model(&win, st);
                     win.set_active_modal(4);
                 }
+                JobResult::Log {
+                    service,
+                    stderr,
+                    status,
+                    lines,
+                } => {
+                    win.set_log_service_name(service.into());
+                    win.set_log_stderr(stderr);
+                    win.set_log_status(status.into());
+                    let shared: Vec<slint::SharedString> =
+                        lines.into_iter().map(|l| l.into()).collect();
+                    win.set_log_lines(slint::ModelRc::new(slint::VecModel::from(shared)));
+                }
                 JobResult::Error(e) => {
                     win.set_status_text(format!("Error: {e}").into());
                 }
@@ -510,7 +550,7 @@ fn local_hms() -> String {
 }
 
 /// Rebuild the `services` model from the cached defs + current filter/search.
-fn refresh_service_model(win: &MainWindow, st: &AppState) {
+fn refresh_service_model(win: &MainWindow, st: &mut AppState) {
     let elevated = win.get_elevated();
     let mut rows: Vec<ServiceRow> = st
         .defs
@@ -519,7 +559,31 @@ fn refresh_service_model(win: &MainWindow, st: &AppState) {
         .map(|d| adapter::to_service_row(d, elevated))
         .collect();
     adapter::sort_service_rows(&mut rows, st.sort_column, st.sort_ascending);
+    st.visible_names = rows.iter().map(|r| r.name.to_string()).collect();
     win.set_services(slint::ModelRc::new(slint::VecModel::from(rows)));
+}
+
+/// Re-read the currently-selected service's log into the Logs view.
+fn request_log(win: &MainWindow, st: &AppState) {
+    let idx = win.get_selected_service().max(0) as usize;
+    match st.visible_names.get(idx) {
+        Some(name) => {
+            win.set_log_service_name(name.clone().into());
+            win.set_log_status("Loading…".into());
+            let _ = st.job_tx.send(Job::ReadLog {
+                service: name.clone(),
+                stderr: st.log_stderr,
+            });
+        }
+        None => {
+            win.set_log_service_name("".into());
+            win.set_log_status("Select a service in the Services view to view its log.".into());
+            win.set_log_lines(slint::ModelRc::new(slint::VecModel::from(Vec::<
+                slint::SharedString,
+            >::new(
+            ))));
+        }
+    }
 }
 
 /// Rebuild the Processes-dialog model from the cached rows + current sort.
