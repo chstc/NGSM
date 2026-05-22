@@ -47,12 +47,15 @@ export component Pill inherits Rectangle {
 export component AccentButton inherits Rectangle {
     in property <string> text;
     in property <color> tint: Theme.green;
+    in property <bool> enabled: true;
     callback clicked;
     height: 36px;
     border-radius: Theme.radius-sm;
     background: ta.has-hover ? tint.brighter(0.15) : tint;
+    opacity: root.enabled ? 1.0 : 0.4;
     animate background { duration: 110ms; }
     ta := TouchArea {
+        enabled: root.enabled;
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
     }
@@ -74,14 +77,17 @@ export component AccentButton inherits Rectangle {
 export component GhostButton inherits Rectangle {
     in property <string> text;
     in property <color> tint: Theme.text;
+    in property <bool> enabled: true;
     callback clicked;
     height: 36px;
     border-radius: Theme.radius-sm;
     border-width: 1px;
     border-color: ta.has-hover ? tint.with-alpha(0.55) : Theme.card-border;
     background: ta.has-hover ? Theme.hover : transparent;
+    opacity: root.enabled ? 1.0 : 0.4;
     animate border-color, background { duration: 110ms; }
     ta := TouchArea {
+        enabled: root.enabled;
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
     }

@@ -1,13 +1,29 @@
 import { Theme } from "theme.slint";
 import { Card, Pill, AccentButton, GhostButton, Caret } from "widgets.slint";
 
-struct Svc {
+export struct ServiceRow {
     name: string,
     display: string,
     kind: string,
     state: string,
     startup: string,
     running: bool,
+    image-path: string,
+    application: string,
+    arguments: string,
+    working-dir: string,
+    account: string,
+    pid: string,
+    stdout-log: string,
+    can-start: bool,
+    can-stop: bool,
+    can-restart: bool,
+    can-pause: bool,
+    can-continue: bool,
+    can-rotate: bool,
+    can-edit: bool,
+    can-remove: bool,
+    can-processes: bool,
 }
 
 component DetailLine inherits Rectangle {
@@ -45,15 +61,17 @@ component HeaderCell inherits Text {
 
 export component ServicesView inherits Rectangle {
     background: transparent;
+    in property <[ServiceRow]> rows;
+    in property <bool> elevated: false;
     in-out property <int> selected: 0;
-    property <[Svc]> rows: [
-        { name: "SmDemoSvcA",     display: "ServiceManager demo A", kind: "managed", state: "Running", startup: "Manual",    running: true },
-        { name: "SmDemoSvcB",     display: "ServiceManager demo B", kind: "managed", state: "Stopped", startup: "Automatic", running: false },
-        { name: "SmIngestWorker", display: "Ingest worker",         kind: "managed", state: "Running", startup: "Automatic", running: true },
-        { name: "SmReportSvc",    display: "Report scheduler",      kind: "managed", state: "Running", startup: "Automatic", running: true },
-        { name: "Spooler",        display: "Print Spooler",         kind: "native",  state: "Running", startup: "Automatic", running: true },
-        { name: "wuauserv",       display: "Windows Update",        kind: "native",  state: "Stopped", startup: "Manual",    running: false },
-    ];
+    in-out property <bool> managed-only: true;
+    callback refresh();
+    callback install();
+    callback action(string, string);
+    callback filter-changed(bool);
+    callback row-selected(int);
+
+    property <ServiceRow> current: root.rows[root.selected];
 
     HorizontalLayout {
         spacing: Theme.gap;
@@ -66,20 +84,27 @@ export component ServicesView inherits Rectangle {
             HorizontalLayout {
                 spacing: 10px;
                 alignment: start;
-                AccentButton { text: "Install service"; }
-                GhostButton { text: "Refresh"; }
+                AccentButton {
+                    text: "Install service";
+                    enabled: root.elevated;
+                    clicked => { root.install(); }
+                }
+                GhostButton {
+                    text: "Refresh";
+                    clicked => { root.refresh(); }
+                }
                 Rectangle {
                     width: 156px;
                     height: 36px;
                     border-radius: Theme.radius-sm;
                     border-width: 1px;
                     border-color: Theme.card-border;
-                    background: Theme.card-bg;
+                    background: filt.has-hover ? Theme.card-bg.brighter(0.5) : Theme.card-bg;
                     HorizontalLayout {
                         padding-left: 13px;
                         padding-right: 30px;
                         Text {
-                            text: "Managed only";
+                            text: root.managed-only ? "Managed only" : "All services";
                             color: Theme.text-dim;
                             font-size: 13px;
                             vertical-alignment: center;
@@ -88,6 +113,13 @@ export component ServicesView inherits Rectangle {
                     Caret {
                         x: parent.width - self.width - 13px;
                         y: (parent.height - self.height) / 2;
+                    }
+                    filt := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.managed-only = !root.managed-only;
+                            root.filter-changed(root.managed-only);
+                        }
                     }
                 }
                 Rectangle { }
@@ -119,7 +151,10 @@ export component ServicesView inherits Rectangle {
                                   : transparent;
                         rta := TouchArea {
                             mouse-cursor: pointer;
-                            clicked => { root.selected = idx; }
+                            clicked => {
+                                root.selected = idx;
+                                root.row-selected(idx);
+                            }
                         }
                         HorizontalLayout {
                             padding-left: 14px;
@@ -177,51 +212,76 @@ export component ServicesView inherits Rectangle {
             Card {
                 VerticalLayout {
                     padding: 24px;
-                alignment: start;
-                spacing: 0px;
-                Text {
-                    text: root.rows[root.selected].display;
-                    color: Theme.text;
-                    font-size: 21px;
-                    font-weight: 800;
-                }
-                Rectangle { height: 8px; }
-                HorizontalLayout {
-                    spacing: 8px;
                     alignment: start;
-                    Pill {
-                        text: root.rows[root.selected].state;
-                        tint: root.rows[root.selected].running ? Theme.green : Theme.amber;
+                    spacing: 0px;
+                    Text {
+                        text: root.current.display;
+                        color: Theme.text;
+                        font-size: 21px;
+                        font-weight: 800;
                     }
-                    Pill {
-                        text: root.rows[root.selected].kind;
-                        tint: Theme.cyan;
+                    Rectangle { height: 8px; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        Pill {
+                            text: root.current.state;
+                            tint: root.current.running ? Theme.green : Theme.amber;
+                        }
+                        Pill {
+                            text: root.current.kind;
+                            tint: Theme.cyan;
+                        }
+                    }
+                    Rectangle { height: 18px; }
+                    DetailLine { label: "Service name"; value: root.current.name; }
+                    DetailLine { label: "Application";  value: root.current.application; }
+                    DetailLine { label: "Arguments";    value: root.current.arguments; }
+                    DetailLine { label: "Working dir";  value: root.current.working-dir; }
+                    DetailLine { label: "Startup type"; value: root.current.startup; }
+                    DetailLine { label: "stdout log";   value: root.current.stdout-log; }
+                    Rectangle { height: 22px; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        AccentButton {
+                            text: "Start";
+                            enabled: root.current.can-start;
+                            clicked => { root.action("start", root.current.name); }
+                        }
+                        GhostButton {
+                            text: "Stop";
+                            enabled: root.current.can-stop;
+                            clicked => { root.action("stop", root.current.name); }
+                        }
+                        GhostButton {
+                            text: "Restart";
+                            enabled: root.current.can-restart;
+                            clicked => { root.action("restart", root.current.name); }
+                        }
+                    }
+                    Rectangle { height: 9px; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        GhostButton {
+                            text: "Edit…";
+                            enabled: root.current.can-edit;
+                            clicked => { root.action("edit", root.current.name); }
+                        }
+                        GhostButton {
+                            text: "Processes…";
+                            enabled: root.current.can-processes;
+                            clicked => { root.action("processes", root.current.name); }
+                        }
+                        GhostButton {
+                            text: "Remove";
+                            tint: Theme.red;
+                            enabled: root.current.can-remove;
+                            clicked => { root.action("remove", root.current.name); }
+                        }
                     }
                 }
-                Rectangle { height: 18px; }
-                DetailLine { label: "Service name"; value: root.rows[root.selected].name; }
-                DetailLine { label: "Application";  value: "C:\\Apps\\demo\\demo.exe"; }
-                DetailLine { label: "Arguments";    value: "--config prod.toml --verbose"; }
-                DetailLine { label: "Working dir";  value: "C:\\Apps\\demo"; }
-                DetailLine { label: "Startup type"; value: root.rows[root.selected].startup; }
-                DetailLine { label: "stdout log";   value: "C:\\Apps\\demo\\logs\\out.log"; }
-                Rectangle { height: 22px; }
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: start;
-                    AccentButton { text: "Start"; }
-                    GhostButton { text: "Stop"; }
-                    GhostButton { text: "Restart"; }
-                }
-                Rectangle { height: 9px; }
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: start;
-                    GhostButton { text: "Edit…"; }
-                    GhostButton { text: "Processes…"; }
-                    GhostButton { text: "Remove"; tint: Theme.red; }
-                }
-            }
             }
         }
     }

@@ -1,7 +1,7 @@
 import { Theme } from "theme.slint";
 import { NavItem } from "widgets.slint";
-import { DashboardView } from "dashboard.slint";
-import { ServicesView } from "services.slint";
+import { DashboardView, EventEntry } from "dashboard.slint";
+import { ServicesView, ServiceRow } from "services.slint";
 import { LogsView, RecoveryView, SettingsView } from "secondary.slint";
 
 export component MainWindow inherits Window {
@@ -16,6 +16,23 @@ export component MainWindow inherits Window {
     min-height: 700px;
 
     property <int> view: 0;
+
+    in property <bool> elevated: false;
+    in property <[ServiceRow]> services;
+    in-out property <int> selected-service: 0;
+    in property <string> stat-total: "0";
+    in property <string> stat-running: "0";
+    in property <string> stat-stopped: "0";
+    in property <string> stat-attention: "0";
+    in property <[EventEntry]> events;
+    in property <string> status-text;
+    callback refresh();
+    callback install();
+    callback action(string, string);
+    callback filter-changed(bool);
+    callback search-changed(string);
+    callback row-selected(int);
+    callback relaunch-admin();
 
     HorizontalLayout {
         spacing: 0px;
@@ -85,25 +102,33 @@ export component MainWindow inherits Window {
 
                 Rectangle { height: 1px; background: Theme.divider; }
                 Rectangle { height: 14px; }
-                HorizontalLayout {
-                    spacing: 9px;
-                    alignment: start;
-                    Rectangle {
-                        width: 8px;
+                Rectangle {
+                    height: 22px;
+                    HorizontalLayout {
+                        spacing: 9px;
+                        alignment: start;
                         Rectangle {
                             width: 8px;
-                            height: 8px;
-                            border-radius: 4px;
-                            background: Theme.green;
-                            x: 0px;
-                            y: (parent.height - self.height) / 2;
+                            Rectangle {
+                                width: 8px;
+                                height: 8px;
+                                border-radius: 4px;
+                                background: root.elevated ? Theme.green : Theme.amber;
+                                x: 0px;
+                                y: (parent.height - self.height) / 2;
+                            }
+                        }
+                        Text {
+                            text: root.elevated ? "Administrator session" : "Read-only — relaunch";
+                            color: Theme.text-dim;
+                            font-size: 12px;
+                            vertical-alignment: center;
                         }
                     }
-                    Text {
-                        text: "Administrator session";
-                        color: Theme.text-dim;
-                        font-size: 12px;
-                        vertical-alignment: center;
+                    TouchArea {
+                        enabled: !root.elevated;
+                        mouse-cursor: pointer;
+                        clicked => { root.relaunch-admin(); }
                     }
                 }
                 Rectangle { height: 6px; }
@@ -172,24 +197,55 @@ export component MainWindow inherits Window {
                                     background: transparent;
                                 }
                             }
-                            Text {
-                                text: "Search services";
-                                color: Theme.text-faint;
-                                font-size: 13px;
-                                vertical-alignment: center;
+                            Rectangle {
+                                search-box := TextInput {
+                                    color: Theme.text;
+                                    font-size: 13px;
+                                    single-line: true;
+                                    vertical-alignment: center;
+                                    edited => { root.search-changed(self.text); }
+                                }
+                                Text {
+                                    text: "Search services";
+                                    color: Theme.text-faint;
+                                    font-size: 13px;
+                                    vertical-alignment: center;
+                                    visible: search-box.text == "";
+                                }
                             }
-                            Rectangle { }
                         }
                     }
                 }
 
                 // body
                 Rectangle {
-                    if root.view == 0 : DashboardView { }
-                    if root.view == 1 : ServicesView { }
+                    if root.view == 0 : DashboardView {
+                        stat-total: root.stat-total;
+                        stat-running: root.stat-running;
+                        stat-stopped: root.stat-stopped;
+                        stat-attention: root.stat-attention;
+                        events: root.events;
+                    }
+                    if root.view == 1 : ServicesView {
+                        rows: root.services;
+                        elevated: root.elevated;
+                        selected <=> root.selected-service;
+                        refresh => { root.refresh(); }
+                        install => { root.install(); }
+                        action(verb, name) => { root.action(verb, name); }
+                        filter-changed(managed) => { root.filter-changed(managed); }
+                        row-selected(idx) => { root.row-selected(idx); }
+                    }
                     if root.view == 2 : LogsView { }
                     if root.view == 3 : RecoveryView { }
                     if root.view == 4 : SettingsView { }
+                }
+
+                // status bar
+                Text {
+                    text: root.status-text;
+                    color: Theme.text-faint;
+                    font-size: 12px;
                 }
             }
         }
