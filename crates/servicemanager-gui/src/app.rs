@@ -33,6 +33,9 @@ struct AppState {
     /// The (service, stderr) the Logs view currently wants — used to discard
     /// stale `ReadLog` results that arrive after the user moved on.
     log_request: Option<(String, bool)>,
+    /// True while a `ReadEvents` job is queued/running — prevents piling up
+    /// duplicate event-log reads.
+    events_pending: bool,
     /// In-progress edit form — holds the originals so `to_spec` can diff.
     edit_form: Option<forms::EditForm>,
     /// Process-tree rows for the open Processes dialog.
@@ -110,6 +113,7 @@ pub fn build_ui() -> Result<MainWindow, slint::PlatformError> {
             visible_names: Vec::new(),
             log_stderr: false,
             log_request: None,
+            events_pending: false,
             edit_form: None,
             proc_rows: Vec::new(),
             proc_sort_column: 0,
@@ -655,6 +659,7 @@ fn drain_results() {
                     }
                 }
                 JobResult::Events(events) => {
+                    st.events_pending = false;
                     let entries = adapter::scm_events_to_entries(&events, &st.defs, 30);
                     win.set_events(slint::ModelRc::new(slint::VecModel::from(entries)));
                 }
@@ -694,6 +699,7 @@ fn drain_results() {
                     }
                 },
                 JobResult::Error(e) => {
+                    st.events_pending = false;
                     win.set_status_text(format!("Error: {e}").into());
                 }
             }
@@ -712,10 +718,12 @@ fn apply_snapshot(win: &MainWindow, st: &mut AppState) {
     win.set_stat_stopped(stats.stopped.to_string().into());
     win.set_stat_attention(stats.attention.to_string().into());
 
-    // Recent Events come from the OS event log, re-read after every scan.
-    // `st.defs` is already populated above, and the worker is single-threaded, so
-    // the resulting `Events` result is always mapped against an up-to-date snapshot.
-    let _ = st.job_tx.send(Job::ReadEvents);
+    // Recent Events come from the OS event log. Only read them when the
+    // Dashboard is actually visible, and never pile up a second read.
+    if win.get_view() == 0 && !st.events_pending {
+        st.events_pending = true;
+        let _ = st.job_tx.send(Job::ReadEvents);
+    }
 }
 
 /// Rebuild the `services` model from the cached defs + current filter/search,

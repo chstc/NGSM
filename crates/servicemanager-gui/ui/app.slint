@@ -16,7 +16,7 @@ export component MainWindow inherits Window {
     min-width: 1040px;
     min-height: 700px;
 
-    property <int> view: 0;
+    in-out property <int> view: 0;
 
     in property <bool> elevated: false;
     in property <[ServiceRow]> services;
@@ -147,7 +147,7 @@ export component MainWindow inherits Window {
                 }
                 Rectangle { height: 18px; }
 
-                NavItem { label: "Dashboard"; icon: "dashboard"; active: root.view == 0; clicked => { root.view = 0; } }
+                NavItem { label: "Dashboard"; icon: "dashboard"; active: root.view == 0; clicked => { root.view = 0; root.refresh(); } }
                 NavItem { label: "Services";  icon: "services";  active: root.view == 1; clicked => { root.view = 1; } }
                 NavItem { label: "Logs";      icon: "logs";      active: root.view == 2; clicked => { root.view = 2; root.logs-reload(); } }
                 NavItem { label: "Recovery";  icon: "recovery";  active: root.view == 3; clicked => { root.view = 3; root.recovery-reload(); } }
