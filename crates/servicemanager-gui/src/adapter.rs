@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use servicemanager_core::{ServiceDefinition, ServiceState};
 
-use crate::ServiceRow;
+use crate::{ProcessRow, ServiceRow};
 
 /// True if `def` should be shown given the managed-only toggle and search box.
 /// Search matches the service name or display name, case-insensitively.
@@ -180,6 +180,48 @@ pub fn to_service_row(d: &ServiceDefinition, elevated: bool) -> ServiceRow {
     }
 }
 
+/// Sort the service table rows in place by column index, case-insensitively.
+/// Columns: 0 name, 1 display, 2 kind, 3 state, 4 startup.
+pub fn sort_service_rows(rows: &mut [ServiceRow], column: i32, ascending: bool) {
+    let key = |r: &ServiceRow| -> String {
+        match column {
+            1 => r.display.to_lowercase(),
+            2 => r.kind.to_lowercase(),
+            3 => r.state.to_lowercase(),
+            4 => r.startup.to_lowercase(),
+            _ => r.name.to_lowercase(),
+        }
+    };
+    rows.sort_by(|a, b| {
+        let ord = key(a).cmp(&key(b));
+        if ascending {
+            ord
+        } else {
+            ord.reverse()
+        }
+    });
+}
+
+/// Sort the process-tree rows in place. Columns 0 (pid) and 1 (parent pid)
+/// sort numerically; column 2 (image) sorts as text.
+pub fn sort_process_rows(rows: &mut [ProcessRow], column: i32, ascending: bool) {
+    fn pid_num(s: &str) -> u64 {
+        s.parse().unwrap_or(0)
+    }
+    rows.sort_by(|a, b| {
+        let ord = match column {
+            2 => a.image.to_lowercase().cmp(&b.image.to_lowercase()),
+            1 => pid_num(&a.ppid).cmp(&pid_num(&b.ppid)),
+            _ => pid_num(&a.pid).cmp(&pid_num(&b.pid)),
+        };
+        if ascending {
+            ord
+        } else {
+            ord.reverse()
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,5 +391,39 @@ mod tests {
             ),
         ];
         assert!(diff_events(&HashMap::new(), &now).is_empty());
+    }
+
+    #[test]
+    fn sort_service_rows_orders_by_name_case_insensitively() {
+        let row = |name: &str| ServiceRow {
+            name: name.into(),
+            ..Default::default()
+        };
+        let mut rows = vec![row("Charlie"), row("alpha"), row("Bravo")];
+        sort_service_rows(&mut rows, 0, true);
+        assert_eq!(
+            rows.iter().map(|r| r.name.to_string()).collect::<Vec<_>>(),
+            ["alpha", "Bravo", "Charlie"]
+        );
+        sort_service_rows(&mut rows, 0, false);
+        assert_eq!(
+            rows.iter().map(|r| r.name.to_string()).collect::<Vec<_>>(),
+            ["Charlie", "Bravo", "alpha"]
+        );
+    }
+
+    #[test]
+    fn sort_process_rows_sorts_pid_numerically() {
+        let row = |pid: &str| ProcessRow {
+            pid: pid.into(),
+            ppid: "0".into(),
+            image: "x".into(),
+        };
+        let mut rows = vec![row("100"), row("9"), row("40")];
+        sort_process_rows(&mut rows, 0, true);
+        assert_eq!(
+            rows.iter().map(|r| r.pid.to_string()).collect::<Vec<_>>(),
+            ["9", "40", "100"]
+        );
     }
 }

@@ -24,9 +24,15 @@ struct AppState {
     prev_states: HashMap<String, ServiceState>,
     managed_only: bool,
     search: String,
+    sort_column: i32,
+    sort_ascending: bool,
     events: Vec<EventEntry>,
     /// In-progress edit form — holds the originals so `to_spec` can diff.
     edit_form: Option<forms::EditForm>,
+    /// Process-tree rows for the open Processes dialog.
+    proc_rows: Vec<ProcessRow>,
+    proc_sort_column: i32,
+    proc_sort_ascending: bool,
     /// Auto-refresh ticker; held only to keep it running.
     _timer: slint::Timer,
 }
@@ -39,6 +45,8 @@ thread_local! {
 pub fn build_ui() -> Result<MainWindow, slint::PlatformError> {
     let window = MainWindow::new()?;
     window.set_elevated(servicemanager_win32::is_elevated());
+    window.set_sort_ascending(true);
+    window.set_modal_sort_ascending(true);
 
     let (result_tx, result_rx) = channel::<JobResult>();
     // The worker calls this off-thread; it only re-enters the event loop, so
@@ -78,8 +86,13 @@ pub fn build_ui() -> Result<MainWindow, slint::PlatformError> {
             prev_states: HashMap::new(),
             managed_only: true,
             search: String::new(),
+            sort_column: 0,
+            sort_ascending: true,
             events: Vec::new(),
             edit_form: None,
+            proc_rows: Vec::new(),
+            proc_sort_column: 0,
+            proc_sort_ascending: true,
             _timer: auto_timer,
         });
     });
@@ -118,6 +131,23 @@ fn wire_callbacks(window: &MainWindow) {
             let Some(st) = guard.as_mut() else { return };
             st.search = text.to_string();
             if let Some(win) = st.window.upgrade() {
+                refresh_service_model(&win, st);
+            }
+        });
+    });
+    window.on_sort_changed(|column| {
+        STATE.with(|s| {
+            let mut guard = s.borrow_mut();
+            let Some(st) = guard.as_mut() else { return };
+            if st.sort_column == column {
+                st.sort_ascending = !st.sort_ascending;
+            } else {
+                st.sort_column = column;
+                st.sort_ascending = true;
+            }
+            if let Some(win) = st.window.upgrade() {
+                win.set_sort_column(st.sort_column);
+                win.set_sort_ascending(st.sort_ascending);
                 refresh_service_model(&win, st);
             }
         });
@@ -301,6 +331,23 @@ fn wire_callbacks(window: &MainWindow) {
             win.set_active_modal(0);
         });
     });
+    window.on_modal_sort_changed(|column| {
+        STATE.with(|s| {
+            let mut guard = s.borrow_mut();
+            let Some(st) = guard.as_mut() else { return };
+            if st.proc_sort_column == column {
+                st.proc_sort_ascending = !st.proc_sort_ascending;
+            } else {
+                st.proc_sort_column = column;
+                st.proc_sort_ascending = true;
+            }
+            if let Some(win) = st.window.upgrade() {
+                win.set_modal_sort_column(st.proc_sort_column);
+                win.set_modal_sort_ascending(st.proc_sort_ascending);
+                apply_process_model(&win, st);
+            }
+        });
+    });
 }
 
 /// Send a worker job and show a pending message in the status bar.
@@ -384,7 +431,7 @@ fn drain_results() {
                     let _ = st.job_tx.send(Job::Refresh);
                 }
                 JobResult::Processes { service, processes } => {
-                    let rows: Vec<ProcessRow> = processes
+                    st.proc_rows = processes
                         .iter()
                         .map(|p| ProcessRow {
                             pid: p.pid.to_string().into(),
@@ -394,7 +441,7 @@ fn drain_results() {
                         .collect();
                     win.set_status_text(format!("{} process(es)", processes.len()).into());
                     win.set_modal_service_name(service.into());
-                    win.set_modal_processes(slint::ModelRc::new(slint::VecModel::from(rows)));
+                    apply_process_model(&win, st);
                     win.set_active_modal(4);
                 }
                 JobResult::Error(e) => {
@@ -453,11 +500,19 @@ fn local_hms() -> String {
 /// Rebuild the `services` model from the cached defs + current filter/search.
 fn refresh_service_model(win: &MainWindow, st: &AppState) {
     let elevated = win.get_elevated();
-    let rows: Vec<ServiceRow> = st
+    let mut rows: Vec<ServiceRow> = st
         .defs
         .iter()
         .filter(|d| adapter::matches_filter(d, st.managed_only, &st.search))
         .map(|d| adapter::to_service_row(d, elevated))
         .collect();
+    adapter::sort_service_rows(&mut rows, st.sort_column, st.sort_ascending);
     win.set_services(slint::ModelRc::new(slint::VecModel::from(rows)));
+}
+
+/// Rebuild the Processes-dialog model from the cached rows + current sort.
+fn apply_process_model(win: &MainWindow, st: &AppState) {
+    let mut rows = st.proc_rows.clone();
+    adapter::sort_process_rows(&mut rows, st.proc_sort_column, st.proc_sort_ascending);
+    win.set_modal_processes(slint::ModelRc::new(slint::VecModel::from(rows)));
 }

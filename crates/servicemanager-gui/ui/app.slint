@@ -35,6 +35,9 @@ export component MainWindow inherits Window {
     callback search-changed(string);
     callback row-selected(int);
     callback relaunch-admin();
+    callback sort-changed(int);
+    in property <int> sort-column;
+    in property <bool> sort-ascending;
 
     in property <int> active-modal: 0;
     in-out property <string> modal-name;
@@ -53,6 +56,9 @@ export component MainWindow inherits Window {
     callback modal-remove-confirm();
     callback modal-browse-app();
     callback modal-cancel();
+    in property <int> modal-sort-column;
+    in property <bool> modal-sort-ascending;
+    callback modal-sort-changed(int);
 
     HorizontalLayout {
         spacing: 0px;
@@ -251,11 +257,14 @@ export component MainWindow inherits Window {
                         elevated: root.elevated;
                         auto-refresh <=> root.auto-refresh;
                         selected <=> root.selected-service;
+                        sort-column: root.sort-column;
+                        sort-ascending: root.sort-ascending;
                         refresh => { root.refresh(); }
                         install => { root.install(); }
                         action(verb, name) => { root.action(verb, name); }
                         filter-changed(managed) => { root.filter-changed(managed); }
                         row-selected(idx) => { root.row-selected(idx); }
+                        sort-changed(c) => { root.sort-changed(c); }
                     }
                     if root.view == 2 : LogsView { }
                     if root.view == 3 : RecoveryView { }
@@ -308,6 +317,9 @@ export component MainWindow inherits Window {
     if root.active-modal == 4 : ProcessesDialog {
         service-name: root.modal-service-name;
         rows: root.modal-processes;
+        sort-column: root.modal-sort-column;
+        sort-ascending: root.modal-sort-ascending;
         close => { root.modal-cancel(); }
+        sort-changed(c) => { root.modal-sort-changed(c); }
     }
 }

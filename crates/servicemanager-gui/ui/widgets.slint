@@ -116,6 +116,46 @@ export component Caret inherits Path {
     fill: tint;
 }
 
+// Clickable, sortable table-column header. `column` is this header's index;
+// `sort-column` / `ascending` describe the table's current sort, so the active
+// header shows a ▲/▼ marker.
+export component SortHeader inherits Rectangle {
+    in property <string> label;
+    in property <int> column;
+    in property <int> sort-column;
+    in property <bool> ascending;
+    callback clicked(int);
+    property <bool> active: root.column == root.sort-column;
+    HorizontalLayout {
+        spacing: 5px;
+        Text {
+            text: root.label;
+            color: root.active ? Theme.text : Theme.text-faint;
+            font-size: 11px;
+            font-weight: 700;
+            vertical-alignment: center;
+        }
+        Rectangle {
+            width: 9px;
+            Path {
+                width: 9px;
+                height: 6px;
+                x: 0px;
+                y: (parent.height - self.height) / 2;
+                viewbox-width: 10;
+                viewbox-height: 7;
+                commands: root.ascending ? "M 0 7 L 10 7 L 5 0 Z" : "M 0 0 L 10 0 L 5 7 Z";
+                fill: Theme.cyan;
+                visible: root.active;
+            }
+        }
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(root.column); }
+    }
+}
+
 // Simple geometric sidebar icons, drawn from primitives.
 component NavIcon inherits Rectangle {
     in property <string> kind;
