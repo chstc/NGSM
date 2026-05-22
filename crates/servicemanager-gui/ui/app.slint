@@ -2,7 +2,7 @@ import { Theme } from "theme.slint";
 import { NavItem } from "widgets.slint";
 import { DashboardView, EventEntry } from "dashboard.slint";
 import { ServicesView, ServiceRow } from "services.slint";
-import { LogsView, RecoveryView, SettingsView } from "secondary.slint";
+import { LogsView, RecoveryView, RecoveryRow, SettingsView } from "secondary.slint";
 import { InstallDialog, EditDialog, RemoveDialog, ProcessesDialog, ProcessRow } from "dialogs.slint";
 
 export component MainWindow inherits Window {
@@ -69,6 +69,21 @@ export component MainWindow inherits Window {
     callback logs-reload();
     callback logs-set-stderr(bool);
 
+    in property <bool> recovery-available;
+    in property <string> recovery-service;
+    in property <string> recovery-placeholder;
+    in-out property <string> recovery-restart-delay;
+    in-out property <string> recovery-throttle;
+    in-out property <int> recovery-default-action;
+    in property <[RecoveryRow]> recovery-rows;
+    in property <string> recovery-status;
+    callback recovery-reload();
+    callback recovery-add-row();
+    callback recovery-remove-row(int);
+    callback recovery-code-changed(int, string);
+    callback recovery-action-changed(int, int);
+    callback recovery-save();
+
     HorizontalLayout {
         spacing: 0px;
 
@@ -130,7 +145,7 @@ export component MainWindow inherits Window {
                 NavItem { label: "Dashboard"; icon: "dashboard"; active: root.view == 0; clicked => { root.view = 0; } }
                 NavItem { label: "Services";  icon: "services";  active: root.view == 1; clicked => { root.view = 1; } }
                 NavItem { label: "Logs";      icon: "logs";      active: root.view == 2; clicked => { root.view = 2; root.logs-reload(); } }
-                NavItem { label: "Recovery";  icon: "recovery";  active: root.view == 3; clicked => { root.view = 3; } }
+                NavItem { label: "Recovery";  icon: "recovery";  active: root.view == 3; clicked => { root.view = 3; root.recovery-reload(); } }
                 NavItem { label: "Settings";  icon: "settings";  active: root.view == 4; clicked => { root.view = 4; } }
 
                 Rectangle { }
@@ -285,7 +300,22 @@ export component MainWindow inherits Window {
                         reload => { root.logs-reload(); }
                         set-stderr(v) => { root.logs-set-stderr(v); }
                     }
-                    if root.view == 3 : RecoveryView { }
+                    if root.view == 3 : RecoveryView {
+                        available: root.recovery-available;
+                        service-name: root.recovery-service;
+                        placeholder: root.recovery-placeholder;
+                        restart-delay <=> root.recovery-restart-delay;
+                        throttle <=> root.recovery-throttle;
+                        default-action <=> root.recovery-default-action;
+                        rows: root.recovery-rows;
+                        status: root.recovery-status;
+                        reload => { root.recovery-reload(); }
+                        add-row => { root.recovery-add-row(); }
+                        remove-row(i) => { root.recovery-remove-row(i); }
+                        code-changed(i, t) => { root.recovery-code-changed(i, t); }
+                        action-changed(i, a) => { root.recovery-action-changed(i, a); }
+                        save => { root.recovery-save(); }
+                    }
                     if root.view == 4 : SettingsView { }
                 }
 

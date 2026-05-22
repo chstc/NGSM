@@ -12,6 +12,7 @@ mod app;
 mod data;
 mod elevation;
 mod forms;
+mod recovery;
 
 slint::include_modules!();
 

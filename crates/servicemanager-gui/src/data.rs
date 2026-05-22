@@ -5,12 +5,14 @@
 //! freeze the frame. We send `Job`s to a worker and post `JobResult`s
 //! back, calling a `wake` callback after each so the UI drains them promptly.
 
+use std::collections::BTreeMap;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use servicemanager_core::{
-    IoRedirectionConfig, IoStream, ManagedApplicationConfig, ServiceDefinition,
+    ExitAction, ExitActionPolicy, IoRedirectionConfig, IoStream, ManagedApplicationConfig,
+    ServiceDefinition,
 };
 use servicemanager_win32::{
     build_run_service_command, control_service, enumerate_descendants, enumerate_services,
@@ -45,6 +47,7 @@ pub enum Job {
     Processes(String),
     ReadLog { service: String, stderr: bool },
     ReadEvents,
+    SaveRecovery(RecoverySpec),
 }
 
 /// A result the worker posts back to the UI.
@@ -85,6 +88,18 @@ pub struct InstallSpec {
     pub stdout: Option<String>,
     pub stderr: Option<String>,
     pub start_type: InstallStartType,
+}
+
+/// A validated recovery-policy change for the worker to apply. The form layer
+/// has already parsed and checked every field; the worker only re-reads the
+/// current managed config and writes these values onto it.
+#[derive(Clone, Debug)]
+pub struct RecoverySpec {
+    pub name: String,
+    pub restart_delay_ms: Option<u32>,
+    pub throttle_delay_ms: Option<u32>,
+    pub default_action: ExitAction,
+    pub exit_actions: BTreeMap<String, ExitAction>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -164,6 +179,10 @@ fn execute(job: Job) -> JobResult {
         },
         Job::ReadLog { service, stderr } => read_log(&service, stderr),
         Job::ReadEvents => read_events(),
+        Job::SaveRecovery(spec) => match save_recovery(spec) {
+            Ok(msg) => JobResult::Acted(msg),
+            Err(e) => JobResult::Error(e),
+        },
     }
 }
 
@@ -505,6 +524,31 @@ fn read_events() -> JobResult {
         Ok(events) => JobResult::Events(events),
         Err(e) => JobResult::Error(format!("event log: {e}")),
     }
+}
+
+/// Worker-side recovery save: re-read the managed config from the registry
+/// (never trusting the possibly-stale UI snapshot, exactly as `edit` does),
+/// apply the restart-policy and exit-action fields, and write it all back.
+fn save_recovery(spec: RecoverySpec) -> Result<String, String> {
+    let Some(mut managed) =
+        servicemanager_registry::read_managed_config(&spec.name).map_err(|e| e.to_string())?
+    else {
+        return Err(format!(
+            "'{}' is not an NGSM-managed service — refusing to edit its recovery policy",
+            spec.name
+        ));
+    };
+    managed.restart.restart_delay_ms = spec.restart_delay_ms;
+    managed.restart.throttle_delay_ms = spec.throttle_delay_ms;
+    managed.restart.default_action = Some(spec.default_action);
+    managed.exit_actions = spec
+        .exit_actions
+        .iter()
+        .map(|(code, action)| (code.clone(), ExitActionPolicy { action: *action }))
+        .collect();
+    servicemanager_registry::write_managed_config(&spec.name, &managed)
+        .map_err(|e| e.to_string())?;
+    Ok(format!("Saved recovery policy for '{}'.", spec.name))
 }
 
 /// Read the last ~64 KiB of a file and return up to its last 400 lines.

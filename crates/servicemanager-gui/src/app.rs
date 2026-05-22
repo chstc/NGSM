@@ -9,8 +9,8 @@ use servicemanager_win32::InstallStartType;
 use slint::ComponentHandle;
 
 use crate::data::{spawn_worker, Job, JobResult};
-use crate::{adapter, forms};
-use crate::{MainWindow, ProcessRow, ServiceRow};
+use crate::{adapter, forms, recovery};
+use crate::{MainWindow, ProcessRow, RecoveryRow, ServiceRow};
 
 /// UI-thread-only controller state. It lives in a `thread_local` so the
 /// worker's wake callback — which must be `Send` — can stay capture-free and
@@ -36,6 +36,8 @@ struct AppState {
     proc_rows: Vec<ProcessRow>,
     proc_sort_column: i32,
     proc_sort_ascending: bool,
+    /// In-progress Recovery editor form for the selected managed service.
+    recovery_form: Option<recovery::RecoveryForm>,
     /// Auto-refresh ticker; held only to keep it running.
     _timer: slint::Timer,
 }
@@ -97,6 +99,7 @@ pub fn build_ui() -> Result<MainWindow, slint::PlatformError> {
             proc_rows: Vec::new(),
             proc_sort_column: 0,
             proc_sort_ascending: true,
+            recovery_form: None,
             _timer: auto_timer,
         });
     });
@@ -382,6 +385,95 @@ fn wire_callbacks(window: &MainWindow) {
             }
         });
     });
+    window.on_recovery_reload(|| {
+        STATE.with(|s| {
+            let mut guard = s.borrow_mut();
+            let Some(st) = guard.as_mut() else { return };
+            if let Some(win) = st.window.upgrade() {
+                reload_recovery(&win, st);
+            }
+        });
+    });
+    window.on_recovery_add_row(|| {
+        STATE.with(|s| {
+            let mut guard = s.borrow_mut();
+            let Some(st) = guard.as_mut() else { return };
+            let Some(form) = st.recovery_form.as_mut() else {
+                return;
+            };
+            form.rows.push(recovery::RecoveryExitRow::default());
+            if let Some(win) = st.window.upgrade() {
+                push_recovery_rows(&win, form);
+            }
+        });
+    });
+    window.on_recovery_remove_row(|idx| {
+        STATE.with(|s| {
+            let mut guard = s.borrow_mut();
+            let Some(st) = guard.as_mut() else { return };
+            let Some(form) = st.recovery_form.as_mut() else {
+                return;
+            };
+            let i = idx.max(0) as usize;
+            if i < form.rows.len() {
+                form.rows.remove(i);
+            }
+            if let Some(win) = st.window.upgrade() {
+                push_recovery_rows(&win, form);
+            }
+        });
+    });
+    window.on_recovery_code_changed(|idx, text| {
+        STATE.with(|s| {
+            let mut guard = s.borrow_mut();
+            let Some(st) = guard.as_mut() else { return };
+            let Some(form) = st.recovery_form.as_mut() else {
+                return;
+            };
+            if let Some(row) = form.rows.get_mut(idx.max(0) as usize) {
+                row.exit_code = text.to_string();
+            }
+        });
+    });
+    window.on_recovery_action_changed(|idx, action| {
+        STATE.with(|s| {
+            let mut guard = s.borrow_mut();
+            let Some(st) = guard.as_mut() else { return };
+            let Some(form) = st.recovery_form.as_mut() else {
+                return;
+            };
+            if let Some(row) = form.rows.get_mut(idx.max(0) as usize) {
+                row.action = action;
+            }
+            if let Some(win) = st.window.upgrade() {
+                push_recovery_rows(&win, form);
+            }
+        });
+    });
+    window.on_recovery_save(|| {
+        STATE.with(|s| {
+            let mut guard = s.borrow_mut();
+            let Some(st) = guard.as_mut() else { return };
+            let Some(win) = st.window.upgrade() else {
+                return;
+            };
+            let Some(form) = st.recovery_form.as_mut() else {
+                return;
+            };
+            // The exit-code rows are kept current by the row callbacks; pull
+            // the delay / default-action fields from the bound properties.
+            form.restart_delay = win.get_recovery_restart_delay().to_string();
+            form.throttle = win.get_recovery_throttle().to_string();
+            form.default_action = win.get_recovery_default_action();
+            match form.to_spec() {
+                Ok(spec) => {
+                    win.set_recovery_status(format!("Saving '{}'…", spec.name).into());
+                    let _ = st.job_tx.send(Job::SaveRecovery(spec));
+                }
+                Err(e) => win.set_recovery_status(e.into()),
+            }
+        });
+    });
 }
 
 /// Send a worker job and show a pending message in the status bar.
@@ -562,4 +654,60 @@ fn apply_process_model(win: &MainWindow, st: &AppState) {
     let mut rows = st.proc_rows.clone();
     adapter::sort_process_rows(&mut rows, st.proc_sort_column, st.proc_sort_ascending);
     win.set_modal_processes(slint::ModelRc::new(slint::VecModel::from(rows)));
+}
+
+/// Rebuild the Recovery editor form for the currently-selected service, or
+/// show an explanatory placeholder when it cannot be edited.
+fn reload_recovery(win: &MainWindow, st: &mut AppState) {
+    let placeholder = |win: &MainWindow, msg: &str| {
+        win.set_recovery_available(false);
+        win.set_recovery_placeholder(msg.into());
+    };
+    if !win.get_elevated() {
+        st.recovery_form = None;
+        placeholder(win, "Recovery editing needs an administrator session.");
+        return;
+    }
+    let idx = win.get_selected_service().max(0) as usize;
+    let Some(name) = st.visible_names.get(idx).cloned() else {
+        st.recovery_form = None;
+        placeholder(
+            win,
+            "Select a service in the Services view to edit its recovery policy.",
+        );
+        return;
+    };
+    let Some(def) = st.defs.iter().find(|d| d.native.name == name) else {
+        st.recovery_form = None;
+        placeholder(win, "The selected service is no longer present.");
+        return;
+    };
+    let Some(managed) = def.managed.clone() else {
+        st.recovery_form = None;
+        placeholder(win, &format!("'{name}' is not an NGSM-managed service."));
+        return;
+    };
+    let display = def.native.display_name.clone();
+    let form = recovery::RecoveryForm::from_managed(&name, &managed);
+    win.set_recovery_service(display.into());
+    win.set_recovery_restart_delay(form.restart_delay.clone().into());
+    win.set_recovery_throttle(form.throttle.clone().into());
+    win.set_recovery_default_action(form.default_action);
+    win.set_recovery_status("".into());
+    push_recovery_rows(win, &form);
+    win.set_recovery_available(true);
+    st.recovery_form = Some(form);
+}
+
+/// Push the form's exit-code rows into the Slint `recovery-rows` model.
+fn push_recovery_rows(win: &MainWindow, form: &recovery::RecoveryForm) {
+    let rows: Vec<RecoveryRow> = form
+        .rows
+        .iter()
+        .map(|r| RecoveryRow {
+            exit_code: r.exit_code.clone().into(),
+            action: r.action,
+        })
+        .collect();
+    win.set_recovery_rows(slint::ModelRc::new(slint::VecModel::from(rows)));
 }

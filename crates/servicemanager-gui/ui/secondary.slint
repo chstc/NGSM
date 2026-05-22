@@ -1,5 +1,5 @@
 import { Theme } from "theme.slint";
-import { Card, GhostButton } from "widgets.slint";
+import { Card, GhostButton, AccentButton } from "widgets.slint";
 import { ScrollView } from "std-widgets.slint";
 
 // Placeholder for views whose full implementation is deferred (Recovery and
@@ -128,8 +128,234 @@ export component LogsView inherits Rectangle {
     }
 }
 
-export component RecoveryView inherits StubView {
-    view-title: "Recovery";
+export struct RecoveryRow {
+    exit-code: string,
+    action: int,
+}
+
+// 4-way exit-action picker: 0 Restart, 1 Ignore, 2 Exit, 3 Suicide.
+component ActionPick inherits Rectangle {
+    in property <int> value;
+    callback changed(int);
+    width: 354px;
+    height: 32px;
+    HorizontalLayout {
+        spacing: 6px;
+        alignment: start;
+        for opt[i] in ["Restart", "Ignore", "Exit", "Suicide"] : Rectangle {
+            width: 84px;
+            height: 32px;
+            border-radius: Theme.radius-sm;
+            border-width: 1px;
+            border-color: root.value == i ? Theme.cyan : Theme.card-border;
+            background: root.value == i ? Theme.cyan.with-alpha(0.14) : Theme.bg;
+            Text {
+                text: opt;
+                color: root.value == i ? Theme.cyan : Theme.text-dim;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.changed(i); }
+            }
+        }
+    }
+}
+
+// A labelled millisecond text field.
+component NumField inherits Rectangle {
+    in property <string> label;
+    in-out property <string> text;
+    width: 230px;
+    height: 58px;
+    VerticalLayout {
+        spacing: 5px;
+        Text {
+            text: root.label;
+            color: Theme.text-dim;
+            font-size: 12px;
+        }
+        Rectangle {
+            height: 32px;
+            border-radius: Theme.radius-sm;
+            border-width: 1px;
+            border-color: ti.has-focus ? Theme.cyan : Theme.card-border;
+            background: Theme.bg;
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                ti := TextInput {
+                    text <=> root.text;
+                    color: Theme.text;
+                    font-size: 13px;
+                    single-line: true;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}
+
+// One editable per-exit-code row.
+component ExitRow inherits Rectangle {
+    in property <int> index;
+    in property <string> exit-code;
+    in property <int> action;
+    callback code-changed(int, string);
+    callback action-changed(int, int);
+    callback remove(int);
+    HorizontalLayout {
+        spacing: 10px;
+        alignment: start;
+        Rectangle {
+            width: 110px;
+            height: 32px;
+            border-radius: Theme.radius-sm;
+            border-width: 1px;
+            border-color: cti.has-focus ? Theme.cyan : Theme.card-border;
+            background: Theme.bg;
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                cti := TextInput {
+                    text: root.exit-code;
+                    color: Theme.text;
+                    font-size: 13px;
+                    single-line: true;
+                    vertical-alignment: center;
+                    edited => { root.code-changed(root.index, self.text); }
+                }
+            }
+        }
+        ActionPick {
+            value: root.action;
+            changed(a) => { root.action-changed(root.index, a); }
+        }
+        GhostButton {
+            text: "Remove";
+            tint: Theme.red;
+            clicked => { root.remove(root.index); }
+        }
+    }
+}
+
+export component RecoveryView inherits Rectangle {
+    in property <bool> available;
+    in property <string> service-name;
+    in property <string> placeholder;
+    in-out property <string> restart-delay;
+    in-out property <string> throttle;
+    in-out property <int> default-action;
+    in property <[RecoveryRow]> rows;
+    in property <string> status;
+    callback reload();
+    callback add-row();
+    callback remove-row(int);
+    callback code-changed(int, string);
+    callback action-changed(int, int);
+    callback save();
+    background: transparent;
+
+    if !root.available : Card {
+        VerticalLayout {
+            alignment: center;
+            spacing: 6px;
+            Text {
+                text: "Recovery";
+                color: Theme.text;
+                font-size: 18px;
+                font-weight: 800;
+                horizontal-alignment: center;
+            }
+            Text {
+                text: root.placeholder;
+                color: Theme.text-faint;
+                font-size: 13px;
+                horizontal-alignment: center;
+            }
+        }
+    }
+
+    if root.available : Card {
+        VerticalLayout {
+            padding: 24px;
+            spacing: 14px;
+            alignment: start;
+            Text {
+                text: "Recovery policy — " + root.service-name;
+                color: Theme.text;
+                font-size: 17px;
+                font-weight: 800;
+            }
+            HorizontalLayout {
+                spacing: 16px;
+                alignment: start;
+                NumField {
+                    label: "Restart delay (ms)";
+                    text <=> root.restart-delay;
+                }
+                NumField {
+                    label: "Throttle window (ms)";
+                    text <=> root.throttle;
+                }
+            }
+            Text {
+                text: "Default exit action";
+                color: Theme.text-dim;
+                font-size: 12px;
+            }
+            ActionPick {
+                value: root.default-action;
+                changed(a) => { root.default-action = a; }
+            }
+            Rectangle { height: 1px; background: Theme.divider; }
+            HorizontalLayout {
+                spacing: 10px;
+                alignment: start;
+                Text {
+                    text: "Per-exit-code actions";
+                    color: Theme.text;
+                    font-size: 13px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                }
+                Rectangle { }
+                GhostButton {
+                    text: "Add exit code";
+                    clicked => { root.add-row(); }
+                }
+            }
+            for row[i] in root.rows : ExitRow {
+                index: i;
+                exit-code: row.exit-code;
+                action: row.action;
+                code-changed(idx, t) => { root.code-changed(idx, t); }
+                action-changed(idx, a) => { root.action-changed(idx, a); }
+                remove(idx) => { root.remove-row(idx); }
+            }
+            Rectangle { }
+            HorizontalLayout {
+                spacing: 10px;
+                alignment: start;
+                AccentButton {
+                    text: "Save recovery policy";
+                    clicked => { root.save(); }
+                }
+                GhostButton {
+                    text: "Reload";
+                    clicked => { root.reload(); }
+                }
+                Text {
+                    text: root.status;
+                    color: Theme.text-faint;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
 }
 
 export component SettingsView inherits StubView {
