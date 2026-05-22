@@ -183,14 +183,10 @@ pub fn sort_service_rows(rows: &mut [ServiceRow], column: i32, ascending: bool) 
             _ => r.name.to_lowercase(),
         }
     };
-    rows.sort_by(|a, b| {
-        let ord = key(a).cmp(&key(b));
-        if ascending {
-            ord
-        } else {
-            ord.reverse()
-        }
-    });
+    rows.sort_by_cached_key(key);
+    if !ascending {
+        rows.reverse();
+    }
 }
 
 /// Find the new row index for a previously-selected service after the model

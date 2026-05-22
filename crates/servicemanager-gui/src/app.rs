@@ -25,6 +25,9 @@ struct AppState {
     managed_only: bool,
     running_only: bool,
     search: String,
+    /// Single-shot timer that coalesces rapid search keystrokes into one
+    /// model rebuild.
+    search_debounce: slint::Timer,
     sort_column: i32,
     sort_ascending: bool,
     /// Service names in current display order — maps the selected row index
@@ -65,6 +68,17 @@ fn auto_refresh_tick() {
                     let _ = st.job_tx.send(Job::Refresh);
                 }
             }
+        }
+    });
+}
+
+/// Debounced search rebuild: runs once the user pauses typing.
+fn apply_search() {
+    STATE.with(|s| {
+        let mut guard = s.borrow_mut();
+        let Some(st) = guard.as_mut() else { return };
+        if let Some(win) = st.window.upgrade() {
+            refresh_service_model(&win, st);
         }
     });
 }
@@ -111,6 +125,7 @@ pub fn build_ui() -> Result<MainWindow, slint::PlatformError> {
             managed_only: config.managed_only,
             running_only: false,
             search: String::new(),
+            search_debounce: slint::Timer::default(),
             sort_column: 0,
             sort_ascending: true,
             visible_names: Vec::new(),
@@ -183,9 +198,13 @@ fn wire_callbacks(window: &MainWindow) {
             let mut guard = s.borrow_mut();
             let Some(st) = guard.as_mut() else { return };
             st.search = text.to_string();
-            if let Some(win) = st.window.upgrade() {
-                refresh_service_model(&win, st);
-            }
+            // Coalesce rapid keystrokes: rebuild the model only after the user
+            // pauses. Calling `start` again restarts the single-shot timer.
+            st.search_debounce.start(
+                slint::TimerMode::SingleShot,
+                std::time::Duration::from_millis(180),
+                apply_search,
+            );
         });
     });
     window.on_sort_changed(|column| {
