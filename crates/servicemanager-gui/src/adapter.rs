@@ -5,6 +5,8 @@ use std::collections::HashMap;
 
 use servicemanager_core::{ServiceDefinition, ServiceState};
 
+use crate::ServiceRow;
+
 /// True if `def` should be shown given the managed-only toggle and search box.
 /// Search matches the service name or display name, case-insensitively.
 pub fn matches_filter(def: &ServiceDefinition, managed_only: bool, search: &str) -> bool {
@@ -105,6 +107,77 @@ pub fn state_snapshot(defs: &[ServiceDefinition]) -> HashMap<String, ServiceStat
         .filter(|d| d.is_managed())
         .filter_map(|d| d.runtime.as_ref().map(|r| (d.native.name.clone(), r.state)))
         .collect()
+}
+
+/// Convert a core `ServiceDefinition` into the Slint table/detail row,
+/// computing action-button gating from elevation and the runtime state.
+pub fn to_service_row(d: &ServiceDefinition, elevated: bool) -> ServiceRow {
+    use servicemanager_core::ManagementKind;
+    let state = d.runtime.as_ref().map(|r| r.state);
+    let owned = d.is_managed();
+    let managed_cfg = d.managed.is_some();
+    let can_start = elevated && owned && matches!(state, Some(ServiceState::Stopped) | None);
+    let can_stop = elevated
+        && owned
+        && matches!(
+            state,
+            Some(ServiceState::Running | ServiceState::Paused | ServiceState::StartPending)
+        );
+    let m = d.managed.as_ref();
+    ServiceRow {
+        name: d.native.name.clone().into(),
+        display: d.native.display_name.clone().into(),
+        kind: match d.management_kind() {
+            ManagementKind::Managed => "managed",
+            ManagementKind::Native => "native",
+        }
+        .into(),
+        state: state
+            .map(|s| format!("{s:?}"))
+            .unwrap_or_else(|| "Unknown".to_string())
+            .into(),
+        startup: format!("{:?}", d.native.startup).into(),
+        running: matches!(state, Some(ServiceState::Running)),
+        image_path: d.native.image_path.clone().into(),
+        application: m
+            .and_then(|m| m.application.clone())
+            .unwrap_or_default()
+            .into(),
+        arguments: m
+            .and_then(|m| m.app_parameters.clone())
+            .unwrap_or_default()
+            .into(),
+        working_dir: m
+            .and_then(|m| m.app_directory.clone())
+            .unwrap_or_default()
+            .into(),
+        account: d.native.account.clone().unwrap_or_default().into(),
+        pid: d
+            .runtime
+            .as_ref()
+            .and_then(|r| r.pid)
+            .map(|p| p.to_string())
+            .unwrap_or_default()
+            .into(),
+        stdout_log: m
+            .and_then(|m| m.io.stdout.as_ref().map(|s| s.path.clone()))
+            .unwrap_or_default()
+            .into(),
+        can_start,
+        can_stop,
+        can_restart: can_start || can_stop,
+        can_pause: elevated && managed_cfg && matches!(state, Some(ServiceState::Running)),
+        can_continue: elevated && managed_cfg && matches!(state, Some(ServiceState::Paused)),
+        can_rotate: elevated
+            && m.is_some_and(|m| m.has_online_rotation())
+            && matches!(state, Some(ServiceState::Running | ServiceState::Paused)),
+        can_edit: elevated && managed_cfg,
+        can_remove: elevated && owned,
+        can_processes: matches!(
+            state,
+            Some(ServiceState::Running | ServiceState::Paused | ServiceState::StartPending)
+        ),
+    }
 }
 
 #[cfg(test)]

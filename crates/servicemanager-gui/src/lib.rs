@@ -8,11 +8,13 @@
 compile_error!("servicemanager-gui builds only for Windows targets.");
 
 mod adapter;
+mod app;
 mod data;
 mod forms;
 
 slint::include_modules!();
 
 pub fn run() -> Result<(), slint::PlatformError> {
-    MainWindow::new()?.run()
+    let window = app::build_ui()?;
+    window.run()
 }
