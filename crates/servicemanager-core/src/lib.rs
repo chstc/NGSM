@@ -7,6 +7,7 @@
 pub mod error;
 pub mod events;
 pub mod model;
+pub mod paths;
 pub mod validate;
 
 pub use error::{Error, Result};
