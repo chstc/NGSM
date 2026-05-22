@@ -12,6 +12,7 @@ mod app;
 mod config;
 mod data;
 mod elevation;
+pub mod event_log_reader;
 mod forms;
 mod recovery;
 
