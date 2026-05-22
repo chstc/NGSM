@@ -1,0 +1,326 @@
+import { Theme } from "theme.slint";
+import { Card, AccentButton, GhostButton } from "widgets.slint";
+
+export struct ProcessRow {
+    pid: string,
+    ppid: string,
+    image: string,
+}
+
+// A labelled single-line text field.
+component Field inherits Rectangle {
+    in property <string> label;
+    in-out property <string> text;
+    height: 54px;
+    VerticalLayout {
+        spacing: 5px;
+        Text {
+            text: root.label;
+            color: Theme.text-dim;
+            font-size: 12px;
+        }
+        Rectangle {
+            height: 32px;
+            border-radius: Theme.radius-sm;
+            border-width: 1px;
+            border-color: ti.has-focus ? Theme.cyan : Theme.card-border;
+            background: Theme.bg;
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                ti := TextInput {
+                    text <=> root.text;
+                    color: Theme.text;
+                    font-size: 13px;
+                    single-line: true;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}
+
+// A read-only labelled value.
+component ReadField inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    height: 54px;
+    VerticalLayout {
+        spacing: 5px;
+        Text {
+            text: root.label;
+            color: Theme.text-dim;
+            font-size: 12px;
+        }
+        Rectangle {
+            height: 32px;
+            border-radius: Theme.radius-sm;
+            background: Theme.sidebar-bg;
+            HorizontalLayout {
+                padding-left: 10px;
+                Text {
+                    text: root.value;
+                    color: Theme.text-dim;
+                    font-size: 13px;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}
+
+// 3-way startup-type picker: 0 Manual, 1 Automatic, 2 Disabled.
+component StartTypePick inherits Rectangle {
+    in-out property <int> value;
+    height: 54px;
+    VerticalLayout {
+        spacing: 5px;
+        Text {
+            text: "Startup";
+            color: Theme.text-dim;
+            font-size: 12px;
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            for opt[i] in ["Manual", "Automatic", "Disabled"] : Rectangle {
+                width: 116px;
+                height: 32px;
+                border-radius: Theme.radius-sm;
+                border-width: 1px;
+                border-color: root.value == i ? Theme.cyan : Theme.card-border;
+                background: root.value == i ? Theme.cyan.with-alpha(0.14) : Theme.bg;
+                Text {
+                    text: opt;
+                    color: root.value == i ? Theme.cyan : Theme.text-dim;
+                    font-size: 13px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.value = i; }
+                }
+            }
+        }
+    }
+}
+
+component ErrorText inherits Text {
+    color: Theme.red;
+    font-size: 12px;
+    wrap: word-wrap;
+}
+
+// === Install ===
+
+export component InstallDialog inherits Rectangle {
+    in-out property <string> name;
+    in-out property <string> display-name;
+    in-out property <string> application;
+    in-out property <string> arguments;
+    in-out property <string> working-dir;
+    in-out property <string> stdout-path;
+    in-out property <string> stderr-path;
+    in-out property <int> start-type;
+    in property <string> error;
+    callback submit();
+    callback cancel();
+    callback browse-app();
+
+    background: #000000aa;
+    TouchArea { }
+
+    Card {
+        width: 560px;
+        height: 712px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        VerticalLayout {
+            padding: 24px;
+            spacing: 8px;
+            Text {
+                text: "Install service";
+                color: Theme.text;
+                font-size: 18px;
+                font-weight: 800;
+            }
+            Rectangle { height: 4px; }
+            Field { label: "Service name"; text <=> root.name; }
+            Field { label: "Display name"; text <=> root.display-name; }
+            Field { label: "Application"; text <=> root.application; }
+            HorizontalLayout {
+                alignment: start;
+                GhostButton { text: "Browse for executable…"; clicked => { root.browse-app(); } }
+            }
+            Field { label: "Arguments"; text <=> root.arguments; }
+            Field { label: "Working directory"; text <=> root.working-dir; }
+            Field { label: "stdout log"; text <=> root.stdout-path; }
+            Field { label: "stderr log"; text <=> root.stderr-path; }
+            StartTypePick { value <=> root.start-type; }
+            ErrorText { text: root.error; visible: root.error != ""; }
+            Rectangle { }
+            HorizontalLayout {
+                spacing: 8px;
+                Rectangle { }
+                GhostButton { text: "Cancel"; clicked => { root.cancel(); } }
+                AccentButton { text: "Install"; clicked => { root.submit(); } }
+            }
+        }
+    }
+}
+
+// === Edit ===
+
+export component EditDialog inherits Rectangle {
+    in property <string> service-name;
+    in-out property <string> display-name;
+    in-out property <string> application;
+    in-out property <string> arguments;
+    in-out property <string> working-dir;
+    in-out property <string> stdout-path;
+    in-out property <string> stderr-path;
+    in-out property <int> start-type;
+    in property <string> error;
+    callback submit();
+    callback cancel();
+    callback browse-app();
+
+    background: #000000aa;
+    TouchArea { }
+
+    Card {
+        width: 560px;
+        height: 712px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        VerticalLayout {
+            padding: 24px;
+            spacing: 8px;
+            Text {
+                text: "Edit service";
+                color: Theme.text;
+                font-size: 18px;
+                font-weight: 800;
+            }
+            Rectangle { height: 4px; }
+            ReadField { label: "Service name"; value: root.service-name; }
+            Field { label: "Display name"; text <=> root.display-name; }
+            Field { label: "Application"; text <=> root.application; }
+            HorizontalLayout {
+                alignment: start;
+                GhostButton { text: "Browse for executable…"; clicked => { root.browse-app(); } }
+            }
+            Field { label: "Arguments"; text <=> root.arguments; }
+            Field { label: "Working directory"; text <=> root.working-dir; }
+            Field { label: "stdout log"; text <=> root.stdout-path; }
+            Field { label: "stderr log"; text <=> root.stderr-path; }
+            StartTypePick { value <=> root.start-type; }
+            Text {
+                text: "Only fields you change are written.";
+                color: Theme.text-faint;
+                font-size: 12px;
+            }
+            ErrorText { text: root.error; visible: root.error != ""; }
+            Rectangle { }
+            HorizontalLayout {
+                spacing: 8px;
+                Rectangle { }
+                GhostButton { text: "Cancel"; clicked => { root.cancel(); } }
+                AccentButton { text: "Save"; clicked => { root.submit(); } }
+            }
+        }
+    }
+}
+
+// === Remove confirmation ===
+
+export component RemoveDialog inherits Rectangle {
+    in property <string> service-name;
+    callback confirm();
+    callback cancel();
+
+    background: #000000aa;
+    TouchArea { }
+
+    Card {
+        width: 460px;
+        height: 220px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        VerticalLayout {
+            padding: 24px;
+            spacing: 10px;
+            Text {
+                text: "Remove service";
+                color: Theme.text;
+                font-size: 18px;
+                font-weight: 800;
+            }
+            Text {
+                text: "Remove '" + root.service-name + "'?\nThis deletes the SCM registration and the managed configuration.";
+                color: Theme.text-dim;
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+            Rectangle { }
+            HorizontalLayout {
+                spacing: 8px;
+                Rectangle { }
+                GhostButton { text: "Cancel"; clicked => { root.cancel(); } }
+                AccentButton { text: "Remove"; tint: Theme.red; clicked => { root.confirm(); } }
+            }
+        }
+    }
+}
+
+// === Processes ===
+
+export component ProcessesDialog inherits Rectangle {
+    in property <string> service-name;
+    in property <[ProcessRow]> rows;
+    callback close();
+
+    background: #000000aa;
+    TouchArea { }
+
+    Card {
+        width: 580px;
+        height: 440px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        VerticalLayout {
+            padding: 24px;
+            spacing: 8px;
+            Text {
+                text: "Processes — " + root.service-name;
+                color: Theme.text;
+                font-size: 18px;
+                font-weight: 800;
+            }
+            Rectangle { height: 4px; }
+            HorizontalLayout {
+                padding-left: 4px;
+                spacing: 14px;
+                Text { text: "PID"; color: Theme.text-faint; font-size: 11px; font-weight: 700; width: 70px; }
+                Text { text: "PARENT"; color: Theme.text-faint; font-size: 11px; font-weight: 700; width: 70px; }
+                Text { text: "IMAGE"; color: Theme.text-faint; font-size: 11px; font-weight: 700; }
+            }
+            for p in root.rows : Rectangle {
+                height: 28px;
+                HorizontalLayout {
+                    padding-left: 4px;
+                    spacing: 14px;
+                    Text { text: p.pid; color: Theme.text; font-family: "Consolas"; font-size: 12px; width: 70px; vertical-alignment: center; }
+                    Text { text: p.ppid; color: Theme.text-dim; font-family: "Consolas"; font-size: 12px; width: 70px; vertical-alignment: center; }
+                    Text { text: p.image; color: Theme.text; font-size: 12px; vertical-alignment: center; }
+                }
+            }
+            Rectangle { }
+            HorizontalLayout {
+                Rectangle { }
+                GhostButton { text: "Close"; clicked => { root.close(); } }
+            }
+        }
+    }
+}

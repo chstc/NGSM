@@ -3,6 +3,7 @@ import { NavItem } from "widgets.slint";
 import { DashboardView, EventEntry } from "dashboard.slint";
 import { ServicesView, ServiceRow } from "services.slint";
 import { LogsView, RecoveryView, SettingsView } from "secondary.slint";
+import { InstallDialog, EditDialog, RemoveDialog, ProcessesDialog, ProcessRow } from "dialogs.slint";
 
 export component MainWindow inherits Window {
     title: "NGSM — Service Manager";
@@ -33,6 +34,24 @@ export component MainWindow inherits Window {
     callback search-changed(string);
     callback row-selected(int);
     callback relaunch-admin();
+
+    in property <int> active-modal: 0;
+    in-out property <string> modal-name;
+    in-out property <string> modal-display;
+    in-out property <string> modal-application;
+    in-out property <string> modal-arguments;
+    in-out property <string> modal-working-dir;
+    in-out property <string> modal-stdout;
+    in-out property <string> modal-stderr;
+    in-out property <int> modal-start-type;
+    in property <string> modal-error;
+    in property <string> modal-service-name;
+    in property <[ProcessRow]> modal-processes;
+    callback modal-install-submit();
+    callback modal-edit-submit();
+    callback modal-remove-confirm();
+    callback modal-browse-app();
+    callback modal-cancel();
 
     HorizontalLayout {
         spacing: 0px;
@@ -249,5 +268,44 @@ export component MainWindow inherits Window {
                 }
             }
         }
+    }
+
+    if root.active-modal == 1 : InstallDialog {
+        name <=> root.modal-name;
+        display-name <=> root.modal-display;
+        application <=> root.modal-application;
+        arguments <=> root.modal-arguments;
+        working-dir <=> root.modal-working-dir;
+        stdout-path <=> root.modal-stdout;
+        stderr-path <=> root.modal-stderr;
+        start-type <=> root.modal-start-type;
+        error: root.modal-error;
+        submit => { root.modal-install-submit(); }
+        cancel => { root.modal-cancel(); }
+        browse-app => { root.modal-browse-app(); }
+    }
+    if root.active-modal == 2 : EditDialog {
+        service-name: root.modal-service-name;
+        display-name <=> root.modal-display;
+        application <=> root.modal-application;
+        arguments <=> root.modal-arguments;
+        working-dir <=> root.modal-working-dir;
+        stdout-path <=> root.modal-stdout;
+        stderr-path <=> root.modal-stderr;
+        start-type <=> root.modal-start-type;
+        error: root.modal-error;
+        submit => { root.modal-edit-submit(); }
+        cancel => { root.modal-cancel(); }
+        browse-app => { root.modal-browse-app(); }
+    }
+    if root.active-modal == 3 : RemoveDialog {
+        service-name: root.modal-service-name;
+        confirm => { root.modal-remove-confirm(); }
+        cancel => { root.modal-cancel(); }
+    }
+    if root.active-modal == 4 : ProcessesDialog {
+        service-name: root.modal-service-name;
+        rows: root.modal-processes;
+        close => { root.modal-cancel(); }
     }
 }
