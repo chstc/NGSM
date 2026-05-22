@@ -1,11 +1,9 @@
 //! Pure view-model logic: filtering, dashboard stats, and event diffing.
 //! No Slint or Win32 calls — every function here is unit-tested.
 
-use std::collections::HashMap;
-
 use servicemanager_core::{ServiceDefinition, ServiceState};
 
-use crate::{ProcessRow, ServiceRow};
+use crate::{EventEntry, ProcessRow, ServiceRow};
 
 /// True if `def` should be shown given the managed-only / running-only
 /// toggles and the search box. Search matches the service name or display
@@ -64,57 +62,38 @@ pub fn dashboard_stats(defs: &[ServiceDefinition]) -> DashboardStats {
     s
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EventKind {
-    Started,
-    Stopped,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EventChange {
-    pub service: String,
-    pub kind: EventKind,
-}
-
-/// Compare the previous managed-service states to the current snapshot and
-/// return the state transitions worth surfacing in the Recent Events panel.
-/// Only managed services are considered. A service with no prior entry (first
-/// scan) produces no event.
-pub fn diff_events(
-    prev: &HashMap<String, ServiceState>,
-    now: &[ServiceDefinition],
-) -> Vec<EventChange> {
-    let mut out = Vec::new();
-    for d in now.iter().filter(|d| d.is_managed()) {
-        let Some(cur) = d.runtime.as_ref().map(|r| r.state) else {
-            continue;
-        };
-        let Some(&old) = prev.get(&d.native.name) else {
-            continue;
-        };
-        if old == cur {
-            continue;
-        }
-        match cur {
-            ServiceState::Running => out.push(EventChange {
-                service: d.native.name.clone(),
-                kind: EventKind::Started,
-            }),
-            ServiceState::Stopped => out.push(EventChange {
-                service: d.native.name.clone(),
-                kind: EventKind::Stopped,
-            }),
-            _ => {}
-        }
-    }
-    out
-}
-
-/// Snapshot the current managed-service states for the next `diff_events`.
-pub fn state_snapshot(defs: &[ServiceDefinition]) -> HashMap<String, ServiceState> {
-    defs.iter()
+/// Map SCM event-log records to Dashboard `EventEntry` rows. Keeps only events
+/// whose service display name matches a managed service (case-insensitively),
+/// preserves the newest-first order, and caps the result at `limit` rows.
+/// `kind`: 0 started (green), 1 stopped (amber), 2 terminated/failed (red).
+pub fn scm_events_to_entries(
+    events: &[servicemanager_win32::ScmEvent],
+    defs: &[ServiceDefinition],
+    limit: usize,
+) -> Vec<EventEntry> {
+    use servicemanager_win32::ScmEventKind;
+    let managed_displays: std::collections::HashSet<String> = defs
+        .iter()
         .filter(|d| d.is_managed())
-        .filter_map(|d| d.runtime.as_ref().map(|r| (d.native.name.clone(), r.state)))
+        .map(|d| d.native.display_name.to_lowercase())
+        .collect();
+    events
+        .iter()
+        .filter(|e| managed_displays.contains(&e.service.to_lowercase()))
+        .take(limit)
+        .map(|e| {
+            let (verb, kind) = match e.kind {
+                ScmEventKind::Started => ("started", 0),
+                ScmEventKind::Stopped => ("stopped", 1),
+                ScmEventKind::Terminated => ("terminated", 2),
+                ScmEventKind::StartFailed => ("start failed", 2),
+            };
+            EventEntry {
+                label: format!("{} — {verb}", e.service).into(),
+                time: e.timestamp.clone().into(),
+                kind,
+            }
+        })
         .collect()
 }
 
@@ -364,66 +343,6 @@ mod tests {
     }
 
     #[test]
-    fn diff_events_reports_start_and_stop_transitions() {
-        let ngsm = |n: &str, state| {
-            def(
-                n,
-                n,
-                &format!("C:\\NGSM\\ngsm.exe run-service {n}"),
-                StartupType::Manual,
-                state,
-            )
-        };
-        let prev: HashMap<String, ServiceState> = [
-            ("A".to_string(), ServiceState::Stopped),
-            ("B".to_string(), ServiceState::Running),
-            ("C".to_string(), ServiceState::Running),
-        ]
-        .into_iter()
-        .collect();
-        let now = vec![
-            ngsm("A", Some(ServiceState::Running)), // started
-            ngsm("B", Some(ServiceState::Stopped)), // stopped
-            ngsm("C", Some(ServiceState::Running)), // unchanged
-        ];
-        let events = diff_events(&prev, &now);
-        assert_eq!(
-            events,
-            vec![
-                EventChange {
-                    service: "A".into(),
-                    kind: EventKind::Started
-                },
-                EventChange {
-                    service: "B".into(),
-                    kind: EventKind::Stopped
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn diff_events_ignores_first_scan_and_native_services() {
-        let now = vec![
-            def(
-                "A",
-                "A",
-                "C:\\NGSM\\ngsm.exe run-service A",
-                StartupType::Manual,
-                Some(ServiceState::Running),
-            ),
-            def(
-                "Spooler",
-                "Spooler",
-                "C:\\Windows\\spoolsv.exe",
-                StartupType::Automatic,
-                Some(ServiceState::Running),
-            ),
-        ];
-        assert!(diff_events(&HashMap::new(), &now).is_empty());
-    }
-
-    #[test]
     fn sort_service_rows_orders_by_name_case_insensitively() {
         let row = |name: &str| ServiceRow {
             name: name.into(),
@@ -455,5 +374,62 @@ mod tests {
             rows.iter().map(|r| r.pid.to_string()).collect::<Vec<_>>(),
             ["9", "40", "100"]
         );
+    }
+
+    #[test]
+    fn scm_events_to_entries_filters_and_maps() {
+        use servicemanager_win32::{ScmEvent, ScmEventKind};
+        let managed = def(
+            "DemoA",
+            "Demo Worker A",
+            "C:\\NGSM\\ngsm.exe run-service DemoA",
+            StartupType::Manual,
+            Some(ServiceState::Running),
+        );
+        let native = def(
+            "Spooler",
+            "Print Spooler",
+            "C:\\Windows\\spoolsv.exe",
+            StartupType::Automatic,
+            Some(ServiceState::Running),
+        );
+        let ev = |service: &str, kind| ScmEvent {
+            service: service.into(),
+            kind,
+            timestamp: "2026-05-21 09:00:00".into(),
+        };
+        let events = vec![
+            ev("Demo Worker A", ScmEventKind::Started),
+            ev("Print Spooler", ScmEventKind::Stopped), // native -> dropped
+            ev("demo worker a", ScmEventKind::Terminated), // case-insensitive match
+            ev("Demo Worker A", ScmEventKind::StartFailed),
+        ];
+        let entries = scm_events_to_entries(&events, &[managed, native], 30);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].kind, 0); // started -> green
+        assert_eq!(entries[1].kind, 2); // terminated -> red
+        assert_eq!(entries[2].kind, 2); // start failed -> red
+        assert_eq!(entries[0].label, "Demo Worker A — started");
+    }
+
+    #[test]
+    fn scm_events_to_entries_respects_limit() {
+        use servicemanager_win32::{ScmEvent, ScmEventKind};
+        let managed = def(
+            "DemoA",
+            "Demo Worker A",
+            "C:\\NGSM\\ngsm.exe run-service DemoA",
+            StartupType::Manual,
+            Some(ServiceState::Running),
+        );
+        let events: Vec<ScmEvent> = (0..10)
+            .map(|_| ScmEvent {
+                service: "Demo Worker A".into(),
+                kind: ScmEventKind::Started,
+                timestamp: "2026-05-21 09:00:00".into(),
+            })
+            .collect();
+        let entries = scm_events_to_entries(&events, std::slice::from_ref(&managed), 3);
+        assert_eq!(entries.len(), 3);
     }
 }
