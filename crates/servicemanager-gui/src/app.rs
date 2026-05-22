@@ -6,11 +6,12 @@ use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use servicemanager_core::{ServiceDefinition, ServiceState};
+use servicemanager_win32::InstallStartType;
 use slint::ComponentHandle;
 
-use crate::adapter;
 use crate::data::{spawn_worker, Job, JobResult};
-use crate::{EventEntry, MainWindow, ServiceRow};
+use crate::{adapter, forms};
+use crate::{EventEntry, MainWindow, ProcessRow, ServiceRow};
 
 /// UI-thread-only controller state. It lives in a `thread_local` so the
 /// worker's wake callback — which must be `Send` — can stay capture-free and
@@ -24,6 +25,8 @@ struct AppState {
     managed_only: bool,
     search: String,
     events: Vec<EventEntry>,
+    /// In-progress edit form — holds the originals so `to_spec` can diff.
+    edit_form: Option<forms::EditForm>,
 }
 
 thread_local! {
@@ -55,6 +58,7 @@ pub fn build_ui() -> Result<MainWindow, slint::PlatformError> {
             managed_only: true,
             search: String::new(),
             events: Vec::new(),
+            edit_form: None,
         });
     });
 
@@ -98,33 +102,38 @@ fn wire_callbacks(window: &MainWindow) {
     });
     window.on_action(|verb, name| {
         STATE.with(|s| {
-            let guard = s.borrow();
-            let Some(st) = guard.as_ref() else { return };
+            let mut guard = s.borrow_mut();
+            let Some(st) = guard.as_mut() else { return };
             let Some(win) = st.window.upgrade() else { return };
             let name = name.to_string();
-            let job = match verb.as_str() {
-                "start" => Some((Job::Start(name.clone()), format!("Starting '{name}'…"))),
-                "stop" => Some((Job::Stop(name.clone()), format!("Stopping '{name}'…"))),
+            match verb.as_str() {
+                "start" => dispatch(st, &win, Job::Start(name.clone()), format!("Starting '{name}'…")),
+                "stop" => dispatch(st, &win, Job::Stop(name.clone()), format!("Stopping '{name}'…")),
                 "restart" => {
-                    Some((Job::Restart(name.clone()), format!("Restarting '{name}'…")))
+                    dispatch(st, &win, Job::Restart(name.clone()), format!("Restarting '{name}'…"))
                 }
-                "pause" => Some((Job::Pause(name.clone()), format!("Pausing '{name}'…"))),
+                "pause" => dispatch(st, &win, Job::Pause(name.clone()), format!("Pausing '{name}'…")),
                 "continue" => {
-                    Some((Job::Continue(name.clone()), format!("Resuming '{name}'…")))
+                    dispatch(st, &win, Job::Continue(name.clone()), format!("Resuming '{name}'…"))
                 }
-                "rotate" => {
-                    Some((Job::Rotate(name.clone()), format!("Rotating logs for '{name}'…")))
-                }
-                "processes" => Some((
+                "rotate" => dispatch(
+                    st,
+                    &win,
+                    Job::Rotate(name.clone()),
+                    format!("Rotating logs for '{name}'…"),
+                ),
+                "processes" => dispatch(
+                    st,
+                    &win,
                     Job::Processes(name.clone()),
                     format!("Listing processes of '{name}'…"),
-                )),
-                // "edit" / "remove" open modal dialogs — wired in Task 16.
-                _ => None,
-            };
-            if let Some((job, msg)) = job {
-                win.set_status_text(msg.into());
-                let _ = st.job_tx.send(job);
+                ),
+                "edit" => open_edit_modal(st, &win, &name),
+                "remove" => {
+                    win.set_modal_service_name(name.clone().into());
+                    win.set_active_modal(3);
+                }
+                _ => {}
             }
         });
     });
@@ -140,6 +149,158 @@ fn wire_callbacks(window: &MainWindow) {
             }
         });
     });
+    window.on_install(|| {
+        STATE.with(|s| {
+            if let Some(st) = s.borrow().as_ref() {
+                if let Some(win) = st.window.upgrade() {
+                    clear_modal_fields(&win);
+                    win.set_modal_start_type(0);
+                    win.set_modal_error("".into());
+                    win.set_active_modal(1);
+                }
+            }
+        });
+    });
+    window.on_modal_cancel(|| {
+        STATE.with(|s| {
+            let mut guard = s.borrow_mut();
+            let Some(st) = guard.as_mut() else { return };
+            st.edit_form = None;
+            if let Some(win) = st.window.upgrade() {
+                win.set_active_modal(0);
+            }
+        });
+    });
+    window.on_modal_browse_app(|| {
+        // The native picker runs its own modal loop; do this before borrowing
+        // STATE so the borrow is not held across the blocking call.
+        let picked = rfd::FileDialog::new()
+            .add_filter("Executables", &["exe"])
+            .add_filter("All files", &["*"])
+            .pick_file();
+        if let Some(path) = picked {
+            STATE.with(|s| {
+                if let Some(st) = s.borrow().as_ref() {
+                    if let Some(win) = st.window.upgrade() {
+                        win.set_modal_application(path.to_string_lossy().into_owned().into());
+                    }
+                }
+            });
+        }
+    });
+    window.on_modal_install_submit(|| {
+        STATE.with(|s| {
+            let guard = s.borrow();
+            let Some(st) = guard.as_ref() else { return };
+            let Some(win) = st.window.upgrade() else { return };
+            let form = forms::InstallForm {
+                name: win.get_modal_name().to_string(),
+                display_name: win.get_modal_display().to_string(),
+                application: win.get_modal_application().to_string(),
+                app_parameters: win.get_modal_arguments().to_string(),
+                app_directory: win.get_modal_working_dir().to_string(),
+                stdout: win.get_modal_stdout().to_string(),
+                stderr: win.get_modal_stderr().to_string(),
+                start_type: int_to_start_type(win.get_modal_start_type()),
+                error: None,
+            };
+            match form.to_spec() {
+                Ok(spec) => {
+                    win.set_status_text(format!("Installing '{}'…", spec.name).into());
+                    let _ = st.job_tx.send(Job::Install(spec));
+                    win.set_active_modal(0);
+                }
+                Err(e) => win.set_modal_error(e.into()),
+            }
+        });
+    });
+    window.on_modal_edit_submit(|| {
+        STATE.with(|s| {
+            let mut guard = s.borrow_mut();
+            let Some(st) = guard.as_mut() else { return };
+            let Some(win) = st.window.upgrade() else { return };
+            let Some(form) = st.edit_form.as_mut() else { return };
+            form.display_name = win.get_modal_display().to_string();
+            form.application = win.get_modal_application().to_string();
+            form.app_parameters = win.get_modal_arguments().to_string();
+            form.app_directory = win.get_modal_working_dir().to_string();
+            form.stdout = win.get_modal_stdout().to_string();
+            form.stderr = win.get_modal_stderr().to_string();
+            form.start_type = int_to_start_type(win.get_modal_start_type());
+            match form.to_spec() {
+                Ok(spec) => {
+                    win.set_status_text(format!("Editing '{}'…", spec.name).into());
+                    let _ = st.job_tx.send(Job::Edit(spec));
+                    st.edit_form = None;
+                    win.set_active_modal(0);
+                }
+                Err(e) => win.set_modal_error(e.into()),
+            }
+        });
+    });
+    window.on_modal_remove_confirm(|| {
+        STATE.with(|s| {
+            let guard = s.borrow();
+            let Some(st) = guard.as_ref() else { return };
+            let Some(win) = st.window.upgrade() else { return };
+            let name = win.get_modal_service_name().to_string();
+            win.set_status_text(format!("Removing '{name}'…").into());
+            let _ = st.job_tx.send(Job::Remove(name));
+            win.set_active_modal(0);
+        });
+    });
+}
+
+/// Send a worker job and show a pending message in the status bar.
+fn dispatch(st: &AppState, win: &MainWindow, job: Job, msg: String) {
+    win.set_status_text(msg.into());
+    let _ = st.job_tx.send(job);
+}
+
+/// Populate the shared modal fields from a service's config and open Edit.
+fn open_edit_modal(st: &mut AppState, win: &MainWindow, name: &str) {
+    let Some(def) = st.defs.iter().find(|d| d.native.name == name) else {
+        win.set_status_text(format!("'{name}' is no longer present.").into());
+        return;
+    };
+    let form = forms::EditForm::from_definition(def);
+    win.set_modal_service_name(form.name.clone().into());
+    win.set_modal_display(form.display_name.clone().into());
+    win.set_modal_application(form.application.clone().into());
+    win.set_modal_arguments(form.app_parameters.clone().into());
+    win.set_modal_working_dir(form.app_directory.clone().into());
+    win.set_modal_stdout(form.stdout.clone().into());
+    win.set_modal_stderr(form.stderr.clone().into());
+    win.set_modal_start_type(start_type_to_int(form.start_type));
+    win.set_modal_error("".into());
+    st.edit_form = Some(form);
+    win.set_active_modal(2);
+}
+
+fn clear_modal_fields(win: &MainWindow) {
+    win.set_modal_name("".into());
+    win.set_modal_display("".into());
+    win.set_modal_application("".into());
+    win.set_modal_arguments("".into());
+    win.set_modal_working_dir("".into());
+    win.set_modal_stdout("".into());
+    win.set_modal_stderr("".into());
+}
+
+fn int_to_start_type(v: i32) -> InstallStartType {
+    match v {
+        1 => InstallStartType::Automatic,
+        2 => InstallStartType::Disabled,
+        _ => InstallStartType::Manual,
+    }
+}
+
+fn start_type_to_int(v: InstallStartType) -> i32 {
+    match v {
+        InstallStartType::Manual => 0,
+        InstallStartType::Automatic => 1,
+        InstallStartType::Disabled => 2,
+    }
 }
 
 /// Drain every pending `JobResult` and apply it to the UI. Posted onto the UI
@@ -168,8 +329,21 @@ fn drain_results() {
                     win.set_status_text(msg.into());
                     let _ = st.job_tx.send(Job::Refresh);
                 }
-                JobResult::Processes { .. } => {
-                    // Wired in Task 16 (Processes modal).
+                JobResult::Processes {
+                    service, processes, ..
+                } => {
+                    let rows: Vec<ProcessRow> = processes
+                        .iter()
+                        .map(|p| ProcessRow {
+                            pid: p.pid.to_string().into(),
+                            ppid: p.parent_pid.to_string().into(),
+                            image: p.image_name.clone().into(),
+                        })
+                        .collect();
+                    win.set_status_text(format!("{} process(es)", processes.len()).into());
+                    win.set_modal_service_name(service.into());
+                    win.set_modal_processes(slint::ModelRc::new(slint::VecModel::from(rows)));
+                    win.set_active_modal(4);
                 }
                 JobResult::Error(e) => {
                     win.set_status_text(format!("Error: {e}").into());
