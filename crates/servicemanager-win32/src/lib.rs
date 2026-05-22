@@ -10,6 +10,8 @@ pub mod console_ctrl;
 #[cfg(windows)]
 pub mod control;
 #[cfg(windows)]
+pub mod event_log;
+#[cfg(windows)]
 mod handles;
 #[cfg(windows)]
 pub mod job;
@@ -32,6 +34,8 @@ pub use control::{
 };
 #[cfg(windows)]
 pub use elevation::is_elevated;
+#[cfg(windows)]
+pub use event_log::{parse_scm_event_xml, read_scm_events, ScmEvent, ScmEventKind};
 #[cfg(windows)]
 pub use job::JobObject;
 #[cfg(windows)]
@@ -69,3 +73,30 @@ pub mod scm {
 
 #[cfg(not(windows))]
 pub use scm::NativeService;
+
+#[cfg(not(windows))]
+pub mod event_log {
+    use servicemanager_core::{Error, Result};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ScmEventKind {
+        Started,
+        Stopped,
+        Terminated,
+        StartFailed,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ScmEvent {
+        pub service: String,
+        pub kind: ScmEventKind,
+        pub timestamp: String,
+    }
+
+    pub fn read_scm_events(_max: usize) -> Result<Vec<ScmEvent>> {
+        Err(Error::other("event-log read requires Windows"))
+    }
+}
+
+#[cfg(not(windows))]
+pub use event_log::{read_scm_events, ScmEvent, ScmEventKind};
