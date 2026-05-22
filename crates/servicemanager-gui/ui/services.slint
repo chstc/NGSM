@@ -65,6 +65,7 @@ export component ServicesView inherits Rectangle {
     in property <bool> elevated: false;
     in-out property <int> selected: 0;
     in-out property <bool> managed-only: true;
+    in-out property <bool> auto-refresh: false;
     callback refresh();
     callback install();
     callback action(string, string);
@@ -92,6 +93,39 @@ export component ServicesView inherits Rectangle {
                 GhostButton {
                     text: "Refresh";
                     clicked => { root.refresh(); }
+                }
+                Rectangle {
+                    width: 138px;
+                    height: 36px;
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: root.auto-refresh ? Theme.green : Theme.card-border;
+                    background: auto-ta.has-hover ? Theme.card-bg.brighter(0.5) : Theme.card-bg;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        spacing: 8px;
+                        Rectangle {
+                            width: 8px;
+                            Rectangle {
+                                width: 8px;
+                                height: 8px;
+                                border-radius: 4px;
+                                background: root.auto-refresh ? Theme.green : Theme.text-faint;
+                                x: 0px;
+                                y: (parent.height - self.height) / 2;
+                            }
+                        }
+                        Text {
+                            text: "Auto-refresh";
+                            color: root.auto-refresh ? Theme.text : Theme.text-dim;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                        }
+                    }
+                    auto-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.auto-refresh = !root.auto-refresh; }
+                    }
                 }
                 Rectangle {
                     width: 156px;

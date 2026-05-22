@@ -27,6 +27,8 @@ struct AppState {
     events: Vec<EventEntry>,
     /// In-progress edit form — holds the originals so `to_spec` can diff.
     edit_form: Option<forms::EditForm>,
+    /// Auto-refresh ticker; held only to keep it running.
+    _timer: slint::Timer,
 }
 
 thread_local! {
@@ -48,6 +50,25 @@ pub fn build_ui() -> Result<MainWindow, slint::PlatformError> {
         }),
     );
 
+    // Auto-refresh: a repeating 5 s tick that re-enumerates while the toggle
+    // is on. The toggle state lives in the `auto-refresh` window property.
+    let auto_timer = slint::Timer::default();
+    auto_timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_secs(5),
+        || {
+            STATE.with(|s| {
+                if let Some(st) = s.borrow().as_ref() {
+                    if let Some(win) = st.window.upgrade() {
+                        if win.get_auto_refresh() {
+                            let _ = st.job_tx.send(Job::Refresh);
+                        }
+                    }
+                }
+            });
+        },
+    );
+
     STATE.with(|s| {
         *s.borrow_mut() = Some(AppState {
             window: window.as_weak(),
@@ -59,6 +80,7 @@ pub fn build_ui() -> Result<MainWindow, slint::PlatformError> {
             search: String::new(),
             events: Vec::new(),
             edit_form: None,
+            _timer: auto_timer,
         });
     });
 
