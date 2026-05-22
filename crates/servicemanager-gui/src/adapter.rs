@@ -105,7 +105,9 @@ pub fn to_service_row(d: &ServiceDefinition, elevated: bool) -> ServiceRow {
     let state = d.runtime.as_ref().map(|r| r.state);
     let owned = d.is_managed();
     let managed_cfg = d.managed.is_some();
-    let can_start = elevated && owned && matches!(state, Some(ServiceState::Stopped) | None);
+    let enabled = d.native.startup != servicemanager_core::StartupType::Disabled;
+    let can_start =
+        elevated && owned && enabled && matches!(state, Some(ServiceState::Stopped) | None);
     let can_stop = elevated
         && owned
         && matches!(
@@ -154,7 +156,7 @@ pub fn to_service_row(d: &ServiceDefinition, elevated: bool) -> ServiceRow {
             .into(),
         can_start,
         can_stop,
-        can_restart: can_start || can_stop,
+        can_restart: enabled && (can_start || can_stop),
         can_pause: elevated && managed_cfg && matches!(state, Some(ServiceState::Running)),
         can_continue: elevated && managed_cfg && matches!(state, Some(ServiceState::Paused)),
         can_rotate: elevated
@@ -374,6 +376,33 @@ mod tests {
         assert_eq!(
             rows.iter().map(|r| r.pid.to_string()).collect::<Vec<_>>(),
             ["9", "40", "100"]
+        );
+    }
+
+    #[test]
+    fn disabled_services_cannot_start_or_restart() {
+        let disabled = def(
+            "DisabledSvc",
+            "Disabled Svc",
+            "C:\\NGSM\\ngsm.exe run-service DisabledSvc",
+            StartupType::Disabled,
+            Some(ServiceState::Stopped),
+        );
+        let row = to_service_row(&disabled, true);
+        assert!(!row.can_start, "disabled service must not be startable");
+        assert!(!row.can_restart, "disabled service must not be restartable");
+
+        let manual = def(
+            "ManualSvc",
+            "Manual Svc",
+            "C:\\NGSM\\ngsm.exe run-service ManualSvc",
+            StartupType::Manual,
+            Some(ServiceState::Stopped),
+        );
+        let row = to_service_row(&manual, true);
+        assert!(
+            row.can_start,
+            "a stopped manual managed service stays startable"
         );
     }
 

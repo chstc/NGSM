@@ -150,6 +150,7 @@ fn execute(job: Job) -> JobResult {
         },
         Job::Start(n) => simple(&n, "Start requested", || {
             ensure_ngsm_managed(&n)?;
+            ensure_enabled(&n)?;
             start_service(&n)
         }),
         Job::Stop(n) => simple_with(&n, "Stop requested", || {
@@ -374,6 +375,20 @@ fn ensure_ngsm_managed(name: &str) -> servicemanager_core::Result<()> {
     }
 }
 
+/// Re-check, against current SCM state, that a service is not Disabled before
+/// the worker attempts to start it. The UI gates this too, but its snapshot
+/// can be stale.
+fn ensure_enabled(name: &str) -> servicemanager_core::Result<()> {
+    use servicemanager_core::StartupType;
+    let native = query_service(name)?;
+    if native.config.startup == StartupType::Disabled {
+        return Err(servicemanager_core::Error::other(format!(
+            "'{name}' is disabled — enable it before starting"
+        )));
+    }
+    Ok(())
+}
+
 /// Worker-side rotate: re-read managed config and require online rotation
 /// before issuing `SERVICE_CONTROL_ROTATE`, matching the CLI/broker
 /// preflight (the UI snapshot may be stale).
@@ -396,6 +411,7 @@ fn rotate(name: &str) -> Result<String, String> {
 fn restart(name: &str) -> Result<String, String> {
     use servicemanager_core::ServiceState;
     ensure_ngsm_managed(name).map_err(|e| e.to_string())?;
+    ensure_enabled(name).map_err(|e| e.to_string())?;
     let snapshot = query_service(name).map_err(|e| e.to_string())?;
     let initial = snapshot.runtime.as_ref().map(|r| r.state);
     let needs_stop = !matches!(initial, Some(ServiceState::Stopped) | None);
