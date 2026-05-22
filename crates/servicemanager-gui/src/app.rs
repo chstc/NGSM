@@ -96,6 +96,38 @@ fn wire_callbacks(window: &MainWindow) {
             }
         });
     });
+    window.on_action(|verb, name| {
+        STATE.with(|s| {
+            let guard = s.borrow();
+            let Some(st) = guard.as_ref() else { return };
+            let Some(win) = st.window.upgrade() else { return };
+            let name = name.to_string();
+            let job = match verb.as_str() {
+                "start" => Some((Job::Start(name.clone()), format!("Starting '{name}'…"))),
+                "stop" => Some((Job::Stop(name.clone()), format!("Stopping '{name}'…"))),
+                "restart" => {
+                    Some((Job::Restart(name.clone()), format!("Restarting '{name}'…")))
+                }
+                "pause" => Some((Job::Pause(name.clone()), format!("Pausing '{name}'…"))),
+                "continue" => {
+                    Some((Job::Continue(name.clone()), format!("Resuming '{name}'…")))
+                }
+                "rotate" => {
+                    Some((Job::Rotate(name.clone()), format!("Rotating logs for '{name}'…")))
+                }
+                "processes" => Some((
+                    Job::Processes(name.clone()),
+                    format!("Listing processes of '{name}'…"),
+                )),
+                // "edit" / "remove" open modal dialogs — wired in Task 16.
+                _ => None,
+            };
+            if let Some((job, msg)) = job {
+                win.set_status_text(msg.into());
+                let _ = st.job_tx.send(job);
+            }
+        });
+    });
 }
 
 /// Drain every pending `JobResult` and apply it to the UI. Posted onto the UI
