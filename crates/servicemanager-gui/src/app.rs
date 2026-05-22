@@ -20,6 +20,8 @@ struct AppState {
     job_tx: Sender<Job>,
     result_rx: Receiver<JobResult>,
     defs: Vec<ServiceDefinition>,
+    /// Per-service warnings from the most recent scan (unreadable config, ...).
+    warnings: Vec<String>,
     managed_only: bool,
     running_only: bool,
     search: String,
@@ -105,6 +107,7 @@ pub fn build_ui() -> Result<MainWindow, slint::PlatformError> {
             job_tx: job_tx.clone(),
             result_rx,
             defs: Vec::new(),
+            warnings: Vec::new(),
             managed_only: config.managed_only,
             running_only: false,
             search: String::new(),
@@ -139,6 +142,17 @@ fn wire_callbacks(window: &MainWindow) {
         STATE.with(|s| {
             if let Some(st) = s.borrow().as_ref() {
                 let _ = st.job_tx.send(Job::Refresh);
+            }
+        });
+    });
+    window.on_view_warnings(|| {
+        STATE.with(|s| {
+            if let Some(st) = s.borrow().as_ref() {
+                if let Some(win) = st.window.upgrade() {
+                    if !st.warnings.is_empty() {
+                        win.set_active_modal(5);
+                    }
+                }
             }
         });
     });
@@ -611,15 +625,22 @@ fn drain_results() {
             match result {
                 JobResult::Services { defs, warnings } => {
                     st.defs = defs;
+                    st.warnings = warnings;
                     let base = format!("{} services", st.defs.len());
                     win.set_status_text(
-                        if warnings.is_empty() {
+                        if st.warnings.is_empty() {
                             base
                         } else {
-                            format!("{base}  —  {} with unreadable config", warnings.len())
+                            format!(
+                                "{base}  —  {} with unreadable config (click for details)",
+                                st.warnings.len()
+                            )
                         }
                         .into(),
                     );
+                    let shared: Vec<slint::SharedString> =
+                        st.warnings.iter().map(|w| w.clone().into()).collect();
+                    win.set_warnings(slint::ModelRc::new(slint::VecModel::from(shared)));
                     apply_snapshot(&win, st);
                 }
                 JobResult::Acted(msg) => {

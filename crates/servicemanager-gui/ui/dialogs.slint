@@ -363,3 +363,49 @@ export component ProcessesDialog inherits Rectangle {
         }
     }
 }
+
+// === Refresh warnings ===
+
+export component WarningsDialog inherits Rectangle {
+    in property <[string]> rows;
+    callback close();
+
+    background: Theme.overlay;
+    TouchArea { }
+
+    Card {
+        width: 640px;
+        height: 420px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        VerticalLayout {
+            padding: 24px;
+            spacing: 8px;
+            Text {
+                text: "Refresh warnings";
+                color: Theme.text;
+                font-size: 18px;
+                font-weight: 800;
+            }
+            Text {
+                text: "Services whose managed configuration could not be read.";
+                color: Theme.text-faint;
+                font-size: 12px;
+            }
+            Rectangle { height: 4px; }
+            ListView {
+                vertical-stretch: 1;
+                for w in root.rows : Text {
+                    text: w;
+                    color: Theme.text-dim;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+            }
+            HorizontalLayout {
+                Rectangle { }
+                GhostButton { text: "Close"; clicked => { root.close(); } }
+            }
+        }
+    }
+}

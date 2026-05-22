@@ -3,7 +3,7 @@ import { NavItem } from "widgets.slint";
 import { DashboardView, EventEntry } from "dashboard.slint";
 import { ServicesView, ServiceRow } from "services.slint";
 import { LogsView, RecoveryView, RecoveryRow, SettingsView } from "secondary.slint";
-import { InstallDialog, EditDialog, RemoveDialog, ProcessesDialog, ProcessRow } from "dialogs.slint";
+import { InstallDialog, EditDialog, RemoveDialog, ProcessesDialog, WarningsDialog, ProcessRow } from "dialogs.slint";
 
 export component MainWindow inherits Window {
     title: "NGSM — Service Manager";
@@ -30,6 +30,8 @@ export component MainWindow inherits Window {
     in property <string> stat-attention: "0";
     in property <[EventEntry]> events;
     in property <string> status-text;
+    in property <[string]> warnings;
+    callback view-warnings();
     callback refresh();
     callback install();
     callback action(string, string);
@@ -334,10 +336,20 @@ export component MainWindow inherits Window {
                 }
 
                 // status bar
-                Text {
-                    text: root.status-text;
-                    color: Theme.text-faint;
-                    font-size: 12px;
+                Rectangle {
+                    height: 16px;
+                    Text {
+                        x: 0px;
+                        text: root.status-text;
+                        color: root.warnings.length > 0 ? Theme.amber : Theme.text-faint;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+                    TouchArea {
+                        enabled: root.warnings.length > 0;
+                        mouse-cursor: pointer;
+                        clicked => { root.view-warnings(); }
+                    }
                 }
             }
         }
@@ -385,5 +397,9 @@ export component MainWindow inherits Window {
         sort-ascending: root.modal-sort-ascending;
         close => { root.modal-cancel(); }
         sort-changed(c) => { root.modal-sort-changed(c); }
+    }
+    if root.active-modal == 5 : WarningsDialog {
+        rows: root.warnings;
+        close => { root.modal-cancel(); }
     }
 }
