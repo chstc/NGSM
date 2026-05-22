@@ -64,12 +64,16 @@ pub fn dashboard_stats(defs: &[ServiceDefinition]) -> DashboardStats {
     s
 }
 
+// TODO(Task 8): remove these items once the session-diff approach is fully
+// replaced. `#[allow(dead_code)]` is temporary.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
     Started,
     Stopped,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventChange {
     pub service: String,
@@ -80,6 +84,7 @@ pub struct EventChange {
 /// return the state transitions worth surfacing in the Recent Events panel.
 /// Only managed services are considered. A service with no prior entry (first
 /// scan) produces no event.
+#[allow(dead_code)]
 pub fn diff_events(
     prev: &HashMap<String, ServiceState>,
     now: &[ServiceDefinition],
@@ -111,6 +116,7 @@ pub fn diff_events(
 }
 
 /// Snapshot the current managed-service states for the next `diff_events`.
+#[allow(dead_code)]
 pub fn state_snapshot(defs: &[ServiceDefinition]) -> HashMap<String, ServiceState> {
     defs.iter()
         .filter(|d| d.is_managed())

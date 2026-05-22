@@ -56,6 +56,9 @@ pub enum JobResult {
         /// values, ...). The rows are still shown; these are surfaced as a
         /// status-bar warning instead of being silently dropped.
         warnings: Vec<String>,
+        /// Most-recent supervisor-recorded events, newest first. Populated
+        /// every Refresh tick from the on-disk event log.
+        events: Vec<servicemanager_core::EventRecord>,
     },
     Processes {
         service: String,
@@ -137,7 +140,11 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<JobResult>, wake: Box<dyn Fn() + Se
 fn execute(job: Job) -> JobResult {
     match job {
         Job::Refresh => match list_services() {
-            Ok((defs, warnings)) => JobResult::Services { defs, warnings },
+            Ok((defs, warnings)) => JobResult::Services {
+                defs,
+                warnings,
+                events: crate::event_log_reader::read_recent(50),
+            },
             Err(e) => JobResult::Error(format!("enumerate: {e}")),
         },
         Job::Install(spec) => JobResult::Installed(install(spec)),

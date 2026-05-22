@@ -4,9 +4,7 @@
 use std::cell::RefCell;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
-use std::collections::HashMap;
-
-use servicemanager_core::{ServiceDefinition, ServiceState};
+use servicemanager_core::ServiceDefinition;
 use servicemanager_win32::InstallStartType;
 use slint::ComponentHandle;
 
@@ -40,8 +38,10 @@ struct AppState {
     /// The (service, stderr) the Logs view currently wants — used to discard
     /// stale `ReadLog` results that arrive after the user moved on.
     log_request: Option<(String, bool)>,
-    /// Managed-service states from the previous scan — feeds `diff_events`.
-    prev_states: HashMap<String, ServiceState>,
+    /// Most-recent supervisor-recorded events from the last scan
+    /// (newest first). The display `events: Vec<EventEntry>` is
+    /// rebuilt from this every `apply_snapshot`.
+    event_records: Vec<servicemanager_core::EventRecord>,
     /// Accumulated Recent Events entries (session-scoped, newest first).
     events: Vec<EventEntry>,
     /// In-progress edit form — holds the originals so `to_spec` can diff.
@@ -134,7 +134,7 @@ pub fn build_ui() -> Result<MainWindow, slint::PlatformError> {
             visible_names: Vec::new(),
             log_stderr: false,
             log_request: None,
-            prev_states: HashMap::new(),
+            event_records: Vec::new(),
             events: Vec::new(),
             edit_form: None,
             proc_rows: Vec::new(),
@@ -646,9 +646,10 @@ fn drain_results() {
         };
         while let Ok(result) = st.result_rx.try_recv() {
             match result {
-                JobResult::Services { defs, warnings } => {
+                JobResult::Services { defs, warnings, events } => {
                     st.defs = defs;
                     st.warnings = warnings;
+                    st.event_records = events;
                     let base = format!("{} services", st.defs.len());
                     win.set_status_text(
                         if st.warnings.is_empty() {
@@ -756,38 +757,35 @@ fn apply_snapshot(win: &MainWindow, st: &mut AppState) {
     win.set_stat_stopped(stats.stopped.to_string().into());
     win.set_stat_attention(stats.attention.to_string().into());
 
-    // Recent Events: diff this scan against the previous one, newest first.
-    let changes = adapter::diff_events(&st.prev_states, &st.defs);
-    if !changes.is_empty() {
-        let now = local_hms();
-        for change in changes {
-            let (verb, kind) = match change.kind {
-                adapter::EventKind::Started => ("started", 0),
-                adapter::EventKind::Stopped => ("stopped", 1),
-            };
-            st.events.insert(
-                0,
-                EventEntry {
-                    label: format!("{} — {verb}", change.service).into(),
-                    time: now.clone().into(),
-                    kind,
-                },
-            );
+    // Recent Events: render from the supervisor's persistent log.
+    use servicemanager_core::events::{EventKind as Ek, EventRecord};
+    let render = |rec: &EventRecord| {
+        let (label, kind) = match rec.event {
+            Ek::Started => (format!("{} — started", rec.service), 0),
+            Ek::Stopped => (format!("{} — stopped", rec.service), 1),
+            Ek::ChildExited => match rec.exit_code {
+                Some(c) => (format!("{} — exited (code {c})", rec.service), 1),
+                None => (format!("{} — exited", rec.service), 1),
+            },
+            Ek::Restarted => (format!("{} — restarted", rec.service), 2),
+            Ek::Throttled => match rec.delay_ms {
+                Some(ms) => (
+                    format!("{} — restart throttled ({ms}ms)", rec.service),
+                    2,
+                ),
+                None => (format!("{} — restart throttled", rec.service), 2),
+            },
+        };
+        EventEntry {
+            label: label.into(),
+            time: crate::event_log_reader::format_local_hms(&rec.ts).into(),
+            kind,
         }
-        st.events.truncate(12);
-    }
-    st.prev_states = adapter::state_snapshot(&st.defs);
+    };
+    st.events = st.event_records.iter().take(12).map(render).collect();
     win.set_events(slint::ModelRc::new(slint::VecModel::from(
         st.events.clone(),
     )));
-}
-
-/// Current local time formatted `HH:MM:SS`, for event timestamps.
-fn local_hms() -> String {
-    use windows::Win32::System::SystemInformation::GetLocalTime;
-    // SAFETY: `GetLocalTime` returns a fully-initialised `SYSTEMTIME`.
-    let t = unsafe { GetLocalTime() };
-    format!("{:02}:{:02}:{:02}", t.wHour, t.wMinute, t.wSecond)
 }
 
 /// Rebuild the `services` model from the cached defs + current filter/search,
@@ -906,5 +904,19 @@ fn push_recovery_rows(win: &MainWindow, form: &recovery::RecoveryForm) {
 fn persist_config(st: &AppState, win: &MainWindow) {
     if let Err(e) = config::save(&st.config) {
         win.set_status_text(format!("Settings not saved: {e}").into());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::event_log_reader::format_local_hms;
+
+    #[test]
+    fn format_local_hms_round_trip_for_known_input() {
+        // Only assert the shape — actual local hour depends on test
+        // machine timezone.
+        let s = format_local_hms("2026-05-22T14:15:32Z");
+        assert_eq!(s.len(), 8);
+        assert!(s.chars().nth(2) == Some(':'));
     }
 }
