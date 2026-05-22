@@ -471,6 +471,18 @@ fn remove(name: &str) -> Result<String, String> {
             "'{name}' is not an NGSM-managed service — refusing to remove it"
         ));
     }
+    // The UI gates Remove on the stopped state, but its snapshot can be stale —
+    // refuse to delete a service that is still running/pending/paused.
+    use servicemanager_core::ServiceState;
+    let stopped = matches!(
+        def.runtime.as_ref().map(|r| r.state),
+        Some(ServiceState::Stopped) | None
+    );
+    if !stopped {
+        return Err(format!(
+            "'{name}' is not stopped — stop it before removing it"
+        ));
+    }
     // Remove the SCM service first, then scrub the registry; surface a
     // cleanup failure instead of silently dropping it.
     remove_service(name).map_err(|e| e.to_string())?;

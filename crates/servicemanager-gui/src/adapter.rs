@@ -163,7 +163,7 @@ pub fn to_service_row(d: &ServiceDefinition, elevated: bool) -> ServiceRow {
             && m.is_some_and(|m| m.has_online_rotation())
             && matches!(state, Some(ServiceState::Running | ServiceState::Paused)),
         can_edit: elevated && managed_cfg,
-        can_remove: elevated && owned,
+        can_remove: elevated && owned && matches!(state, Some(ServiceState::Stopped) | None),
         can_processes: matches!(
             state,
             Some(ServiceState::Running | ServiceState::Paused | ServiceState::StartPending)
@@ -403,6 +403,33 @@ mod tests {
         assert!(
             row.can_start,
             "a stopped manual managed service stays startable"
+        );
+    }
+
+    #[test]
+    fn only_stopped_services_can_be_removed() {
+        let running = def(
+            "RunSvc",
+            "Run Svc",
+            "C:\\NGSM\\ngsm.exe run-service RunSvc",
+            StartupType::Manual,
+            Some(ServiceState::Running),
+        );
+        assert!(
+            !to_service_row(&running, true).can_remove,
+            "a running service must not be removable"
+        );
+
+        let stopped = def(
+            "StopSvc",
+            "Stop Svc",
+            "C:\\NGSM\\ngsm.exe run-service StopSvc",
+            StartupType::Manual,
+            Some(ServiceState::Stopped),
+        );
+        assert!(
+            to_service_row(&stopped, true).can_remove,
+            "a stopped managed service stays removable"
         );
     }
 
