@@ -25,9 +25,7 @@ pub fn ngsm_program_data() -> std::io::Result<PathBuf> {
             "neither NGSM_PROGRAM_DATA_DIR nor ProgramData is set",
         ));
     };
-    if !base.exists() {
-        std::fs::create_dir_all(&base)?;
-    }
+    std::fs::create_dir_all(&base)?;
     Ok(base)
 }
 
@@ -44,19 +42,26 @@ pub fn events_log_backup() -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
-    /// Build an isolated tempdir and set `NGSM_PROGRAM_DATA_DIR` to it.
-    /// Returns the tempdir so the caller can keep it alive for the test
-    /// (it's removed on drop).
-    fn isolate() -> tempfile::TempDir {
+    /// All paths tests mutate the process-wide `NGSM_PROGRAM_DATA_DIR`
+    /// env var. Rust runs them on multiple threads by default, so the
+    /// reads + writes race. Serialise them on this lock.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Build an isolated tempdir, lock the process env, and set
+    /// `NGSM_PROGRAM_DATA_DIR` to it. Returns the guard + tempdir so the
+    /// caller can keep both alive for the duration of the test.
+    fn isolate() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
+        let guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
         std::env::set_var("NGSM_PROGRAM_DATA_DIR", dir.path());
-        dir
+        (guard, dir)
     }
 
     #[test]
     fn ngsm_program_data_returns_override_and_creates_it() {
-        let dir = isolate();
+        let (_g, dir) = isolate();
         let nested = dir.path().join("does_not_exist_yet");
         std::env::set_var("NGSM_PROGRAM_DATA_DIR", &nested);
         let resolved = ngsm_program_data().unwrap();
@@ -66,7 +71,7 @@ mod tests {
 
     #[test]
     fn events_log_lives_under_program_data() {
-        let _dir = isolate();
+        let (_g, _dir) = isolate();
         let log = events_log().unwrap();
         assert!(log.ends_with("events.log"));
         assert!(log.parent().unwrap().exists());
@@ -74,8 +79,9 @@ mod tests {
 
     #[test]
     fn events_log_backup_lives_under_program_data() {
-        let _dir = isolate();
+        let (_g, _dir) = isolate();
         let bak = events_log_backup().unwrap();
         assert!(bak.ends_with("events.log.1"));
+        assert!(bak.parent().unwrap().exists());
     }
 }
