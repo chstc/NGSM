@@ -587,6 +587,16 @@ fn drain_results() {
                     let entries = adapter::scm_events_to_entries(&events, &st.defs, 30);
                     win.set_events(slint::ModelRc::new(slint::VecModel::from(entries)));
                 }
+                JobResult::RecoverySaved(result) => match result {
+                    Ok(msg) => {
+                        win.set_recovery_status(msg.clone().into());
+                        win.set_status_text(msg.into());
+                        let _ = st.job_tx.send(Job::Refresh);
+                    }
+                    Err(e) => {
+                        win.set_recovery_status(format!("Error: {e}").into());
+                    }
+                },
                 JobResult::Error(e) => {
                     win.set_status_text(format!("Error: {e}").into());
                 }

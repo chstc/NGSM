@@ -28,7 +28,7 @@ pub struct RecoveryForm {
 }
 
 /// Map an `ExitAction` to the 0-3 index the Slint pickers use.
-pub fn exit_action_to_int(a: ExitAction) -> i32 {
+fn exit_action_to_int(a: ExitAction) -> i32 {
     match a {
         ExitAction::Restart => 0,
         ExitAction::Ignore => 1,
@@ -38,7 +38,7 @@ pub fn exit_action_to_int(a: ExitAction) -> i32 {
 }
 
 /// Inverse of [`exit_action_to_int`]; unknown indices fall back to `Restart`.
-pub fn int_to_exit_action(i: i32) -> ExitAction {
+fn int_to_exit_action(i: i32) -> ExitAction {
     match i {
         1 => ExitAction::Ignore,
         2 => ExitAction::Exit,
@@ -54,6 +54,7 @@ impl RecoveryForm {
         let rows = cfg
             .exit_actions
             .iter()
+            .filter(|(code, _)| code.as_str() != "default")
             .map(|(code, policy)| RecoveryExitRow {
                 exit_code: code.clone(),
                 action: exit_action_to_int(policy.action),
@@ -228,5 +229,44 @@ mod tests {
             ..Default::default()
         };
         assert!(form.to_spec().is_err());
+    }
+
+    #[test]
+    fn from_managed_excludes_the_default_pseudo_key() {
+        // `read_managed_config` carries the default action both as
+        // `restart.default_action` and as an `exit_actions["default"]` entry.
+        // The form must represent it only via `default_action`, never as a row.
+        let cfg = config_with(
+            RestartPolicy {
+                restart_delay_ms: None,
+                throttle_delay_ms: None,
+                default_action: Some(ExitAction::Restart),
+            },
+            &[("default", ExitAction::Restart), ("1", ExitAction::Exit)],
+        );
+        let form = RecoveryForm::from_managed("DemoA", &cfg);
+        assert_eq!(form.rows.len(), 1);
+        assert_eq!(form.rows[0].exit_code, "1");
+    }
+
+    #[test]
+    fn to_spec_last_write_wins_for_duplicate_exit_codes() {
+        let form = RecoveryForm {
+            service: "DemoA".into(),
+            rows: vec![
+                RecoveryExitRow {
+                    exit_code: "1".into(),
+                    action: 0, // Restart
+                },
+                RecoveryExitRow {
+                    exit_code: "1".into(),
+                    action: 2, // Exit
+                },
+            ],
+            ..Default::default()
+        };
+        let spec = form.to_spec().expect("should validate");
+        assert_eq!(spec.exit_actions.len(), 1);
+        assert_eq!(spec.exit_actions.get("1"), Some(&ExitAction::Exit));
     }
 }

@@ -75,6 +75,9 @@ pub enum JobResult {
     },
     /// Recent Service Control Manager events for the Dashboard feed.
     Events(Vec<ScmEvent>),
+    /// Outcome of a `SaveRecovery` job — routed to the Recovery view's own
+    /// status line. `Ok` carries the success message, `Err` the failure.
+    RecoverySaved(Result<String, String>),
     Error(String),
 }
 
@@ -179,10 +182,7 @@ fn execute(job: Job) -> JobResult {
         },
         Job::ReadLog { service, stderr } => read_log(&service, stderr),
         Job::ReadEvents => read_events(),
-        Job::SaveRecovery(spec) => match save_recovery(spec) {
-            Ok(msg) => JobResult::Acted(msg),
-            Err(e) => JobResult::Error(e),
-        },
+        Job::SaveRecovery(spec) => JobResult::RecoverySaved(save_recovery(spec)),
     }
 }
 
@@ -540,6 +540,9 @@ fn save_recovery(spec: RecoverySpec) -> Result<String, String> {
     };
     managed.restart.restart_delay_ms = spec.restart_delay_ms;
     managed.restart.throttle_delay_ms = spec.throttle_delay_ms;
+    // The editor always writes an explicit default action; a service that
+    // previously had no explicit default is promoted to one (semantically
+    // equivalent at runtime, since the supervisor's implicit fallback is Restart).
     managed.restart.default_action = Some(spec.default_action);
     managed.exit_actions = spec
         .exit_actions
