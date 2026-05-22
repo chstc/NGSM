@@ -1,0 +1,67 @@
+import { Theme } from "theme.slint";
+import { Card, StatCard, EventRow } from "widgets.slint";
+
+export component DashboardView inherits Rectangle {
+    background: transparent;
+
+    VerticalLayout {
+        spacing: Theme.gap;
+
+        // --- stat cards ---
+        HorizontalLayout {
+            spacing: Theme.gap;
+            StatCard {
+                title: "Managed services";
+                value: "24";
+                accent: Theme.green;
+                caption: "Running";
+                caption-value: "20";
+            }
+            StatCard {
+                title: "Stopped";
+                value: "2";
+                accent: Theme.cyan;
+                caption: "Manual start";
+                caption-value: "2";
+            }
+            StatCard {
+                title: "Failed";
+                value: "1";
+                accent: Theme.red;
+                caption: "Auto-recovering";
+                caption-value: "1";
+            }
+            StatCard {
+                title: "Availability (30d)";
+                value: "99.9%";
+                accent: Theme.green;
+                show-chart: true;
+                chart-line: "M 0 22 L 9 17 L 18 19 L 27 12 L 36 14 L 45 9 L 54 12 L 63 8 L 72 10 L 81 6 L 90 7 L 100 4";
+                chart-area: "M 0 22 L 9 17 L 18 19 L 27 12 L 36 14 L 45 9 L 54 12 L 63 8 L 72 10 L 81 6 L 90 7 L 100 4 L 100 28 L 0 28 Z";
+            }
+        }
+
+        // --- recent events ---
+        Card {
+            VerticalLayout {
+                padding: 20px;
+                alignment: start;
+                spacing: 0px;
+                Text {
+                    text: "Recent Events";
+                    color: Theme.text;
+                    font-size: 15px;
+                    font-weight: 800;
+                }
+                Rectangle { height: 10px; }
+                EventRow { label: "SmDemoSvcA — started";        time: "10:21:15"; tint: Theme.green; }
+                EventRow { label: "SmIngestWorker — recovered";   time: "10:20:42"; tint: Theme.green; }
+                EventRow { label: "SmDemoSvcB — stopped";         time: "10:17:33"; tint: Theme.amber; }
+                EventRow { label: "SmDemoSvcB — failed (exit 1)"; time: "10:16:05"; tint: Theme.red; }
+                EventRow { label: "SmReportSvc — started";        time: "10:15:12"; tint: Theme.green; }
+                EventRow { label: "Service scan completed";       time: "10:14:00"; tint: Theme.cyan; }
+                EventRow { label: "NGSM started";                 time: "10:13:58"; tint: Theme.cyan; last: true; }
+            }
+        }
+    }
+}

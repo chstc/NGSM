@@ -1,0 +1,228 @@
+import { Theme } from "theme.slint";
+import { Card, Pill, AccentButton, GhostButton, Caret } from "widgets.slint";
+
+struct Svc {
+    name: string,
+    display: string,
+    kind: string,
+    state: string,
+    startup: string,
+    running: bool,
+}
+
+component DetailLine inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    height: 32px;
+    HorizontalLayout {
+        Text {
+            text: root.label;
+            color: Theme.text-faint;
+            font-size: 12px;
+            width: 116px;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.value;
+            color: Theme.text;
+            font-size: 13px;
+            vertical-alignment: center;
+        }
+    }
+    Rectangle {
+        y: parent.height - 1px;
+        height: 1px;
+        background: Theme.divider;
+    }
+}
+
+component HeaderCell inherits Text {
+    color: Theme.text-faint;
+    font-size: 11px;
+    font-weight: 700;
+    vertical-alignment: center;
+}
+
+export component ServicesView inherits Rectangle {
+    background: transparent;
+    in-out property <int> selected: 0;
+    property <[Svc]> rows: [
+        { name: "SmDemoSvcA",     display: "ServiceManager demo A", kind: "managed", state: "Running", startup: "Manual",    running: true },
+        { name: "SmDemoSvcB",     display: "ServiceManager demo B", kind: "managed", state: "Stopped", startup: "Automatic", running: false },
+        { name: "SmIngestWorker", display: "Ingest worker",         kind: "managed", state: "Running", startup: "Automatic", running: true },
+        { name: "SmReportSvc",    display: "Report scheduler",      kind: "managed", state: "Running", startup: "Automatic", running: true },
+        { name: "Spooler",        display: "Print Spooler",         kind: "native",  state: "Running", startup: "Automatic", running: true },
+        { name: "wuauserv",       display: "Windows Update",        kind: "native",  state: "Stopped", startup: "Manual",    running: false },
+    ];
+
+    HorizontalLayout {
+        spacing: Theme.gap;
+
+        // --- toolbar + table ---
+        VerticalLayout {
+            horizontal-stretch: 3;
+            spacing: Theme.gap;
+
+            HorizontalLayout {
+                spacing: 10px;
+                alignment: start;
+                AccentButton { text: "Install service"; }
+                GhostButton { text: "Refresh"; }
+                Rectangle {
+                    width: 156px;
+                    height: 36px;
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: Theme.card-border;
+                    background: Theme.card-bg;
+                    HorizontalLayout {
+                        padding-left: 13px;
+                        padding-right: 30px;
+                        Text {
+                            text: "Managed only";
+                            color: Theme.text-dim;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Caret {
+                        x: parent.width - self.width - 13px;
+                        y: (parent.height - self.height) / 2;
+                    }
+                }
+                Rectangle { }
+            }
+
+            Card {
+                VerticalLayout {
+                    padding: 8px;
+                    alignment: start;
+                    spacing: 2px;
+                    Rectangle {
+                        height: 36px;
+                        HorizontalLayout {
+                            padding-left: 14px;
+                            padding-right: 14px;
+                            spacing: 12px;
+                            HeaderCell { text: "NAME"; width: 148px; }
+                            HeaderCell { text: "DISPLAY NAME"; horizontal-stretch: 1; }
+                            HeaderCell { text: "KIND"; width: 74px; }
+                            HeaderCell { text: "STATE"; width: 104px; }
+                            HeaderCell { text: "STARTUP"; width: 88px; }
+                        }
+                    }
+                    for svc[idx] in root.rows : Rectangle {
+                        height: 46px;
+                        border-radius: 7px;
+                        background: idx == root.selected ? Theme.sel
+                                  : rta.has-hover ? Theme.hover
+                                  : transparent;
+                        rta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.selected = idx; }
+                        }
+                        HorizontalLayout {
+                            padding-left: 14px;
+                            padding-right: 14px;
+                            spacing: 12px;
+                            Text {
+                                text: svc.name;
+                                color: Theme.text;
+                                font-size: 13px;
+                                font-weight: 600;
+                                width: 148px;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: svc.display;
+                                color: Theme.text-dim;
+                                font-size: 13px;
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: svc.kind;
+                                color: Theme.text-faint;
+                                font-size: 12px;
+                                width: 74px;
+                                vertical-alignment: center;
+                            }
+                            Rectangle {
+                                width: 104px;
+                                Pill {
+                                    x: 0px;
+                                    y: (parent.height - self.height) / 2;
+                                    text: svc.state;
+                                    tint: svc.running ? Theme.green : Theme.amber;
+                                }
+                            }
+                            Text {
+                                text: svc.startup;
+                                color: Theme.text-dim;
+                                font-size: 12px;
+                                width: 88px;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- detail pane ---
+        VerticalLayout {
+            horizontal-stretch: 2;
+            spacing: Theme.gap;
+            Rectangle { height: 36px; }
+            Card {
+                VerticalLayout {
+                    padding: 24px;
+                alignment: start;
+                spacing: 0px;
+                Text {
+                    text: root.rows[root.selected].display;
+                    color: Theme.text;
+                    font-size: 21px;
+                    font-weight: 800;
+                }
+                Rectangle { height: 8px; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    Pill {
+                        text: root.rows[root.selected].state;
+                        tint: root.rows[root.selected].running ? Theme.green : Theme.amber;
+                    }
+                    Pill {
+                        text: root.rows[root.selected].kind;
+                        tint: Theme.cyan;
+                    }
+                }
+                Rectangle { height: 18px; }
+                DetailLine { label: "Service name"; value: root.rows[root.selected].name; }
+                DetailLine { label: "Application";  value: "C:\\Apps\\demo\\demo.exe"; }
+                DetailLine { label: "Arguments";    value: "--config prod.toml --verbose"; }
+                DetailLine { label: "Working dir";  value: "C:\\Apps\\demo"; }
+                DetailLine { label: "Startup type"; value: root.rows[root.selected].startup; }
+                DetailLine { label: "stdout log";   value: "C:\\Apps\\demo\\logs\\out.log"; }
+                Rectangle { height: 22px; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    AccentButton { text: "Start"; }
+                    GhostButton { text: "Stop"; }
+                    GhostButton { text: "Restart"; }
+                }
+                Rectangle { height: 9px; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    GhostButton { text: "Edit…"; }
+                    GhostButton { text: "Processes…"; }
+                    GhostButton { text: "Remove"; tint: Theme.red; }
+                }
+            }
+            }
+        }
+    }
+}

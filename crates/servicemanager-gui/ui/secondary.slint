@@ -1,0 +1,40 @@
+import { Theme } from "theme.slint";
+import { Card } from "widgets.slint";
+
+// R1 placeholder for views whose full implementation is deferred (Logs and
+// Recovery to R2/R3, Settings to R3). Keeps the shell coherent and navigable.
+component StubView inherits Rectangle {
+    in property <string> view-title;
+    background: transparent;
+    Card {
+        VerticalLayout {
+            alignment: center;
+            spacing: 6px;
+            Text {
+                text: root.view-title;
+                color: Theme.text;
+                font-size: 18px;
+                font-weight: 800;
+                horizontal-alignment: center;
+            }
+            Text {
+                text: "Available in a later NGSM release.";
+                color: Theme.text-faint;
+                font-size: 13px;
+                horizontal-alignment: center;
+            }
+        }
+    }
+}
+
+export component LogsView inherits StubView {
+    view-title: "Logs";
+}
+
+export component RecoveryView inherits StubView {
+    view-title: "Recovery";
+}
+
+export component SettingsView inherits StubView {
+    view-title: "Settings";
+}
