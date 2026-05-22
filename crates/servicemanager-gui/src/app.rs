@@ -128,6 +128,18 @@ fn wire_callbacks(window: &MainWindow) {
             }
         });
     });
+    window.on_relaunch_admin(|| {
+        if crate::elevation::relaunch_as_admin() {
+            std::process::exit(0);
+        }
+        STATE.with(|s| {
+            if let Some(st) = s.borrow().as_ref() {
+                if let Some(win) = st.window.upgrade() {
+                    win.set_status_text("Relaunch declined or failed.".into());
+                }
+            }
+        });
+    });
 }
 
 /// Drain every pending `JobResult` and apply it to the UI. Posted onto the UI
