@@ -60,6 +60,7 @@ features = [
     "Win32_Security_Authorization",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
+    "Win32_System_EventLog",
 ]
 
 [profile.release]
