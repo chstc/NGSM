@@ -42,7 +42,8 @@ struct AppState {
     /// (newest first). The display `events: Vec<EventEntry>` is
     /// rebuilt from this every `apply_snapshot`.
     event_records: Vec<servicemanager_core::EventRecord>,
-    /// Accumulated Recent Events entries (session-scoped, newest first).
+    /// Display model for the Recent Events panel — rebuilt from `event_records`
+    /// every `apply_snapshot`, newest first, capped at 12.
     events: Vec<EventEntry>,
     /// In-progress edit form — holds the originals so `to_spec` can diff.
     edit_form: Option<forms::EditForm>,
@@ -747,7 +748,7 @@ fn drain_results() {
 }
 
 /// Rebuild the service model and Dashboard stats from the cached defs, then
-/// diff this scan against the previous one to update the Recent Events feed.
+/// render the Recent Events feed from the cached supervisor event records.
 fn apply_snapshot(win: &MainWindow, st: &mut AppState) {
     refresh_service_model(win, st);
 
