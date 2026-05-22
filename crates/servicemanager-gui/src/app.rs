@@ -58,10 +58,44 @@ pub fn build_ui() -> Result<MainWindow, slint::PlatformError> {
         });
     });
 
+    wire_callbacks(&window);
+
     window.set_status_text("Loading…".into());
     let _ = job_tx.send(Job::Refresh);
 
     Ok(window)
+}
+
+/// Register the UI callbacks. Each runs on the UI thread and reaches the
+/// controller through the `STATE` thread-local.
+fn wire_callbacks(window: &MainWindow) {
+    window.on_refresh(|| {
+        STATE.with(|s| {
+            if let Some(st) = s.borrow().as_ref() {
+                let _ = st.job_tx.send(Job::Refresh);
+            }
+        });
+    });
+    window.on_filter_changed(|managed_only| {
+        STATE.with(|s| {
+            let mut guard = s.borrow_mut();
+            let Some(st) = guard.as_mut() else { return };
+            st.managed_only = managed_only;
+            if let Some(win) = st.window.upgrade() {
+                refresh_service_model(&win, st);
+            }
+        });
+    });
+    window.on_search_changed(|text| {
+        STATE.with(|s| {
+            let mut guard = s.borrow_mut();
+            let Some(st) = guard.as_mut() else { return };
+            st.search = text.to_string();
+            if let Some(win) = st.window.upgrade() {
+                refresh_service_model(&win, st);
+            }
+        });
+    });
 }
 
 /// Drain every pending `JobResult` and apply it to the UI. Posted onto the UI
