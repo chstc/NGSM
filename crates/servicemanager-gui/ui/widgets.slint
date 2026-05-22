@@ -6,7 +6,7 @@ export component Card inherits Rectangle {
     border-color: Theme.card-border;
     border-width: 1px;
     border-radius: Theme.radius;
-    drop-shadow-color: #00000066;
+    drop-shadow-color: Theme.shadow;
     drop-shadow-blur: 18px;
     drop-shadow-offset-y: 6px;
 }
@@ -64,7 +64,7 @@ export component AccentButton inherits Rectangle {
         padding-right: 18px;
         Text {
             text: root.text;
-            color: #08140d;
+            color: Theme.on-accent;
             font-size: 13px;
             font-weight: 700;
             vertical-alignment: center;
@@ -184,7 +184,7 @@ export component CheckBox inherits Rectangle {
                     viewbox-width: 11;
                     viewbox-height: 9;
                     commands: "M 0 4 L 4 8 L 11 0";
-                    stroke: #06210f;
+                    stroke: Theme.on-accent;
                     stroke-width: 2px;
                     visible: root.checked;
                 }
