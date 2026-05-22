@@ -472,6 +472,7 @@ impl Supervisor {
                 }
                 Err(_) => {
                     self.stop_child_gracefully();
+                    writer.stopped(servicemanager_core::events::StopReason::ScmStop);
                     return Ok(ExitReason::Stopped);
                 }
             }
