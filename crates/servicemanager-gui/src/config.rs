@@ -32,8 +32,8 @@ pub fn parse_config(text: &str) -> Config {
 }
 
 /// Serialise preferences to pretty JSON.
-pub fn to_json(config: &Config) -> String {
-    serde_json::to_string_pretty(config).unwrap_or_default()
+fn to_json(config: &Config) -> Result<String, String> {
+    serde_json::to_string_pretty(config).map_err(|e| format!("serialise config: {e}"))
 }
 
 /// Path to the config file: `%APPDATA%\NGSM\config.json`.
@@ -61,7 +61,8 @@ pub fn save(config: &Config) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     }
-    std::fs::write(&path, to_json(config)).map_err(|e| format!("write config: {e}"))
+    let json = to_json(config)?;
+    std::fs::write(&path, json).map_err(|e| format!("write config: {e}"))
 }
 
 #[cfg(test)]
@@ -83,7 +84,7 @@ mod tests {
             auto_refresh_secs: 30,
             managed_only: false,
         };
-        assert_eq!(parse_config(&to_json(&c)), c);
+        assert_eq!(parse_config(&to_json(&c).expect("serialises")), c);
     }
 
     #[test]

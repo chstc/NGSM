@@ -138,9 +138,11 @@ fn wire_callbacks(window: &MainWindow) {
         STATE.with(|s| {
             let mut guard = s.borrow_mut();
             let Some(st) = guard.as_mut() else { return };
+            st.config.managed_only = managed_only;
             st.managed_only = managed_only;
             if let Some(win) = st.window.upgrade() {
                 refresh_service_model(&win, st);
+                persist_config(st, &win);
             }
         });
     });
@@ -503,6 +505,8 @@ fn wire_callbacks(window: &MainWindow) {
             let secs_u = secs.max(1) as u32;
             st.config.auto_refresh_secs = secs_u;
             // Restart the ticker so the new interval takes effect at once.
+            // Calling `start` on a running `slint::Timer` replaces its current
+            // registration, so no explicit cancel/stop is needed first.
             st.timer.start(
                 slint::TimerMode::Repeated,
                 std::time::Duration::from_secs(secs_u as u64),
