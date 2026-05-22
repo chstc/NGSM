@@ -9,6 +9,7 @@ compile_error!("servicemanager-gui builds only for Windows targets.");
 
 mod adapter;
 mod app;
+mod config;
 mod data;
 mod elevation;
 mod forms;

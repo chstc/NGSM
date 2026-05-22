@@ -9,7 +9,7 @@ use servicemanager_win32::InstallStartType;
 use slint::ComponentHandle;
 
 use crate::data::{spawn_worker, Job, JobResult};
-use crate::{adapter, forms, recovery};
+use crate::{adapter, config, forms, recovery};
 use crate::{MainWindow, ProcessRow, RecoveryRow, ServiceRow};
 
 /// UI-thread-only controller state. It lives in a `thread_local` so the
@@ -38,12 +38,27 @@ struct AppState {
     proc_sort_ascending: bool,
     /// In-progress Recovery editor form for the selected managed service.
     recovery_form: Option<recovery::RecoveryForm>,
-    /// Auto-refresh ticker; held only to keep it running.
-    _timer: slint::Timer,
+    /// Persisted user preferences.
+    config: config::Config,
+    /// Auto-refresh ticker; held so it keeps running and can be restarted.
+    timer: slint::Timer,
 }
 
 thread_local! {
     static STATE: RefCell<Option<AppState>> = const { RefCell::new(None) };
+}
+
+/// The auto-refresh ticker body: enqueue a refresh while the toggle is on.
+fn auto_refresh_tick() {
+    STATE.with(|s| {
+        if let Some(st) = s.borrow().as_ref() {
+            if let Some(win) = st.window.upgrade() {
+                if win.get_auto_refresh() {
+                    let _ = st.job_tx.send(Job::Refresh);
+                }
+            }
+        }
+    });
 }
 
 /// Build the main window, spawn the worker, and kick off the first refresh.
@@ -63,23 +78,19 @@ pub fn build_ui() -> Result<MainWindow, slint::PlatformError> {
         }),
     );
 
-    // Auto-refresh: a repeating 5 s tick that re-enumerates while the toggle
-    // is on. The toggle state lives in the `auto-refresh` window property.
+    // Load persisted preferences and seed the window from them.
+    let config = config::load();
+    window.set_auto_refresh(config.auto_refresh);
+    window.set_managed_only(config.managed_only);
+    window.set_auto_refresh_secs(config.auto_refresh_secs as i32);
+
+    // Auto-refresh: a repeating tick that re-enumerates while the toggle is
+    // on. The interval comes from preferences and can be changed in Settings.
     let auto_timer = slint::Timer::default();
     auto_timer.start(
         slint::TimerMode::Repeated,
-        std::time::Duration::from_secs(5),
-        || {
-            STATE.with(|s| {
-                if let Some(st) = s.borrow().as_ref() {
-                    if let Some(win) = st.window.upgrade() {
-                        if win.get_auto_refresh() {
-                            let _ = st.job_tx.send(Job::Refresh);
-                        }
-                    }
-                }
-            });
-        },
+        std::time::Duration::from_secs(config.auto_refresh_secs.max(1) as u64),
+        auto_refresh_tick,
     );
 
     STATE.with(|s| {
@@ -88,7 +99,7 @@ pub fn build_ui() -> Result<MainWindow, slint::PlatformError> {
             job_tx: job_tx.clone(),
             result_rx,
             defs: Vec::new(),
-            managed_only: true,
+            managed_only: config.managed_only,
             running_only: false,
             search: String::new(),
             sort_column: 0,
@@ -100,7 +111,8 @@ pub fn build_ui() -> Result<MainWindow, slint::PlatformError> {
             proc_sort_column: 0,
             proc_sort_ascending: true,
             recovery_form: None,
-            _timer: auto_timer,
+            config,
+            timer: auto_timer,
         });
     });
 
@@ -474,6 +486,46 @@ fn wire_callbacks(window: &MainWindow) {
             }
         });
     });
+    window.on_settings_set_auto_refresh(|v| {
+        STATE.with(|s| {
+            let mut guard = s.borrow_mut();
+            let Some(st) = guard.as_mut() else { return };
+            st.config.auto_refresh = v;
+            if let Some(win) = st.window.upgrade() {
+                persist_config(st, &win);
+            }
+        });
+    });
+    window.on_settings_set_interval(|secs| {
+        STATE.with(|s| {
+            let mut guard = s.borrow_mut();
+            let Some(st) = guard.as_mut() else { return };
+            let secs_u = secs.max(1) as u32;
+            st.config.auto_refresh_secs = secs_u;
+            // Restart the ticker so the new interval takes effect at once.
+            st.timer.start(
+                slint::TimerMode::Repeated,
+                std::time::Duration::from_secs(secs_u as u64),
+                auto_refresh_tick,
+            );
+            if let Some(win) = st.window.upgrade() {
+                win.set_auto_refresh_secs(secs);
+                persist_config(st, &win);
+            }
+        });
+    });
+    window.on_settings_set_managed_only(|v| {
+        STATE.with(|s| {
+            let mut guard = s.borrow_mut();
+            let Some(st) = guard.as_mut() else { return };
+            st.config.managed_only = v;
+            st.managed_only = v;
+            if let Some(win) = st.window.upgrade() {
+                refresh_service_model(&win, st);
+                persist_config(st, &win);
+            }
+        });
+    });
 }
 
 /// Send a worker job and show a pending message in the status bar.
@@ -720,4 +772,12 @@ fn push_recovery_rows(win: &MainWindow, form: &recovery::RecoveryForm) {
         })
         .collect();
     win.set_recovery_rows(slint::ModelRc::new(slint::VecModel::from(rows)));
+}
+
+/// Persist preferences; a failed save is surfaced in the status bar but is
+/// non-fatal (the in-memory config still applies for the session).
+fn persist_config(st: &AppState, win: &MainWindow) {
+    if let Err(e) = config::save(&st.config) {
+        win.set_status_text(format!("Settings not saved: {e}").into());
+    }
 }

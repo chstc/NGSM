@@ -1,32 +1,6 @@
 import { Theme } from "theme.slint";
-import { Card, GhostButton, AccentButton } from "widgets.slint";
+import { Card, GhostButton, AccentButton, CheckBox } from "widgets.slint";
 import { ScrollView } from "std-widgets.slint";
-
-// Placeholder for views whose full implementation is deferred (Recovery and
-// Settings to R3). Keeps the shell coherent and navigable.
-component StubView inherits Rectangle {
-    in property <string> view-title;
-    background: transparent;
-    Card {
-        VerticalLayout {
-            alignment: center;
-            spacing: 6px;
-            Text {
-                text: root.view-title;
-                color: Theme.text;
-                font-size: 18px;
-                font-weight: 800;
-                horizontal-alignment: center;
-            }
-            Text {
-                text: "Available in a later NGSM release.";
-                color: Theme.text-faint;
-                font-size: 13px;
-                horizontal-alignment: center;
-            }
-        }
-    }
-}
 
 // One stdout/stderr selector chip.
 component StreamChip inherits Rectangle {
@@ -358,6 +332,83 @@ export component RecoveryView inherits Rectangle {
     }
 }
 
-export component SettingsView inherits StubView {
-    view-title: "Settings";
+export component SettingsView inherits Rectangle {
+    in-out property <bool> auto-refresh;
+    in property <int> auto-refresh-secs;
+    in-out property <bool> managed-only;
+    callback set-auto-refresh(bool);
+    callback set-interval(int);
+    callback set-managed-only(bool);
+    background: transparent;
+
+    Card {
+        VerticalLayout {
+            padding: 24px;
+            spacing: 20px;
+            alignment: start;
+            Text {
+                text: "Preferences";
+                color: Theme.text;
+                font-size: 17px;
+                font-weight: 800;
+            }
+            VerticalLayout {
+                spacing: 6px;
+                Text {
+                    text: "Auto-refresh";
+                    color: Theme.text-dim;
+                    font-size: 12px;
+                }
+                CheckBox {
+                    label: "Re-enumerate services automatically";
+                    checked <=> root.auto-refresh;
+                    toggled(v) => { root.set-auto-refresh(v); }
+                }
+            }
+            VerticalLayout {
+                spacing: 6px;
+                Text {
+                    text: "Auto-refresh interval";
+                    color: Theme.text-dim;
+                    font-size: 12px;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    for secs in [5, 10, 30] : Rectangle {
+                        width: 104px;
+                        height: 34px;
+                        border-radius: Theme.radius-sm;
+                        border-width: 1px;
+                        border-color: root.auto-refresh-secs == secs ? Theme.cyan : Theme.card-border;
+                        background: root.auto-refresh-secs == secs ? Theme.cyan.with-alpha(0.14) : Theme.bg;
+                        Text {
+                            text: secs + " seconds";
+                            color: root.auto-refresh-secs == secs ? Theme.cyan : Theme.text-dim;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.set-interval(secs); }
+                        }
+                    }
+                }
+            }
+            VerticalLayout {
+                spacing: 6px;
+                Text {
+                    text: "Default service filter";
+                    color: Theme.text-dim;
+                    font-size: 12px;
+                }
+                CheckBox {
+                    label: "Show only NGSM-managed services";
+                    checked <=> root.managed-only;
+                    toggled(v) => { root.set-managed-only(v); }
+                }
+            }
+        }
+    }
 }

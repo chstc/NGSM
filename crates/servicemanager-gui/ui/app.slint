@@ -84,6 +84,12 @@ export component MainWindow inherits Window {
     callback recovery-action-changed(int, int);
     callback recovery-save();
 
+    in-out property <bool> managed-only: true;
+    in-out property <int> auto-refresh-secs: 5;
+    callback settings-set-auto-refresh(bool);
+    callback settings-set-interval(int);
+    callback settings-set-managed-only(bool);
+
     HorizontalLayout {
         spacing: 0px;
 
@@ -281,6 +287,7 @@ export component MainWindow inherits Window {
                         elevated: root.elevated;
                         auto-refresh <=> root.auto-refresh;
                         running-only <=> root.running-only;
+                        managed-only <=> root.managed-only;
                         selected <=> root.selected-service;
                         sort-column: root.sort-column;
                         sort-ascending: root.sort-ascending;
@@ -316,7 +323,14 @@ export component MainWindow inherits Window {
                         action-changed(i, a) => { root.recovery-action-changed(i, a); }
                         save => { root.recovery-save(); }
                     }
-                    if root.view == 4 : SettingsView { }
+                    if root.view == 4 : SettingsView {
+                        auto-refresh <=> root.auto-refresh;
+                        managed-only <=> root.managed-only;
+                        auto-refresh-secs: root.auto-refresh-secs;
+                        set-auto-refresh(v) => { root.settings-set-auto-refresh(v); }
+                        set-interval(s) => { root.settings-set-interval(s); }
+                        set-managed-only(v) => { root.settings-set-managed-only(v); }
+                    }
                 }
 
                 // status bar
