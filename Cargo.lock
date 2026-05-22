@@ -4056,6 +4056,8 @@ name = "servicemanager-gui"
 version = "0.1.0"
 dependencies = [
  "rfd",
+ "serde",
+ "serde_json",
  "servicemanager-core",
  "servicemanager-registry",
  "servicemanager-win32",
