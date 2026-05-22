@@ -1,6 +1,8 @@
 //! Pure view-model logic: filtering, dashboard stats, and event diffing.
 //! No Slint or Win32 calls — every function here is unit-tested.
 
+use std::collections::HashMap;
+
 use servicemanager_core::{ServiceDefinition, ServiceState};
 
 /// True if `def` should be shown given the managed-only toggle and search box.
@@ -49,6 +51,60 @@ pub fn dashboard_stats(defs: &[ServiceDefinition]) -> DashboardStats {
         }
     }
     s
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventKind {
+    Started,
+    Stopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventChange {
+    pub service: String,
+    pub kind: EventKind,
+}
+
+/// Compare the previous managed-service states to the current snapshot and
+/// return the state transitions worth surfacing in the Recent Events panel.
+/// Only managed services are considered. A service with no prior entry (first
+/// scan) produces no event.
+pub fn diff_events(
+    prev: &HashMap<String, ServiceState>,
+    now: &[ServiceDefinition],
+) -> Vec<EventChange> {
+    let mut out = Vec::new();
+    for d in now.iter().filter(|d| d.is_managed()) {
+        let Some(cur) = d.runtime.as_ref().map(|r| r.state) else {
+            continue;
+        };
+        let Some(&old) = prev.get(&d.native.name) else {
+            continue;
+        };
+        if old == cur {
+            continue;
+        }
+        match cur {
+            ServiceState::Running => out.push(EventChange {
+                service: d.native.name.clone(),
+                kind: EventKind::Started,
+            }),
+            ServiceState::Stopped => out.push(EventChange {
+                service: d.native.name.clone(),
+                kind: EventKind::Stopped,
+            }),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Snapshot the current managed-service states for the next `diff_events`.
+pub fn state_snapshot(defs: &[ServiceDefinition]) -> HashMap<String, ServiceState> {
+    defs.iter()
+        .filter(|d| d.is_managed())
+        .filter_map(|d| d.runtime.as_ref().map(|r| (d.native.name.clone(), r.state)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -154,5 +210,59 @@ mod tests {
         assert_eq!(s.running, 1);
         assert_eq!(s.stopped, 2);
         assert_eq!(s.attention, 1); // only B: managed + Automatic + Stopped
+    }
+
+    #[test]
+    fn diff_events_reports_start_and_stop_transitions() {
+        let ngsm = |n: &str, state| {
+            def(
+                n,
+                n,
+                &format!("C:\\NGSM\\ngsm.exe run-service {n}"),
+                StartupType::Manual,
+                state,
+            )
+        };
+        let prev: HashMap<String, ServiceState> = [
+            ("A".to_string(), ServiceState::Stopped),
+            ("B".to_string(), ServiceState::Running),
+            ("C".to_string(), ServiceState::Running),
+        ]
+        .into_iter()
+        .collect();
+        let now = vec![
+            ngsm("A", Some(ServiceState::Running)), // started
+            ngsm("B", Some(ServiceState::Stopped)), // stopped
+            ngsm("C", Some(ServiceState::Running)), // unchanged
+        ];
+        let events = diff_events(&prev, &now);
+        assert_eq!(
+            events,
+            vec![
+                EventChange { service: "A".into(), kind: EventKind::Started },
+                EventChange { service: "B".into(), kind: EventKind::Stopped },
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_events_ignores_first_scan_and_native_services() {
+        let now = vec![
+            def(
+                "A",
+                "A",
+                "C:\\NGSM\\ngsm.exe run-service A",
+                StartupType::Manual,
+                Some(ServiceState::Running),
+            ),
+            def(
+                "Spooler",
+                "Spooler",
+                "C:\\Windows\\spoolsv.exe",
+                StartupType::Automatic,
+                Some(ServiceState::Running),
+            ),
+        ];
+        assert!(diff_events(&HashMap::new(), &now).is_empty());
     }
 }
