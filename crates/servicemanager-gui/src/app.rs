@@ -4,13 +4,15 @@
 use std::cell::RefCell;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
-use servicemanager_core::ServiceDefinition;
+use std::collections::HashMap;
+
+use servicemanager_core::{ServiceDefinition, ServiceState};
 use servicemanager_win32::InstallStartType;
 use slint::ComponentHandle;
 
 use crate::data::{spawn_worker, Job, JobResult};
 use crate::{adapter, config, forms, recovery};
-use crate::{MainWindow, ProcessRow, RecoveryRow, ServiceRow};
+use crate::{EventEntry, MainWindow, ProcessRow, RecoveryRow, ServiceRow};
 
 /// UI-thread-only controller state. It lives in a `thread_local` so the
 /// worker's wake callback — which must be `Send` — can stay capture-free and
@@ -38,9 +40,10 @@ struct AppState {
     /// The (service, stderr) the Logs view currently wants — used to discard
     /// stale `ReadLog` results that arrive after the user moved on.
     log_request: Option<(String, bool)>,
-    /// True while a `ReadEvents` job is queued/running — prevents piling up
-    /// duplicate event-log reads.
-    events_pending: bool,
+    /// Managed-service states from the previous scan — feeds `diff_events`.
+    prev_states: HashMap<String, ServiceState>,
+    /// Accumulated Recent Events entries (session-scoped, newest first).
+    events: Vec<EventEntry>,
     /// In-progress edit form — holds the originals so `to_spec` can diff.
     edit_form: Option<forms::EditForm>,
     /// Process-tree rows for the open Processes dialog.
@@ -131,7 +134,8 @@ pub fn build_ui() -> Result<MainWindow, slint::PlatformError> {
             visible_names: Vec::new(),
             log_stderr: false,
             log_request: None,
-            events_pending: false,
+            prev_states: HashMap::new(),
+            events: Vec::new(),
             edit_form: None,
             proc_rows: Vec::new(),
             proc_sort_column: 0,
@@ -698,11 +702,6 @@ fn drain_results() {
                         win.set_log_lines(slint::ModelRc::new(slint::VecModel::from(shared)));
                     }
                 }
-                JobResult::Events(events) => {
-                    st.events_pending = false;
-                    let entries = adapter::scm_events_to_entries(&events, &st.defs, 30);
-                    win.set_events(slint::ModelRc::new(slint::VecModel::from(entries)));
-                }
                 JobResult::RecoverySaved(result) => match result {
                     Ok(msg) => {
                         win.set_recovery_status(msg.clone().into());
@@ -739,7 +738,6 @@ fn drain_results() {
                     }
                 },
                 JobResult::Error(e) => {
-                    st.events_pending = false;
                     win.set_status_text(format!("Error: {e}").into());
                 }
             }
@@ -748,7 +746,7 @@ fn drain_results() {
 }
 
 /// Rebuild the service model and Dashboard stats from the cached defs, then
-/// kick off an event-log read for the Recent Events panel.
+/// diff this scan against the previous one to update the Recent Events feed.
 fn apply_snapshot(win: &MainWindow, st: &mut AppState) {
     refresh_service_model(win, st);
 
@@ -758,12 +756,38 @@ fn apply_snapshot(win: &MainWindow, st: &mut AppState) {
     win.set_stat_stopped(stats.stopped.to_string().into());
     win.set_stat_attention(stats.attention.to_string().into());
 
-    // Recent Events come from the OS event log. Only read them when the
-    // Dashboard is actually visible, and never pile up a second read.
-    if win.get_view() == 0 && !st.events_pending {
-        st.events_pending = true;
-        let _ = st.job_tx.send(Job::ReadEvents);
+    // Recent Events: diff this scan against the previous one, newest first.
+    let changes = adapter::diff_events(&st.prev_states, &st.defs);
+    if !changes.is_empty() {
+        let now = local_hms();
+        for change in changes {
+            let (verb, kind) = match change.kind {
+                adapter::EventKind::Started => ("started", 0),
+                adapter::EventKind::Stopped => ("stopped", 1),
+            };
+            st.events.insert(
+                0,
+                EventEntry {
+                    label: format!("{} — {verb}", change.service).into(),
+                    time: now.clone().into(),
+                    kind,
+                },
+            );
+        }
+        st.events.truncate(12);
     }
+    st.prev_states = adapter::state_snapshot(&st.defs);
+    win.set_events(slint::ModelRc::new(slint::VecModel::from(
+        st.events.clone(),
+    )));
+}
+
+/// Current local time formatted `HH:MM:SS`, for event timestamps.
+fn local_hms() -> String {
+    use windows::Win32::System::SystemInformation::GetLocalTime;
+    // SAFETY: `GetLocalTime` returns a fully-initialised `SYSTEMTIME`.
+    let t = unsafe { GetLocalTime() };
+    format!("{:02}:{:02}:{:02}", t.wHour, t.wMinute, t.wSecond)
 }
 
 /// Rebuild the `services` model from the cached defs + current filter/search,

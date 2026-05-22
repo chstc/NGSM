@@ -16,9 +16,8 @@ use servicemanager_core::{
 };
 use servicemanager_win32::{
     build_run_service_command, control_service, enumerate_descendants, enumerate_services,
-    install_service, query_service, read_scm_events, remove_service, start_service,
-    update_native_config, InstallOptions, InstallStartType, ProcessInfo, ScmEvent,
-    ServiceControlSignal, SERVICE_CONTROL_ROTATE,
+    install_service, query_service, remove_service, start_service, update_native_config,
+    InstallOptions, InstallStartType, ProcessInfo, ServiceControlSignal, SERVICE_CONTROL_ROTATE,
 };
 
 /// Wrap a log-file path in a plain [`IoStream`] (default share/disposition).
@@ -46,7 +45,6 @@ pub enum Job {
     Remove(String),
     Processes(String),
     ReadLog { service: String, stderr: bool },
-    ReadEvents,
     SaveRecovery(RecoverySpec),
 }
 
@@ -73,8 +71,6 @@ pub enum JobResult {
         status: String,
         lines: Vec<String>,
     },
-    /// Recent Service Control Manager events for the Dashboard feed.
-    Events(Vec<ScmEvent>),
     /// Outcome of a `SaveRecovery` job — routed to the Recovery view's own
     /// status line. `Ok` carries the success message, `Err` the failure.
     RecoverySaved(Result<String, String>),
@@ -180,7 +176,6 @@ fn execute(job: Job) -> JobResult {
             Err(e) => JobResult::Error(e),
         },
         Job::ReadLog { service, stderr } => read_log(&service, stderr),
-        Job::ReadEvents => read_events(),
         Job::SaveRecovery(spec) => JobResult::RecoverySaved(save_recovery(spec)),
     }
 }
@@ -539,16 +534,6 @@ fn read_log(service: &str, stderr: bool) -> JobResult {
             lines,
         ),
         Err(e) => log(format!("Cannot read {which} log '{path}': {e}"), Vec::new()),
-    }
-}
-
-/// Read recent Service Control Manager lifecycle records for the Recent Events
-/// feed. 200 raw records is a generous upper bound — the GUI then keeps only
-/// those for managed services and shows the newest ~30.
-fn read_events() -> JobResult {
-    match read_scm_events(200) {
-        Ok(events) => JobResult::Events(events),
-        Err(e) => JobResult::Error(format!("event log: {e}")),
     }
 }
 

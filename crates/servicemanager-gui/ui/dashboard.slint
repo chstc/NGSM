@@ -4,7 +4,7 @@ import { Card, StatCard, EventRow } from "widgets.slint";
 export struct EventEntry {
     label: string,
     time: string,
-    kind: int, // 0 started (green), 1 stopped (amber), 2 terminated/failed (red)
+    kind: int, // 0 started (green), 1 stopped (amber), 2 info (cyan)
 }
 
 export component DashboardView inherits Rectangle {
@@ -68,7 +68,7 @@ export component DashboardView inherits Rectangle {
                     label: e.label;
                     time: e.time;
                     tint: e.kind == 1 ? Theme.amber
-                        : e.kind == 2 ? Theme.red
+                        : e.kind == 2 ? Theme.cyan
                         : Theme.green;
                 }
             }
