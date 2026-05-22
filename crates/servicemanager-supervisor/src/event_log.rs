@@ -273,7 +273,7 @@ mod tests {
         std::fs::write(&active, vec![b'x'; (ROTATION_THRESHOLD_BYTES + 1) as usize]).unwrap();
         let w = EventWriter::for_service("Foo");
         w.started(1); // triggers rotation
-        // Active is now missing or empty; the next write must recreate it.
+                      // Active is now missing or empty; the next write must recreate it.
         w.started(2);
         assert!(active.exists(), "events.log must exist after second write");
         let body = std::fs::read_to_string(&active).unwrap();
@@ -290,7 +290,7 @@ mod tests {
         std::env::set_var("NGSM_PROGRAM_DATA_DIR", &bogus);
         let w = EventWriter::for_service("Foo");
         w.started(1); // must not panic
-        // Cleanup
+                      // Cleanup
         let _ = std::fs::remove_file(&bogus);
     }
 }

@@ -647,7 +647,11 @@ fn drain_results() {
         };
         while let Ok(result) = st.result_rx.try_recv() {
             match result {
-                JobResult::Services { defs, warnings, events } => {
+                JobResult::Services {
+                    defs,
+                    warnings,
+                    events,
+                } => {
                     st.defs = defs;
                     st.warnings = warnings;
                     st.event_records = events;
@@ -770,10 +774,7 @@ fn apply_snapshot(win: &MainWindow, st: &mut AppState) {
             },
             Ek::Restarted => (format!("{} — restarted", rec.service), 2),
             Ek::Throttled => match rec.delay_ms {
-                Some(ms) => (
-                    format!("{} — restart throttled ({ms}ms)", rec.service),
-                    2,
-                ),
+                Some(ms) => (format!("{} — restart throttled ({ms}ms)", rec.service), 2),
                 None => (format!("{} — restart throttled", rec.service), 2),
             },
         };

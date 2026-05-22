@@ -420,5 +420,4 @@ mod tests {
         // Empty list -> 0 (callers must guard indexing an empty model).
         assert_eq!(remap_selection(Some("alpha"), &[]), 0);
     }
-
 }
