@@ -69,6 +69,7 @@ export component ServicesView inherits Rectangle {
     in-out property <bool> running-only;
     callback row-selected(int);
     callback sort-changed(int);
+    callback auto-refresh-changed(bool);
     in property <int> sort-column;
     in property <bool> sort-ascending;
 
@@ -124,7 +125,10 @@ export component ServicesView inherits Rectangle {
                     }
                     auto-ta := TouchArea {
                         mouse-cursor: pointer;
-                        clicked => { root.auto-refresh = !root.auto-refresh; }
+                        clicked => {
+                            root.auto-refresh = !root.auto-refresh;
+                            root.auto-refresh-changed(root.auto-refresh);
+                        }
                     }
                 }
                 Rectangle {

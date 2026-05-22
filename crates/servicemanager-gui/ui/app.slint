@@ -297,6 +297,7 @@ export component MainWindow inherits Window {
                         running-changed(v) => { root.running-changed(v); }
                         row-selected(idx) => { root.row-selected(idx); }
                         sort-changed(c) => { root.sort-changed(c); }
+                        auto-refresh-changed(v) => { root.settings-set-auto-refresh(v); }
                     }
                     if root.view == 2 : LogsView {
                         service-name: root.log-service-name;
