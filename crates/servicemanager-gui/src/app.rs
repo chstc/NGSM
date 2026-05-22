@@ -30,6 +30,9 @@ struct AppState {
     visible_names: Vec<String>,
     /// Whether the Logs view is showing stderr (vs stdout).
     log_stderr: bool,
+    /// The (service, stderr) the Logs view currently wants — used to discard
+    /// stale `ReadLog` results that arrive after the user moved on.
+    log_request: Option<(String, bool)>,
     /// In-progress edit form — holds the originals so `to_spec` can diff.
     edit_form: Option<forms::EditForm>,
     /// Process-tree rows for the open Processes dialog.
@@ -106,6 +109,7 @@ pub fn build_ui() -> Result<MainWindow, slint::PlatformError> {
             sort_ascending: true,
             visible_names: Vec::new(),
             log_stderr: false,
+            log_request: None,
             edit_form: None,
             proc_rows: Vec::new(),
             proc_sort_column: 0,
@@ -386,8 +390,8 @@ fn wire_callbacks(window: &MainWindow) {
     });
     window.on_logs_reload(|| {
         STATE.with(|s| {
-            let guard = s.borrow();
-            let Some(st) = guard.as_ref() else { return };
+            let mut guard = s.borrow_mut();
+            let Some(st) = guard.as_mut() else { return };
             if let Some(win) = st.window.upgrade() {
                 request_log(&win, st);
             }
@@ -638,12 +642,17 @@ fn drain_results() {
                     status,
                     lines,
                 } => {
-                    win.set_log_service_name(service.into());
-                    win.set_log_stderr(stderr);
-                    win.set_log_status(status.into());
-                    let shared: Vec<slint::SharedString> =
-                        lines.into_iter().map(|l| l.into()).collect();
-                    win.set_log_lines(slint::ModelRc::new(slint::VecModel::from(shared)));
+                    // Discard a result the user no longer wants — they may have
+                    // changed selection or toggled stdout/stderr since the read
+                    // was queued.
+                    if st.log_request.as_ref() == Some(&(service.clone(), stderr)) {
+                        win.set_log_service_name(service.into());
+                        win.set_log_stderr(stderr);
+                        win.set_log_status(status.into());
+                        let shared: Vec<slint::SharedString> =
+                            lines.into_iter().map(|l| l.into()).collect();
+                        win.set_log_lines(slint::ModelRc::new(slint::VecModel::from(shared)));
+                    }
                 }
                 JobResult::Events(events) => {
                     let entries = adapter::scm_events_to_entries(&events, &st.defs, 30);
@@ -733,18 +742,20 @@ fn refresh_service_model(win: &MainWindow, st: &mut AppState) {
 }
 
 /// Re-read the currently-selected service's log into the Logs view.
-fn request_log(win: &MainWindow, st: &AppState) {
+fn request_log(win: &MainWindow, st: &mut AppState) {
     let idx = win.get_selected_service().max(0) as usize;
-    match st.visible_names.get(idx) {
+    match st.visible_names.get(idx).cloned() {
         Some(name) => {
             win.set_log_service_name(name.clone().into());
             win.set_log_status("Loading…".into());
+            st.log_request = Some((name.clone(), st.log_stderr));
             let _ = st.job_tx.send(Job::ReadLog {
-                service: name.clone(),
+                service: name,
                 stderr: st.log_stderr,
             });
         }
         None => {
+            st.log_request = None;
             win.set_log_service_name("".into());
             win.set_log_status("Select a service in the Services view to view its log.".into());
             win.set_log_lines(slint::ModelRc::new(slint::VecModel::from(Vec::<
