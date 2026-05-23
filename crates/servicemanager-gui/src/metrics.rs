@@ -2,9 +2,6 @@
 //! availability. No I/O — caller passes already-loaded services + events
 //! and a `now`. Every function is unit-tested.
 
-// No callers yet — Tasks 5/6 will wire this up.
-#![allow(dead_code)]
-
 use servicemanager_core::events::{EventKind, EventRecord};
 use servicemanager_core::{ServiceDefinition, ServiceState, StartupType};
 use std::collections::HashMap;

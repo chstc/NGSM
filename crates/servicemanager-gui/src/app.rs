@@ -45,6 +45,8 @@ struct AppState {
     /// (newest first). The display `events: Vec<EventEntry>` is
     /// rebuilt from this every `apply_snapshot`.
     event_records: Vec<servicemanager_core::EventRecord>,
+    /// Latest dashboard metrics computed by the worker.
+    metrics: crate::metrics::DashboardMetrics,
     /// Display model for the Recent Events panel — rebuilt from `event_records`
     /// every `apply_snapshot`, newest first, capped at 12.
     events: Vec<EventEntry>,
@@ -142,6 +144,7 @@ pub fn build_ui() -> Result<MainWindow, slint::PlatformError> {
             log_stderr: false,
             log_request: None,
             event_records: Vec::new(),
+            metrics: Default::default(),
             events: Vec::new(),
             edit_form: None,
             proc_rows: Vec::new(),
@@ -677,10 +680,12 @@ fn drain_results() {
                     defs,
                     warnings,
                     events,
+                    metrics,
                 } => {
                     st.defs = defs;
                     st.warnings = warnings;
                     st.event_records = events;
+                    st.metrics = metrics;
                     // Merge the persistent startup warning (e.g. corrupt
                     // config.json) with per-scan service warnings so it
                     // survives across refreshes.
@@ -790,10 +795,34 @@ fn drain_results() {
 fn apply_snapshot(win: &MainWindow, st: &mut AppState) {
     refresh_service_model(win, st);
 
-    let stats = adapter::dashboard_stats(&st.defs);
-    win.set_stat_total(stats.total.to_string().into());
-    win.set_stat_running(stats.running.to_string().into());
-    win.set_stat_stopped(stats.stopped.to_string().into());
+    // --- Dashboard tile bindings ---
+    let m = &st.metrics;
+    win.set_stat_total(m.total.to_string().into());
+    win.set_stat_running(m.running.to_string().into());
+    win.set_stat_stopped(m.stopped.to_string().into());
+    win.set_stat_manual_start(m.manual_start.to_string().into());
+    win.set_stat_failed(m.failed.to_string().into());
+    win.set_stat_auto_recovering(m.auto_recovering.to_string().into());
+    win.set_stat_availability_title(
+        format!("Availability ({}d)", m.availability_window_days).into(),
+    );
+    let availability_text = if m.total == 0 || m.availability_unknown {
+        "—".to_string()
+    } else {
+        format!("{:.1}%", m.availability_pct)
+    };
+    win.set_stat_availability_value(availability_text.into());
+    // Hide the sparkline visually when we have no trustworthy signal — the
+    // empty path strings make the chart render as a flat line at 0, which
+    // would mislead. `sparkline_paths` already returns ("", "") for an
+    // empty slice; force that path here.
+    let (line, area) = if m.availability_unknown {
+        (String::new(), String::new())
+    } else {
+        crate::metrics::sparkline_paths(&m.availability_daily)
+    };
+    win.set_stat_availability_line(line.into());
+    win.set_stat_availability_area(area.into());
 
     // Recent Events: render from the supervisor's persistent log.
     use servicemanager_core::events::{EventKind as Ek, EventRecord};

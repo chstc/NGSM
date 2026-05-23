@@ -29,6 +29,9 @@ pub fn matches_filter(
 }
 
 /// Counts shown on the Dashboard stat cards. Only managed services count.
+// Kept for reference; superseded by `metrics::DashboardMetrics` in Task 8.
+// Removal is out of scope for this task.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DashboardStats {
     pub total: usize,
@@ -39,6 +42,7 @@ pub struct DashboardStats {
 }
 
 /// Tally the Dashboard stat-card counts across the managed services.
+#[allow(dead_code)]
 pub fn dashboard_stats(defs: &[ServiceDefinition]) -> DashboardStats {
     let mut s = DashboardStats::default();
     for d in defs.iter().filter(|d| d.is_managed()) {

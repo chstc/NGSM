@@ -47,6 +47,8 @@ pub enum JobResult {
         /// Most-recent supervisor-recorded events, newest first. Populated
         /// every Refresh tick from the on-disk event log.
         events: Vec<servicemanager_core::EventRecord>,
+        /// Dashboard metrics computed against the last 30 days of events.
+        metrics: crate::metrics::DashboardMetrics,
     },
     Processes {
         service: String,
@@ -199,11 +201,31 @@ mod job_sender_tests {
 fn execute(job: Job) -> JobResult {
     match job {
         Job::Refresh => match servicemanager_ops::list_services() {
-            Ok((defs, warnings)) => JobResult::Services {
-                defs,
-                warnings,
-                events: crate::event_log_reader::read_recent(50),
-            },
+            Ok((defs, mut warnings)) => {
+                let now = time::OffsetDateTime::now_utc();
+                let since = now - time::Duration::days(30);
+                let (events_window, read_failed) =
+                    match crate::event_log_reader::read_since(since) {
+                        Ok(v) => (v, false),
+                        Err(e) => {
+                            warnings.push(format!(
+                                "event log unreadable: {e} — availability unknown"
+                            ));
+                            (Vec::new(), true)
+                        }
+                    };
+                let mut metrics =
+                    crate::metrics::compute_metrics(&defs, &events_window, now);
+                if read_failed {
+                    metrics.availability_unknown = true;
+                }
+                JobResult::Services {
+                    defs,
+                    warnings,
+                    events: crate::event_log_reader::read_recent(50),
+                    metrics,
+                }
+            }
             Err(e) => JobResult::Error(format!("enumerate: {e}")),
         },
         Job::Install(spec) => JobResult::Installed(servicemanager_ops::install(spec)),
