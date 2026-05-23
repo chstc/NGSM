@@ -6,6 +6,7 @@ members = [
     "crates/servicemanager-registry",
     "crates/servicemanager-supervisor",
     "crates/servicemanager-runner",
+    "crates/servicemanager-ops",
     "crates/servicemanager-broker",
     "crates/servicemanager-gui",
     "crates/servicemanager-cli",
@@ -29,6 +30,7 @@ repository = "https://github.com/chstc/NGSM"
 servicemanager-core = { path = "crates/servicemanager-core" }
 servicemanager-win32 = { path = "crates/servicemanager-win32" }
 servicemanager-registry = { path = "crates/servicemanager-registry" }
+servicemanager-ops = { path = "crates/servicemanager-ops" }
 servicemanager-supervisor = { path = "crates/servicemanager-supervisor" }
 servicemanager-runner = { path = "crates/servicemanager-runner" }
 servicemanager-broker = { path = "crates/servicemanager-broker" }

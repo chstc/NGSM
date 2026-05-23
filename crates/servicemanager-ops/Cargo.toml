@@ -1,0 +1,14 @@
+[package]
+name = "servicemanager-ops"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared service-management operations (install, remove, restart, edit, rotate)."
+publish = false
+
+[dependencies]
+servicemanager-core = { workspace = true }
+servicemanager-win32 = { workspace = true }
+servicemanager-registry = { workspace = true }
