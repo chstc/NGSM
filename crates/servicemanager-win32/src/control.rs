@@ -321,27 +321,51 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    /// The six env vars that `validate_runner_location` inspects.
+    const USER_VARS: &[&str] = &[
+        "USERPROFILE",
+        "TEMP",
+        "TMP",
+        "PUBLIC",
+        "LOCALAPPDATA",
+        "APPDATA",
+    ];
+
     /// Serializes tests that mutate process-wide env vars. Cargo runs each
     /// crate's tests in one binary, multithreaded, so concurrent env mutations
     /// would race without this lock.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Override the six user-writable env vars for the duration of the test,
-    /// then return the lock guard (dropped when the calling test returns).
-    ///
-    /// `vars_to_set` is a slice of `(var_name, Some(path) | None)` — `None`
-    /// removes the variable so the validator skips it.
-    fn isolate_with_env(
-        vars_to_set: &[(&str, Option<&std::path::Path>)],
-    ) -> std::sync::MutexGuard<'static, ()> {
-        let guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        for (var, val) in vars_to_set {
-            match val {
-                Some(p) => std::env::set_var(var, p),
-                None => std::env::remove_var(var),
+    /// RAII guard that acquires `ENV_LOCK` and restores every entry in
+    /// `USER_VARS` to its original value when dropped.  Callers must keep
+    /// this guard alive until env vars and any temp directories are no longer
+    /// needed.
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (var, val) in &self.saved {
+                match val {
+                    Some(v) => std::env::set_var(var, v),
+                    None => std::env::remove_var(var),
+                }
             }
         }
-        guard
+    }
+
+    /// Acquires the env lock and snapshots all `USER_VARS` so they are
+    /// restored when the returned guard is dropped.  Call this BEFORE any
+    /// `tempfile::tempdir()` so that `%TEMP%` cannot change underneath us.
+    fn isolate() -> EnvGuard {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let saved = USER_VARS
+            .iter()
+            .map(|&v| (v, std::env::var_os(v)))
+            .collect();
+        EnvGuard { _lock: lock, saved }
     }
 
     /// Drop a zero-byte file with a `.exe` extension into `dir` and return its path.
@@ -357,6 +381,11 @@ mod tests {
 
     #[test]
     fn validate_runner_location_accepts_path_not_under_user_roots() {
+        // Acquire the lock (and snapshot env) FIRST so that %TEMP% cannot be
+        // changed by a concurrent test between our tempdir() calls and the
+        // env-var sets below.  The guard restores everything on drop.
+        let _g = isolate();
+
         // Create two independent temp dirs. We keep the stub exe in `safe` and
         // point all six user-writable env vars at `elsewhere`, so `safe` is not
         // considered user-writable by the validator.
@@ -364,14 +393,12 @@ mod tests {
         let elsewhere = tempfile::tempdir().unwrap();
         let exe = make_stub_exe(safe.path());
 
-        let _g = isolate_with_env(&[
-            ("USERPROFILE", Some(elsewhere.path())),
-            ("TEMP", Some(elsewhere.path())),
-            ("TMP", Some(elsewhere.path())),
-            ("PUBLIC", Some(elsewhere.path())),
-            ("LOCALAPPDATA", Some(elsewhere.path())),
-            ("APPDATA", Some(elsewhere.path())),
-        ]);
+        std::env::set_var("USERPROFILE", elsewhere.path());
+        std::env::set_var("TEMP", elsewhere.path());
+        std::env::set_var("TMP", elsewhere.path());
+        std::env::set_var("PUBLIC", elsewhere.path());
+        std::env::set_var("LOCALAPPDATA", elsewhere.path());
+        std::env::set_var("APPDATA", elsewhere.path());
 
         // Defensive: if the OS happened to allocate both temp dirs under the
         // same canonical root they'd collide. Skip rather than false-fail.
@@ -395,34 +422,24 @@ mod tests {
 
     /// Inner helper so each per-var rejection test avoids duplication.
     fn assert_rejects_under_var(var: &str) {
+        // Acquire the lock (and snapshot env) FIRST so that %TEMP% cannot be
+        // changed by a concurrent test between our tempdir() calls and the
+        // env-var sets below.  The guard restores everything on drop.
+        let _g = isolate();
+
         let user_dir = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
         let exe = make_stub_exe(user_dir.path());
 
-        // Build the set-list: `var` → the dir containing the exe; all others
-        // → `elsewhere` so they can't match first and mask the real assertion.
-        let user_path = user_dir.path();
-        let else_path = elsewhere.path();
-        let all_vars = [
-            "USERPROFILE",
-            "TEMP",
-            "TMP",
-            "PUBLIC",
-            "LOCALAPPDATA",
-            "APPDATA",
-        ];
-        let overrides: Vec<(&str, Option<&std::path::Path>)> = all_vars
-            .iter()
-            .map(|&v| {
-                if v == var {
-                    (v, Some(user_path))
-                } else {
-                    (v, Some(else_path))
-                }
-            })
-            .collect();
-
-        let _g = isolate_with_env(&overrides);
+        // Set `var` → the dir containing the exe; all others → `elsewhere`
+        // so they can't match first and mask the real assertion.
+        for v in USER_VARS {
+            if *v == var {
+                std::env::set_var(v, user_dir.path());
+            } else {
+                std::env::set_var(v, elsewhere.path());
+            }
+        }
 
         let err =
             validate_runner_location(&exe).expect_err(&format!("should reject exe under {var}"));
