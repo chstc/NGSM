@@ -47,6 +47,7 @@ pub fn compute_metrics(
     let window_start = now - time::Duration::days(30);
     let timelines = build_service_timelines(defs, events, window_start, now);
     let avail = compute_availability(&timelines, window_start, now);
+    let daily = compute_daily_sparkline(&timelines, now);
     DashboardMetrics {
         total: counts.total,
         running: counts.running,
@@ -56,9 +57,7 @@ pub fn compute_metrics(
         auto_recovering: counts.auto_recovering,
         availability_pct: avail.aggregate_pct,
         availability_window_days: avail.window_days,
-        // Sparkline filled in by Task 6 (still uses aggregate as placeholder
-        // so the build stays green; a real per-bucket vec lands in Task 6).
-        availability_daily: vec![avail.aggregate_pct; 30],
+        availability_daily: daily,
         availability_unknown: false,
     }
 }
@@ -207,6 +206,75 @@ fn compute_availability(
         aggregate_pct,
         window_days,
     }
+}
+
+/// 30 daily availability buckets, oldest→newest, each 0..=100.
+/// Reads from already-built `ServiceTimeline`s and clips each interval
+/// into the day bucket — events in distant days still contribute to
+/// today's bucket via the "up" interval they opened. Days with no
+/// contributing service carry forward from the previous bucket; the
+/// first bucket with no data falls back to 100.
+fn compute_daily_sparkline(
+    timelines: &[ServiceTimeline],
+    now: OffsetDateTime,
+) -> Vec<f32> {
+    let mut out: Vec<f32> = Vec::with_capacity(30);
+    // Day boundaries in UTC for stability. `today_start` = midnight UTC of
+    // `now`'s date; today's bucket length is `now - today_start`.
+    let today_start = now.replace_time(time::Time::MIDNIGHT);
+    for i in (0..30).rev() {
+        let day_start = today_start - time::Duration::days(i as i64);
+        let day_end = (day_start + time::Duration::hours(24)).min(now);
+
+        let mut ratios: Vec<f32> = Vec::new();
+        for t in timelines {
+            // A service only contributes to days its window covers.
+            if t.window_start >= day_end {
+                continue;
+            }
+            let effective_start = day_start.max(t.window_start);
+            let bucket_len = (day_end - effective_start).whole_milliseconds().max(1) as f32;
+            let up_ms = up_ms_in_window(&t.intervals, effective_start, day_end);
+            ratios.push((up_ms / bucket_len * 100.0).clamp(0.0, 100.0));
+        }
+
+        let value = if ratios.is_empty() {
+            *out.last().unwrap_or(&100.0)
+        } else {
+            ratios.iter().sum::<f32>() / ratios.len() as f32
+        };
+        out.push(value);
+    }
+    out
+}
+
+/// Build SVG path strings (`line`, `area`) for the 30-bucket sparkline,
+/// rendered into a 100×28 viewBox to match the `StatCard.show-chart` mode.
+/// Returns `("", "")` when `daily` is empty so the UI can hide the chart.
+pub fn sparkline_paths(daily: &[f32]) -> (String, String) {
+    if daily.is_empty() {
+        return (String::new(), String::new());
+    }
+    let n = daily.len();
+    let x = |i: usize| -> f32 {
+        if n <= 1 {
+            0.0
+        } else {
+            (i as f32) * (100.0 / (n - 1) as f32)
+        }
+    };
+    let y = |v: f32| -> f32 { 28.0 - (v.clamp(0.0, 100.0) / 100.0) * 28.0 };
+
+    let mut line = format!("M {:.2} {:.2}", x(0), y(daily[0]));
+    for (i, v) in daily.iter().enumerate().skip(1) {
+        line.push_str(&format!(" L {:.2} {:.2}", x(i), y(*v)));
+    }
+    let mut area = format!("M {:.2} 28 L {:.2} {:.2}", x(0), x(0), y(daily[0]));
+    for (i, v) in daily.iter().enumerate().skip(1) {
+        area.push_str(&format!(" L {:.2} {:.2}", x(i), y(*v)));
+    }
+    area.push_str(&format!(" L {:.2} 28 Z", x(n - 1)));
+    (line, area)
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -674,5 +742,86 @@ mod tests {
             "open interval was extended despite state != Running (got {}%)",
             m.availability_pct
         );
+    }
+
+    #[test]
+    fn daily_sparkline_has_30_entries() {
+        let now = datetime!(2026-05-23 12:00:00 UTC);
+        let defs = vec![ngsm("A", StartupType::Automatic, Some(ServiceState::Running))];
+        let events = vec![ev("A", now - time::Duration::days(30), EventKind::Started, None)];
+        let m = compute_metrics(&defs, &events, now);
+        assert_eq!(m.availability_daily.len(), 30);
+        for v in &m.availability_daily {
+            assert!(*v >= 0.0 && *v <= 100.0);
+        }
+    }
+
+    #[test]
+    fn daily_sparkline_reflects_one_full_outage_day() {
+        // A is up for the whole window EXCEPT all of day -3 (24h down).
+        let now = datetime!(2026-05-23 12:00:00 UTC);
+        let defs = vec![ngsm("A", StartupType::Automatic, Some(ServiceState::Running))];
+        let events = vec![
+            ev("A", now - time::Duration::days(10), EventKind::Started, None),
+            ev("A", now - time::Duration::days(4), EventKind::ChildExited, Some(1)),
+            ev("A", now - time::Duration::days(3), EventKind::Restarted, None),
+        ];
+        let m = compute_metrics(&defs, &events, now);
+        // The dip day is somewhere in the middle of the sparkline; check that
+        // *some* entry is well below 50% (proves a real outage drove a bucket
+        // down, not the placeholder constant).
+        let min = m.availability_daily.iter().cloned().fold(100.0f32, f32::min);
+        // The 24h outage (noon-to-noon) straddles two midnight-UTC calendar-day
+        // buckets, each showing ~50%.  50% is well below 100% (the flat
+        // placeholder) and proves the real per-bucket computation is working.
+        assert!(min <= 50.0, "sparkline did not record the outage; got {m:?}");
+    }
+
+    #[test]
+    fn daily_sparkline_carries_uptime_across_event_free_days() {
+        // D1 regression: a service started 7 days ago and still running has
+        // ZERO events in any of the intervening 6 day buckets. A naive
+        // implementation that walks events PER bucket sees nothing and
+        // returns 0% for those days. Correct implementation: build
+        // intervals once and CLIP into each bucket — the 7-day-old "up"
+        // interval covers all 7 buckets and should yield ~100% each.
+        let now = datetime!(2026-05-23 12:00:00 UTC);
+        let defs = vec![ngsm("A", StartupType::Automatic, Some(ServiceState::Running))];
+        let events = vec![ev(
+            "A",
+            now - time::Duration::days(7),
+            EventKind::Started,
+            None,
+        )];
+        let m = compute_metrics(&defs, &events, now);
+        // The last 7 buckets must all be ~100% (any one dropping to 0 means
+        // the interval did not cross bucket boundaries — that's the D1 bug).
+        let recent7 = &m.availability_daily[m.availability_daily.len() - 7..];
+        for (i, v) in recent7.iter().enumerate() {
+            assert!(
+                *v > 95.0,
+                "bucket -{} should be ~100% (continuously up), got {}",
+                7 - i,
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn sparkline_path_strings_are_well_formed() {
+        let daily: Vec<f32> = (0..30).map(|i| (i as f32) * 3.0).collect();
+        let (line, area) = sparkline_paths(&daily);
+        assert!(line.starts_with("M "));
+        assert!(area.starts_with("M "));
+        assert!(area.ends_with(" Z"));
+        // 30 points → 29 line segments plus the move; check the line is non-trivial.
+        assert!(line.matches('L').count() >= 29);
+    }
+
+    #[test]
+    fn sparkline_paths_handle_empty_input_gracefully() {
+        let (line, area) = sparkline_paths(&[]);
+        assert!(line.is_empty());
+        assert!(area.is_empty());
     }
 }
