@@ -6,7 +6,7 @@
 //! [`ServiceContext`] handle to the supplied service closure.
 
 use std::ffi::c_void;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Mutex, OnceLock};
 
 use servicemanager_core::{Error, Result};
@@ -90,7 +90,7 @@ where
 struct ContextInner {
     status_handle: SERVICE_STATUS_HANDLE,
     name: String,
-    controls_tx: Sender<ServiceControl>,
+    controls_tx: SyncSender<ServiceControl>,
     checkpoint: Mutex<u32>,
 }
 
@@ -268,7 +268,10 @@ extern "system" fn service_main_thunk(_argc: u32, _argv: *mut PWSTR) {
     };
     let name = String::from_utf16_lossy(strip_trailing_nul(&name_wide));
 
-    let (tx, rx) = channel();
+    // Capacity of 8 is generous for SCM controls (Stop/Pause/Continue are
+    // rare and sent one at a time by the SCM). The bounded channel prevents
+    // unbounded accumulation if the service loop stalls.
+    let (tx, rx) = sync_channel(8);
     // Leak the inner state so the control handler can dereference it for the
     // remainder of the process lifetime. `Box::leak` returns a `&'static mut`,
     // which we downgrade to a shared `&'static` reference.
@@ -325,7 +328,17 @@ extern "system" fn control_handler_thunk(
     // mutation (status_handle backfill) completed before `lifecycle.run()`.
     let inner = unsafe { &*inner };
     let control = ServiceControl::from_win32(dwcontrol, dwevttype);
-    let _ = inner.controls_tx.send(control);
+    match inner.controls_tx.try_send(control) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::TrySendError::Full(c)) => {
+            // The service loop has stalled with 8 pending controls — extremely
+            // unlikely. Log and drop; the SCM callback cannot propagate errors.
+            eprintln!("[runtime] dropped SCM control {:?} — channel full", c);
+        }
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+            eprintln!("[runtime] dropped SCM control — receiver gone");
+        }
+    }
     0
 }
 
