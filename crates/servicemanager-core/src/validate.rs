@@ -112,14 +112,30 @@ pub fn validate_absolute_path(field: &str, value: &str) -> Result<()> {
 /// drive-rooted path (`X:\...` / `X:/...`) or a UNC path (`\\...` / `//...`).
 fn is_unambiguously_absolute_windows(value: &str) -> bool {
     let bytes = value.as_bytes();
-    // UNC: starts with \\ or //.
+    // UNC: starts with \\ or // followed by NON-EMPTY server, separator,
+    // and NON-EMPTY share — e.g., \\server\share\... or //srv/sh/...
     if bytes.len() >= 2
         && (bytes[0] == b'\\' || bytes[0] == b'/')
         && (bytes[1] == b'\\' || bytes[1] == b'/')
     {
-        return true;
+        let rest = &bytes[2..];
+        // Find the next separator — that's the end of the server name.
+        let Some(server_end) = rest.iter().position(|b| *b == b'\\' || *b == b'/') else {
+            return false; // no separator after server
+        };
+        if server_end == 0 {
+            return false; // empty server name
+        }
+        let after_server = &rest[server_end + 1..];
+        // The share is everything up to the next separator (or end).
+        // It must be non-empty.
+        let share_end = after_server
+            .iter()
+            .position(|b| *b == b'\\' || *b == b'/')
+            .unwrap_or(after_server.len());
+        return share_end > 0;
     }
-    // Drive-rooted: letter + ':' + slash.
+    // Drive-rooted: letter + ':' + slash. (unchanged)
     if bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
@@ -243,6 +259,26 @@ mod tests {
         // Single-char paths that look almost absolute.
         assert!(validate_absolute_path("p", "C").is_err());
         assert!(validate_absolute_path("p", "C:").is_err());
+    }
+
+    #[test]
+    fn validate_absolute_path_rejects_malformed_unc() {
+        // Just the double-backslash with no server.
+        assert!(validate_absolute_path("p", r"\\").is_err());
+        assert!(validate_absolute_path("p", "//").is_err());
+        // Server but no separator after it.
+        assert!(validate_absolute_path("p", r"\\server").is_err());
+        assert!(validate_absolute_path("p", "//server").is_err());
+        // Server + separator but no share.
+        assert!(validate_absolute_path("p", r"\\server\").is_err());
+        assert!(validate_absolute_path("p", "//server/").is_err());
+    }
+
+    #[test]
+    fn validate_absolute_path_accepts_unc_with_share() {
+        assert!(validate_absolute_path("p", r"\\server\share").is_ok());
+        assert!(validate_absolute_path("p", r"\\server\share\sub\file.exe").is_ok());
+        assert!(validate_absolute_path("p", "//server/share/file").is_ok());
     }
 
     #[test]
