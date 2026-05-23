@@ -22,11 +22,11 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 /// Rotation threshold for `events.log`. Single backup at `events.log.1`.
-pub const ROTATION_THRESHOLD_BYTES: u64 = 1024 * 1024;
+pub(crate) const ROTATION_THRESHOLD_BYTES: u64 = 1024 * 1024;
 
 /// One writer per supervisor process. Holds the service name so callers
 /// don't pass it on every event.
-pub struct EventWriter {
+pub(crate) struct EventWriter {
     service: String,
 }
 
@@ -140,7 +140,13 @@ fn append_one(path: &PathBuf, bytes: &[u8]) -> std::io::Result<()> {
     f.write_all(bytes)
 }
 
+/// On Windows: serialize rotation across all supervisor processes using a
+/// named mutex. Re-check file size after acquiring the lock; if a peer
+/// already rotated, skip.
+///
+/// On non-Windows (e.g. Linux CI): keep the original single-check behavior.
 fn maybe_rotate(active: &PathBuf) -> std::io::Result<()> {
+    // Fast path: skip the mutex overhead if we are clearly under threshold.
     let size = match std::fs::metadata(active) {
         Ok(m) => m.len(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -149,11 +155,82 @@ fn maybe_rotate(active: &PathBuf) -> std::io::Result<()> {
     if size < ROTATION_THRESHOLD_BYTES {
         return Ok(());
     }
+
+    #[cfg(windows)]
+    {
+        rotate_with_mutex(active)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let backup = paths::events_log_backup()?;
+        std::fs::rename(active, &backup)
+    }
+}
+
+/// Windows-only: acquire `Global\NGSM-events-log-rotate`, re-check size, rename.
+#[cfg(windows)]
+fn rotate_with_mutex(active: &PathBuf) -> std::io::Result<()> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
+
+    // 1 000 ms timeout so a stuck peer doesn't stall supervision indefinitely.
+    const TIMEOUT_MS: u32 = 1_000;
+
+    // Encode the name as a null-terminated UTF-16 string.
+    let name_wide: Vec<u16> = "Global\\NGSM-events-log-rotate\0".encode_utf16().collect();
+
+    // SAFETY: name_wide is a valid null-terminated UTF-16 string. We pass
+    // NULL for security attributes (default) and FALSE for bInitialOwner.
+    let mutex: HANDLE = unsafe {
+        CreateMutexW(None, false, PCWSTR(name_wide.as_ptr())).map_err(std::io::Error::other)?
+    };
+
+    // RAII guard — releases and closes the mutex handle on drop.
+    struct MutexGuard(HANDLE);
+    impl Drop for MutexGuard {
+        fn drop(&mut self) {
+            unsafe {
+                // Ignore errors: if the handle is invalid there's nothing we
+                // can do, and panicking inside Drop is worse.
+                let _ = ReleaseMutex(self.0);
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    let wait_result = unsafe { WaitForSingleObject(mutex, TIMEOUT_MS) };
+
+    // WAIT_ABANDONED means the previous owner died while holding the lock;
+    // we still own it now, so treat it like WAIT_OBJECT_0.
+    if wait_result != WAIT_OBJECT_0 && wait_result != WAIT_ABANDONED {
+        // Timeout or error — skip rotation; the next write will retry.
+        unsafe {
+            let _ = CloseHandle(mutex);
+        }
+        eprintln!(
+            "[supervisor] event log rotation skipped: could not acquire rotation mutex \
+             (WaitForSingleObject returned {wait_result:?})"
+        );
+        return Ok(());
+    }
+
+    // We own the mutex; the guard will release it on scope exit.
+    let _guard = MutexGuard(mutex);
+
+    // Re-check: a peer may have already rotated while we were waiting.
+    let size = match std::fs::metadata(active) {
+        Ok(m) => m.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if size < ROTATION_THRESHOLD_BYTES {
+        return Ok(());
+    }
+
     let backup = paths::events_log_backup()?;
-    // `rename` overwrites the destination on Windows when both are on
-    // the same volume, which is always true here (same directory).
-    std::fs::rename(active, &backup)?;
-    Ok(())
+    std::fs::rename(active, &backup)
 }
 
 #[cfg(test)]
@@ -299,5 +376,57 @@ mod tests {
         w.started(1); // must not panic
                       // Cleanup
         let _ = std::fs::remove_file(&bogus);
+    }
+
+    #[test]
+    fn concurrent_rotations_do_not_clobber_backup() {
+        let (_g, _dir) = isolate();
+        // Pre-seed backup with sentinel content
+        std::fs::write(paths::events_log_backup().unwrap(), b"BACKUP_SENTINEL\n").unwrap();
+        // Seed active over threshold
+        let active = paths::events_log().unwrap();
+        std::fs::write(&active, vec![b'x'; (ROTATION_THRESHOLD_BYTES + 1) as usize]).unwrap();
+
+        // Many concurrent writers all triggering rotation
+        let threads: Vec<_> = (0..16)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    let w = EventWriter::for_service(format!("svc{i}"));
+                    w.started(i);
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        // Backup must still contain the pre-seeded sentinel — only one
+        // rotation should have actually run (or zero if all writers
+        // raced past the re-check; the file might still be >threshold
+        // with new records appended, that's fine — we just need to prove
+        // the original backup wasn't overwritten).
+        let backup_path = paths::events_log_backup().unwrap();
+        if backup_path.exists() {
+            let backup_body = std::fs::read(&backup_path).unwrap();
+            // Either no rotation happened (backup still is the sentinel)
+            // OR exactly one rotation happened (backup is the old active
+            // which contained the 1MB+ of 'x' bytes — the sentinel is
+            // gone because rotation replaced backup with old active).
+            // What we MUST NOT see: an active that's small AND a backup
+            // that contains neither the sentinel nor 1MB+ of 'x' —
+            // that would mean a clobber.
+            let is_sentinel = backup_body == b"BACKUP_SENTINEL\n";
+            let is_rotated_old_active = backup_body.len() >= ROTATION_THRESHOLD_BYTES as usize
+                && backup_body
+                    .iter()
+                    .take(ROTATION_THRESHOLD_BYTES as usize)
+                    .all(|b| *b == b'x');
+            assert!(
+                is_sentinel || is_rotated_old_active,
+                "backup file was clobbered: len={}, first_bytes={:?}",
+                backup_body.len(),
+                &backup_body[..backup_body.len().min(40)]
+            );
+        }
     }
 }

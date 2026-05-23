@@ -16,5 +16,8 @@ os_pipe = { workspace = true }
 serde_json = { workspace = true }
 time = { version = "0.3", default-features = false, features = ["std", "formatting", "macros"] }
 
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
+
 [dev-dependencies]
 tempfile = "3"
