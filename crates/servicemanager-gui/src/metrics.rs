@@ -382,4 +382,50 @@ mod tests {
             "future throttled must not classify as auto-recovering"
         );
     }
+
+    #[test]
+    fn auto_recovering_excludes_restarted_with_stopped_in_between() {
+        // A `restarted` event whose nearest prior same-service event is
+        // `stopped` (not `child_exited`) means the operator deliberately
+        // stopped+started — NOT auto-recovery. Even if `child_exited`
+        // appears earlier in the history, the `stopped` in between breaks
+        // the chain.
+        let now = datetime!(2026-05-23 12:00:00 UTC);
+        let defs = vec![ngsm("A", StartupType::Automatic, Some(ServiceState::StartPending))];
+        let events = vec![
+            ev("A", now - time::Duration::minutes(10), EventKind::ChildExited, Some(1)),
+            ev("A", now - time::Duration::minutes(8), EventKind::Stopped, None),
+            ev("A", now - time::Duration::minutes(2), EventKind::Restarted, None),
+        ];
+        assert_eq!(
+            compute_metrics(&defs, &events, now).auto_recovering,
+            0,
+            "restarted following stopped (even with earlier child_exited) is not auto-recovery"
+        );
+    }
+
+    #[test]
+    fn auto_recovering_isolated_per_service() {
+        // A `stopped` or `child_exited` event for a DIFFERENT service must
+        // not affect the classification of the target. The Restarted walk
+        // filters by service name; this test pins that filter.
+        let now = datetime!(2026-05-23 12:00:00 UTC);
+        let defs = vec![
+            ngsm("A", StartupType::Automatic, Some(ServiceState::StartPending)),
+            ngsm("B", StartupType::Automatic, Some(ServiceState::Running)),
+        ];
+        // B's `stopped` is interleaved between A's `child_exited` and A's
+        // `restarted`. A must still classify as auto_recovering because
+        // B's event is unrelated.
+        let events = vec![
+            ev("A", now - time::Duration::minutes(3), EventKind::ChildExited, Some(1)),
+            ev("B", now - time::Duration::minutes(2) - time::Duration::seconds(30), EventKind::Stopped, None),
+            ev("A", now - time::Duration::minutes(2), EventKind::Restarted, None),
+        ];
+        let m = compute_metrics(&defs, &events, now);
+        assert_eq!(
+            m.auto_recovering, 1,
+            "A's auto_recovering classification must ignore B's interleaved stopped event"
+        );
+    }
 }
