@@ -39,6 +39,19 @@ pub fn events_log_backup() -> std::io::Result<PathBuf> {
     Ok(ngsm_program_data()?.join("events.log.1"))
 }
 
+/// Returns the path to backup file `n` (1..=4). Index 1 is the most-recent
+/// backup (the one events.log gets renamed to on the next rotation); index
+/// 4 is the oldest backup we retain.
+pub fn events_log_backup_n(n: u8) -> std::io::Result<PathBuf> {
+    if !(1..=4).contains(&n) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("events_log_backup_n: n must be 1..=4, got {n}"),
+        ));
+    }
+    Ok(ngsm_program_data()?.join(format!("events.log.{n}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +96,30 @@ mod tests {
         let bak = events_log_backup().unwrap();
         assert!(bak.ends_with("events.log.1"));
         assert!(bak.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn events_log_backup_n_returns_indexed_files() {
+        let (_g, _dir) = isolate();
+        let b1 = events_log_backup_n(1).unwrap();
+        let b4 = events_log_backup_n(4).unwrap();
+        assert!(b1.ends_with("events.log.1"));
+        assert!(b4.ends_with("events.log.4"));
+    }
+
+    #[test]
+    fn events_log_backup_n_rejects_out_of_range() {
+        let (_g, _dir) = isolate();
+        assert!(events_log_backup_n(0).is_err());
+        assert!(events_log_backup_n(5).is_err());
+    }
+
+    #[test]
+    fn events_log_backup_n_matches_legacy_helper_for_n_1() {
+        let (_g, _dir) = isolate();
+        assert_eq!(
+            events_log_backup_n(1).unwrap(),
+            events_log_backup().unwrap()
+        );
     }
 }
