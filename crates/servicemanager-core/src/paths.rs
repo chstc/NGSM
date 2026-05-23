@@ -6,6 +6,12 @@
 
 use std::path::PathBuf;
 
+/// Number of rotated event-log backups retained on disk
+/// (`events.log.1` .. `events.log.N`). Used by the supervisor's rotation
+/// logic and by the GUI reader's path enumeration to stay in sync — any
+/// change to retention depth flows from this single source.
+pub const BACKUP_RETENTION_COUNT: u8 = 4;
+
 /// Returns the NGSM data directory, creating it if missing.
 ///
 /// Resolution order:
@@ -39,14 +45,16 @@ pub fn events_log_backup() -> std::io::Result<PathBuf> {
     Ok(ngsm_program_data()?.join("events.log.1"))
 }
 
-/// Returns the path to backup file `n` (1..=4). Index 1 is the most-recent
-/// backup (the one events.log gets renamed to on the next rotation); index
-/// 4 is the oldest backup we retain.
+/// Returns the path to backup file `n` (1..=BACKUP_RETENTION_COUNT). Index
+/// 1 is the most-recent backup (the one events.log gets renamed to on the
+/// next rotation); the highest index is the oldest backup we retain.
 pub fn events_log_backup_n(n: u8) -> std::io::Result<PathBuf> {
-    if !(1..=4).contains(&n) {
+    if !(1..=BACKUP_RETENTION_COUNT).contains(&n) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("events_log_backup_n: n must be 1..=4, got {n}"),
+            format!(
+                "events_log_backup_n: n must be 1..={BACKUP_RETENTION_COUNT}, got {n}"
+            ),
         ));
     }
     Ok(ngsm_program_data()?.join(format!("events.log.{n}")))
