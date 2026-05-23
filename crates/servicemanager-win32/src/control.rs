@@ -137,9 +137,21 @@ pub fn build_run_service_command(name: &str) -> Result<String> {
     validate_service_name(name)?;
     let exe = std::env::current_exe().map_err(|e| Error::other(format!("current_exe: {e}")))?;
     validate_runner_location(&exe)?;
+    let exe_str = exe.to_string_lossy();
+    // Reject paths that do not round-trip cleanly through UTF-8. The SCM stores
+    // image paths as wide strings and we need what's on disk to match what we
+    // write. Lossy conversion silently substitutes U+FFFD for unrepresentable
+    // characters, which would corrupt the stored path.
+    if exe_str.contains('\u{FFFD}') {
+        return Err(Error::other(format!(
+            "runner path contains non-UTF-8 characters and cannot be safely \
+             stored in the SCM image path: {}",
+            exe.display()
+        )));
+    }
     Ok(format!(
         "{} run-service {}",
-        quote_windows_arg(&exe.to_string_lossy()),
+        quote_windows_arg(&exe_str),
         quote_windows_arg(name)
     ))
 }
@@ -162,7 +174,17 @@ fn validate_runner_location(exe: &Path) -> Result<()> {
             exe.display()
         ))
     })?;
-    let lower = canonical.to_string_lossy().to_ascii_lowercase();
+    let canonical_lossy = canonical.to_string_lossy();
+    // Fail closed: if the canonical path cannot be represented in UTF-8, the
+    // comparison below would silently match U+FFFD replacement characters and
+    // could pass the security check against a different path.
+    if canonical_lossy.contains('\u{FFFD}') {
+        return Err(Error::other(format!(
+            "cannot validate runner location: path contains non-UTF-8 characters: {}",
+            canonical.display()
+        )));
+    }
+    let lower = canonical_lossy.to_ascii_lowercase();
 
     // A network / UNC location is outside this machine's administrative
     // control and is never a trusted install location. `canonicalize` emits
@@ -197,7 +219,13 @@ fn validate_runner_location(exe: &Path) -> Result<()> {
         let Ok(dir) = std::fs::canonicalize(&raw_dir) else {
             continue;
         };
-        let dir_lower = dir.to_string_lossy().to_ascii_lowercase();
+        let dir_lossy = dir.to_string_lossy();
+        // Skip env-var directories whose paths contain non-UTF-8 characters:
+        // a U+FFFD substitution could make the prefix check match incorrectly.
+        if dir_lossy.contains('\u{FFFD}') {
+            continue;
+        }
+        let dir_lower = dir_lossy.to_ascii_lowercase();
         let dir_path = dir_lower.strip_prefix(r"\\?\").unwrap_or(&dir_lower);
         if dir_path.is_empty() {
             continue;
