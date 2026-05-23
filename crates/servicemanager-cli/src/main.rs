@@ -1,12 +1,13 @@
+use std::collections::BTreeMap;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use servicemanager_core::{
-    HookConfig, IoRedirectionConfig, IoStream, LogRotationConfig, ManagedApplicationConfig,
-    ManagementKind, Result, ServiceDefinition,
+    ExitAction, HookConfig, IoRedirectionConfig, IoStream, LogRotationConfig,
+    ManagedApplicationConfig, ManagementKind, Result, ServiceDefinition,
 };
-use servicemanager_ops::{EditSpec, InstallSpec};
+use servicemanager_ops::{EditSpec, InstallSpec, RecoverySpec};
 use servicemanager_win32::{
     build_run_service_command, control_service, enumerate_descendants, install_service,
     query_service, remove_service, start_service, update_native_config, InstallOptions,
@@ -144,6 +145,8 @@ enum Command {
         /// Service name.
         name: String,
     },
+    /// Show or update the recovery (restart) policy for a managed service.
+    Recovery(RecoveryArgs),
     /// List every process belonging to a running service (the runner plus
     /// every descendant the Toolhelp32 walk can find).
     Processes {
@@ -252,6 +255,79 @@ struct InstallArgs {
     /// `--hook Start/Pre="C:\\scripts\\warmup.cmd"`. May be repeated.
     #[arg(long)]
     hook: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+struct RecoveryArgs {
+    /// Service name.
+    name: String,
+
+    /// Show the current policy as JSON instead of human-readable text.
+    #[arg(long)]
+    json: bool,
+
+    #[command(subcommand)]
+    action: Option<RecoveryAction>,
+}
+
+#[derive(Subcommand, Debug)]
+enum RecoveryAction {
+    /// Update the recovery policy for the service.
+    Set(RecoverySetArgs),
+}
+
+#[derive(Args, Debug)]
+struct RecoverySetArgs {
+    /// Default action when a process exit code has no explicit mapping.
+    #[arg(long, value_enum)]
+    default_action: ExitActionArg,
+
+    /// Milliseconds to delay before restarting the service.
+    #[arg(long)]
+    restart_delay_ms: Option<u32>,
+
+    /// Clear any restart delay (set to None).
+    #[arg(long, conflicts_with = "restart_delay_ms")]
+    no_restart_delay: bool,
+
+    /// Milliseconds of throttle delay between restarts when the service
+    /// is cycling too quickly.
+    #[arg(long)]
+    throttle_delay_ms: Option<u32>,
+
+    /// Clear any throttle delay (set to None).
+    #[arg(long, conflicts_with = "throttle_delay_ms")]
+    no_throttle_delay: bool,
+
+    /// Per-exit-code action. Format: `<code>=<action>`, e.g. `0=ignore`.
+    /// May be repeated.
+    #[arg(long = "exit-action")]
+    exit_actions: Vec<String>,
+
+    /// Drop all existing per-exit-code entries before applying
+    /// `--exit-action` entries (replaces rather than merging).
+    #[arg(long)]
+    clear_exit_actions: bool,
+}
+
+/// CLI-visible exit action names; maps onto [`ExitAction`].
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum ExitActionArg {
+    Restart,
+    Ignore,
+    Exit,
+    Suicide,
+}
+
+impl From<ExitActionArg> for ExitAction {
+    fn from(a: ExitActionArg) -> Self {
+        match a {
+            ExitActionArg::Restart => ExitAction::Restart,
+            ExitActionArg::Ignore => ExitAction::Ignore,
+            ExitActionArg::Exit => ExitAction::Exit,
+            ExitActionArg::Suicide => ExitAction::Suicide,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -400,6 +476,7 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Unset { name, param } => cmd_unset(name, param, cli.json),
         Command::Edit(args) => cmd_edit(args, cli.json),
         Command::Rotate { name } => cmd_rotate(name, cli.json),
+        Command::Recovery(args) => cmd_recovery(args, cli.json),
         Command::Processes { name } => cmd_processes(name, cli.json),
         Command::RunService { name } => servicemanager_runner::run(name),
         #[cfg(feature = "broker")]
@@ -911,6 +988,130 @@ fn cmd_rotate(name: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn cmd_recovery(args: &RecoveryArgs, global_json: bool) -> Result<()> {
+    // --json on the subcommand args takes precedence; global --json also works.
+    let json = args.json || global_json;
+    match &args.action {
+        None => cmd_recovery_show(&args.name, json),
+        Some(RecoveryAction::Set(set_args)) => cmd_recovery_set(&args.name, set_args, json),
+    }
+}
+
+fn cmd_recovery_show(name: &str, json: bool) -> Result<()> {
+    let spec = servicemanager_ops::read_recovery(name).map_err(servicemanager_core::Error::other)?;
+    if json {
+        let exit_map: BTreeMap<&str, String> = spec
+            .exit_actions
+            .iter()
+            .map(|(code, action)| {
+                (
+                    code.as_str(),
+                    format!("{:?}", action).to_ascii_lowercase(),
+                )
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "service": spec.name,
+                "restart_delay_ms": spec.restart_delay_ms,
+                "throttle_delay_ms": spec.throttle_delay_ms,
+                "default_action": format!("{:?}", spec.default_action).to_ascii_lowercase(),
+                "exit_actions": exit_map,
+            }))
+            .map_err(|e| servicemanager_core::Error::other(format!("serialize: {e}")))?
+        );
+    } else {
+        println!("Recovery policy for '{}':", spec.name);
+        match spec.restart_delay_ms {
+            Some(ms) => println!("  Restart delay: {ms}ms"),
+            None => println!("  Restart delay: (none)"),
+        }
+        match spec.throttle_delay_ms {
+            Some(ms) => println!("  Throttle delay: {ms}ms"),
+            None => println!("  Throttle delay: (none)"),
+        }
+        println!("  Default action: {:?}", spec.default_action);
+        if spec.exit_actions.is_empty() {
+            println!("  Per-exit-code: (none)");
+        } else {
+            println!("  Per-exit-code:");
+            for (code, action) in &spec.exit_actions {
+                println!("    AppExit\\{code} -> {action:?}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_recovery_set(name: &str, args: &RecoverySetArgs, json: bool) -> Result<()> {
+    // Read the current spec so we can merge in-place when --clear-exit-actions
+    // is not set.
+    let current =
+        servicemanager_ops::read_recovery(name).map_err(servicemanager_core::Error::other)?;
+
+    let restart_delay_ms = if args.no_restart_delay {
+        None
+    } else {
+        args.restart_delay_ms.or(current.restart_delay_ms)
+    };
+
+    let throttle_delay_ms = if args.no_throttle_delay {
+        None
+    } else {
+        args.throttle_delay_ms.or(current.throttle_delay_ms)
+    };
+
+    let mut exit_actions: BTreeMap<String, ExitAction> = if args.clear_exit_actions {
+        BTreeMap::new()
+    } else {
+        current.exit_actions
+    };
+
+    // Parse and apply --exit-action CODE=ACTION entries.
+    for raw in &args.exit_actions {
+        let (code_str, action_str) = raw.split_once('=').ok_or_else(|| {
+            servicemanager_core::Error::InvalidConfig(format!(
+                "exit-action '{raw}' must be CODE=ACTION (e.g. 0=ignore)"
+            ))
+        })?;
+        let action = parse_exit_action(action_str).map_err(|e| {
+            servicemanager_core::Error::InvalidConfig(format!(
+                "exit-action '{raw}': {e}"
+            ))
+        })?;
+        exit_actions.insert(code_str.trim().to_string(), action);
+    }
+
+    let spec = RecoverySpec {
+        name: name.to_string(),
+        restart_delay_ms,
+        throttle_delay_ms,
+        default_action: args.default_action.into(),
+        exit_actions,
+    };
+    let msg = servicemanager_ops::save_recovery(spec).map_err(servicemanager_core::Error::other)?;
+    if json {
+        println!("{}", serde_json::json!({ "saved": name }));
+    } else {
+        println!("{msg}");
+    }
+    Ok(())
+}
+
+/// Parse an exit-action string (case-insensitive).
+fn parse_exit_action(s: &str) -> std::result::Result<ExitAction, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "restart" => Ok(ExitAction::Restart),
+        "ignore" => Ok(ExitAction::Ignore),
+        "exit" => Ok(ExitAction::Exit),
+        "suicide" => Ok(ExitAction::Suicide),
+        other => Err(format!(
+            "unknown action '{other}'; expected restart, ignore, exit, or suicide"
+        )),
+    }
+}
+
 fn cmd_processes(name: &str, json: bool) -> Result<()> {
     let snapshot = query_service(name)?;
     let pid = snapshot
@@ -1049,5 +1250,20 @@ mod tests {
         let t = truncate("abcdefghij", 5);
         assert_eq!(t.chars().count(), 5);
         assert!(t.ends_with('…'));
+    }
+
+    #[test]
+    fn parse_exit_action_accepts_all_variants_case_insensitive() {
+        use servicemanager_core::ExitAction;
+        assert_eq!(parse_exit_action("restart").unwrap(), ExitAction::Restart);
+        assert_eq!(parse_exit_action("IGNORE").unwrap(), ExitAction::Ignore);
+        assert_eq!(parse_exit_action("Exit").unwrap(), ExitAction::Exit);
+        assert_eq!(parse_exit_action("suicide").unwrap(), ExitAction::Suicide);
+    }
+
+    #[test]
+    fn parse_exit_action_rejects_unknown() {
+        assert!(parse_exit_action("reboot").is_err());
+        assert!(parse_exit_action("").is_err());
     }
 }
