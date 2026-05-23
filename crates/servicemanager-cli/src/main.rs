@@ -629,11 +629,14 @@ fn cmd_install(args: &InstallArgs, json: bool) -> Result<()> {
 }
 
 fn cmd_remove(name: &str, purge_config: bool, force_native: bool, json: bool) -> Result<()> {
-    // `remove` is advertised as *managed*-service removal. Refuse to delete a
-    // service that is not NGSM/NSSM-managed unless the operator explicitly
-    // opts in, so a typo cannot wipe a native Windows service like `Spooler`.
+    // Query once: we need the SCM state both to verify managed ownership
+    // (below, when --force-native is not set) and to confirm the service
+    // is stopped (always — applies even to --force-native because
+    // DeleteService on a running service leaves it marked-for-deletion
+    // until next stop, while the managed config is scrubbed immediately).
+    let native = query_service(name)?;
+
     if !force_native {
-        let native = query_service(name)?;
         // Fail closed: if the managed config cannot be read we cannot tell
         // whether this service is ours, so refuse rather than guess.
         // `--force-native` is the explicit override.
@@ -647,9 +650,9 @@ fn cmd_remove(name: &str, purge_config: bool, force_native: bool, json: bool) ->
             }
         };
         let def = ServiceDefinition {
-            native: native.config,
+            native: native.config.clone(),
             managed,
-            runtime: native.runtime,
+            runtime: native.runtime.clone(),
         };
         if !def.is_managed() {
             return Err(servicemanager_core::Error::other(format!(
@@ -658,6 +661,23 @@ fn cmd_remove(name: &str, purge_config: bool, force_native: bool, json: bool) ->
             )));
         }
     }
+
+    // M-03: refuse to delete a running service. Windows SCM does not stop
+    // the service on DeleteService — it sets a flag and finalizes when the
+    // service next stops, while our managed-config purge happens
+    // immediately. That leaves the operator with a marked-for-deletion
+    // service whose NGSM config is already gone.
+    use servicemanager_core::ServiceState;
+    let stopped = matches!(
+        native.runtime.as_ref().map(|r| r.state),
+        Some(ServiceState::Stopped) | None
+    );
+    if !stopped {
+        return Err(servicemanager_core::Error::other(format!(
+            "'{name}' is not stopped — stop it first (e.g. `ngsm stop {name}`)"
+        )));
+    }
+
     // Remove the SCM service first: if that fails the service keeps its
     // managed config and the operator can retry. Only then scrub the
     // registry, and report (rather than swallow) a cleanup failure.
