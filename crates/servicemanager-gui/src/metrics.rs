@@ -647,4 +647,32 @@ mod tests {
         let m = compute_metrics(&defs, &events, now);
         assert!(m.availability_window_days >= 7 && m.availability_window_days <= 8);
     }
+
+    #[test]
+    fn availability_open_interval_not_extended_when_state_not_running() {
+        // The open-interval extension in build_up_intervals requires BOTH
+        // state==Running AND last event is Started/Restarted. If state is
+        // Stopped (or None), the open up_since must be discarded — not
+        // extended to `now`. Otherwise a stopped service whose stop event
+        // didn't reach the log would report 100% availability.
+        let now = datetime!(2026-05-23 12:00:00 UTC);
+        // Service has a Started event 2h ago but no matching close event,
+        // AND the SCM currently reports it as Stopped (perhaps the stop
+        // event hasn't reached the log yet, or was lost).
+        let defs = vec![ngsm("A", StartupType::Automatic, Some(ServiceState::Stopped))];
+        let events = vec![ev(
+            "A",
+            now - time::Duration::hours(2),
+            EventKind::Started,
+            None,
+        )];
+        let m = compute_metrics(&defs, &events, now);
+        // The open interval must NOT be extended to now. With per-service
+        // window = 2h and no closed intervals, up_ms = 0 → 0% availability.
+        assert!(
+            m.availability_pct < 1.0,
+            "open interval was extended despite state != Running (got {}%)",
+            m.availability_pct
+        );
+    }
 }
