@@ -121,6 +121,7 @@ A Cargo workspace of focused crates:
 | `servicemanager-core` | Platform-agnostic domain model and validation |
 | `servicemanager-win32` | SCM, Job Object, process, and console wrappers |
 | `servicemanager-registry` | NSSM-compatible `Parameters` registry adapter |
+| `servicemanager-ops` | High-level service operations (install, remove, edit, control) |
 | `servicemanager-supervisor` | Child-process supervision, hooks, log rotation |
 | `servicemanager-runner` | Windows service entry point (SCM dispatcher) |
 | `servicemanager-broker` | Optional elevated named-pipe broker |
