@@ -315,3 +315,237 @@ pub fn control_service(name: &str, signal: ServiceControlSignal) -> Result<Servi
         wait_hint_ms: Some(proc_status.dwWaitHint),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate process-wide env vars. Cargo runs each
+    /// crate's tests in one binary, multithreaded, so concurrent env mutations
+    /// would race without this lock.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Override the six user-writable env vars for the duration of the test,
+    /// then return the lock guard (dropped when the calling test returns).
+    ///
+    /// `vars_to_set` is a slice of `(var_name, Some(path) | None)` — `None`
+    /// removes the variable so the validator skips it.
+    fn isolate_with_env(
+        vars_to_set: &[(&str, Option<&std::path::Path>)],
+    ) -> std::sync::MutexGuard<'static, ()> {
+        let guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        for (var, val) in vars_to_set {
+            match val {
+                Some(p) => std::env::set_var(var, p),
+                None => std::env::remove_var(var),
+            }
+        }
+        guard
+    }
+
+    /// Drop a zero-byte file with a `.exe` extension into `dir` and return its path.
+    fn make_stub_exe(dir: &std::path::Path) -> std::path::PathBuf {
+        let exe = dir.join("stub.exe");
+        std::fs::write(&exe, b"").unwrap();
+        exe
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_runner_location — happy path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_runner_location_accepts_path_not_under_user_roots() {
+        // Create two independent temp dirs. We keep the stub exe in `safe` and
+        // point all six user-writable env vars at `elsewhere`, so `safe` is not
+        // considered user-writable by the validator.
+        let safe = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let exe = make_stub_exe(safe.path());
+
+        let _g = isolate_with_env(&[
+            ("USERPROFILE", Some(elsewhere.path())),
+            ("TEMP", Some(elsewhere.path())),
+            ("TMP", Some(elsewhere.path())),
+            ("PUBLIC", Some(elsewhere.path())),
+            ("LOCALAPPDATA", Some(elsewhere.path())),
+            ("APPDATA", Some(elsewhere.path())),
+        ]);
+
+        // Defensive: if the OS happened to allocate both temp dirs under the
+        // same canonical root they'd collide. Skip rather than false-fail.
+        if let (Ok(cs), Ok(ce)) = (
+            std::fs::canonicalize(safe.path()),
+            std::fs::canonicalize(elsewhere.path()),
+        ) {
+            if cs.starts_with(&ce) {
+                eprintln!("skipping validate_runner_location_accepts_path_not_under_user_roots: temp dirs collide");
+                return;
+            }
+        }
+
+        validate_runner_location(&exe)
+            .expect("should accept an exe outside all user-writable env-var roots");
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_runner_location — rejection cases (one per sensitive env var)
+    // -----------------------------------------------------------------------
+
+    /// Inner helper so each per-var rejection test avoids duplication.
+    fn assert_rejects_under_var(var: &str) {
+        let user_dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let exe = make_stub_exe(user_dir.path());
+
+        // Build the set-list: `var` → the dir containing the exe; all others
+        // → `elsewhere` so they can't match first and mask the real assertion.
+        let user_path = user_dir.path();
+        let else_path = elsewhere.path();
+        let all_vars = [
+            "USERPROFILE",
+            "TEMP",
+            "TMP",
+            "PUBLIC",
+            "LOCALAPPDATA",
+            "APPDATA",
+        ];
+        let overrides: Vec<(&str, Option<&std::path::Path>)> = all_vars
+            .iter()
+            .map(|&v| {
+                if v == var {
+                    (v, Some(user_path))
+                } else {
+                    (v, Some(else_path))
+                }
+            })
+            .collect();
+
+        let _g = isolate_with_env(&overrides);
+
+        let err =
+            validate_runner_location(&exe).expect_err(&format!("should reject exe under {var}"));
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("user") || msg.to_lowercase().contains("administrator"),
+            "error message should mention user-writable / administrator concern for {var}: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_runner_location_rejects_path_under_userprofile() {
+        assert_rejects_under_var("USERPROFILE");
+    }
+
+    #[test]
+    fn validate_runner_location_rejects_path_under_temp() {
+        assert_rejects_under_var("TEMP");
+    }
+
+    #[test]
+    fn validate_runner_location_rejects_path_under_localappdata() {
+        assert_rejects_under_var("LOCALAPPDATA");
+    }
+
+    #[test]
+    fn validate_runner_location_rejects_path_under_appdata() {
+        assert_rejects_under_var("APPDATA");
+    }
+
+    #[test]
+    fn validate_runner_location_rejects_path_under_public() {
+        assert_rejects_under_var("PUBLIC");
+    }
+
+    #[test]
+    fn validate_runner_location_rejects_path_under_tmp() {
+        assert_rejects_under_var("TMP");
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_runner_location — UNC paths
+    // -----------------------------------------------------------------------
+
+    // UNC path rejection cannot be exercised hermetically without a real
+    // (or virtual) SMB share because `std::fs::canonicalize` must succeed for
+    // the path to reach the UNC check. Spinning up a network share in a unit
+    // test is not feasible on a standard CI runner, so this case is verified
+    // only by manual / integration testing. The code path is covered by
+    // inspection: `canonicalize` emits `\\?\UNC\...` for any UNC path and
+    // `starts_with(r"\\?\unc\")` (lowercased) catches that; the second arm
+    // (`starts_with(r"\\")` without `\\?\`) is the belt-and-suspenders check
+    // for unresolved UNC inputs that somehow bypass the `\\?\` normalization.
+
+    // -----------------------------------------------------------------------
+    // build_run_service_command — validation-rejection cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_run_service_command_rejects_empty_name() {
+        assert!(
+            build_run_service_command("").is_err(),
+            "empty service name must be rejected"
+        );
+    }
+
+    #[test]
+    fn build_run_service_command_rejects_name_with_nul() {
+        // NUL is a control character — validate_service_name rejects it before
+        // current_exe() or validate_runner_location() are ever called.
+        assert!(
+            build_run_service_command("has\0nul").is_err(),
+            "name containing NUL must be rejected"
+        );
+    }
+
+    #[test]
+    fn build_run_service_command_rejects_name_with_newline() {
+        assert!(
+            build_run_service_command("has\nnewline").is_err(),
+            "name containing newline (control char) must be rejected"
+        );
+    }
+
+    #[test]
+    fn build_run_service_command_rejects_name_with_tab() {
+        assert!(
+            build_run_service_command("has\ttab").is_err(),
+            "name containing tab (control char) must be rejected"
+        );
+    }
+
+    #[test]
+    fn build_run_service_command_rejects_overlong_name() {
+        use servicemanager_core::MAX_SERVICE_NAME_LEN;
+        let long = "x".repeat(MAX_SERVICE_NAME_LEN + 1);
+        assert!(
+            build_run_service_command(&long).is_err(),
+            "name exceeding {MAX_SERVICE_NAME_LEN} chars must be rejected"
+        );
+    }
+
+    #[test]
+    fn build_run_service_command_rejects_name_with_backslash() {
+        assert!(
+            build_run_service_command("evil\\path").is_err(),
+            "name containing backslash must be rejected"
+        );
+    }
+
+    #[test]
+    fn build_run_service_command_rejects_name_with_forward_slash() {
+        assert!(
+            build_run_service_command("evil/path").is_err(),
+            "name containing forward slash must be rejected"
+        );
+    }
+
+    // Happy-path (name valid + runner location accepted + correct quoting) is
+    // not exercised here because `current_exe()` on a test runner resolves to
+    // something under `target/debug/deps/...`, which on a developer machine
+    // typically lives under USERPROFILE — causing validate_runner_location to
+    // reject it. The formatting logic itself (`quote_windows_arg`) is tested
+    // in servicemanager-core; end-to-end formatting is covered by integration
+    // testing during the install flow.
+}
