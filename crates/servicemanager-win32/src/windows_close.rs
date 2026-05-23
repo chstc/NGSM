@@ -102,10 +102,16 @@ extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> windows::Win32::Foun
     let _tid = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut owner_pid)) };
     if owner_pid == state.target_pid {
         unsafe {
-            // Best-effort: ignore failures (closed window, no message queue, etc.).
-            let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+            match PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) {
+                Ok(()) => state.posted += 1,
+                Err(e) => {
+                    eprintln!(
+                        "[windows_close] PostMessageW(hwnd=0x{:x}) failed: {e}",
+                        hwnd.0 as usize
+                    );
+                }
+            }
         }
-        state.posted += 1;
     }
     // Continue enumeration.
     windows::Win32::Foundation::BOOL(1)
