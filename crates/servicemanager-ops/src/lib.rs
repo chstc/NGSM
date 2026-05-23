@@ -19,7 +19,7 @@
 //! | `remove` | [`remove`] (with stopped check + `force_native` option) |
 //! | `lifecycle` | [`start`], [`stop`], [`pause`], [`continue_service`], [`restart`] |
 //! | `rotate` | [`rotate`] (with online-rotation preflight) |
-//! | `recovery` | [`save_recovery`] |
+//! | `recovery` | [`read_recovery`], [`save_recovery`] |
 
 mod error;
 mod helpers;
@@ -41,6 +41,6 @@ pub use edit::edit;
 pub use install::install;
 pub use lifecycle::{continue_service, pause, restart, start, stop};
 pub use list::list_services;
-pub use recovery::save_recovery;
+pub use recovery::{read_recovery, save_recovery};
 pub use remove::remove;
 pub use rotate::rotate;
