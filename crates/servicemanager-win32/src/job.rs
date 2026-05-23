@@ -129,3 +129,139 @@ impl Drop for JobObject {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// Spawn a child process that will sleep for at least 30s, so the
+    /// test has plenty of time to assign it to a job and probe it.
+    /// Returns the Child handle and its PID. Caller MUST kill+wait.
+    fn spawn_long_lived_child() -> std::process::Child {
+        // CREATE_NO_WINDOW = 0x08000000
+        Command::new("cmd.exe")
+            .args(["/c", "ping", "127.0.0.1", "-n", "30", ">NUL"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x08000000)
+            .spawn()
+            .expect("spawn cmd.exe")
+    }
+
+    fn kill_and_wait(mut child: std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn new_kill_on_close_succeeds() {
+        let job = JobObject::new_kill_on_close().expect("create job");
+        // The job exists with its limit flags configured; drop is the
+        // observable effect — we don't have a child to kill yet.
+        drop(job);
+    }
+
+    #[test]
+    fn assign_child_and_contains_report_membership() {
+        let job = JobObject::new_kill_on_close().expect("create job");
+        let child = spawn_long_lived_child();
+        let pid = child.id();
+
+        job.assign_child(&child).expect("assign child to job");
+        assert!(
+            job.contains(pid),
+            "child must be a member of the job after assign"
+        );
+
+        // A clearly-unrelated PID (this test process itself) must NOT be
+        // reported as a member.
+        let self_pid = std::process::id();
+        assert!(
+            !job.contains(self_pid),
+            "test process must not be in the spawned child's job"
+        );
+
+        kill_and_wait(child);
+    }
+
+    #[test]
+    fn contains_returns_false_for_nonexistent_pid() {
+        let job = JobObject::new_kill_on_close().expect("create job");
+        // Windows PIDs are multiples of 4 and the kernel rejects PIDs that
+        // are not valid handles. 0xFFFF_FFFC is unreachable in practice.
+        // `contains` must return false rather than panic when OpenProcess
+        // fails for an unknown PID.
+        assert!(
+            !job.contains(0xFFFF_FFFC),
+            "contains must return false for a nonexistent PID"
+        );
+    }
+
+    #[test]
+    fn contains_returns_false_for_pid_never_in_job() {
+        let job = JobObject::new_kill_on_close().expect("create job");
+        // Probe an unrelated process (this test runner). It's alive but
+        // never joined the job we just made.
+        let self_pid = std::process::id();
+        assert!(!job.contains(self_pid));
+    }
+
+    #[test]
+    fn dropping_job_kills_assigned_child() {
+        // The whole point of KILL_ON_JOB_CLOSE: when the last handle to
+        // the job closes, all member processes are terminated. We can
+        // verify this by spawning a child, assigning, dropping the job,
+        // and checking the child reaps quickly.
+        let child = spawn_long_lived_child();
+        let pid = child.id();
+        {
+            let job = JobObject::new_kill_on_close().expect("create job");
+            job.assign_child(&child).expect("assign child");
+            assert!(job.contains(pid));
+            // Job dropped here.
+        }
+        // Wait up to 5s for the OS to actually terminate the child.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut child = child;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_status)) => return, // success
+                Ok(None) if Instant::now() >= deadline => {
+                    panic!("child should have been killed when job dropped")
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(e) => panic!("try_wait failed: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn terminate_kills_all_members() {
+        let child = spawn_long_lived_child();
+        let pid = child.id();
+        let job = JobObject::new_kill_on_close().expect("create job");
+        job.assign_child(&child).expect("assign child");
+        assert!(job.contains(pid));
+
+        job.terminate(1).expect("terminate job");
+
+        // After terminate, the child must be reapable.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut child = child;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() >= deadline => {
+                    panic!("child should be dead after terminate")
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(e) => panic!("try_wait failed: {e}"),
+            }
+        }
+        // (no need to drop job; the loop returns first)
+    }
+}

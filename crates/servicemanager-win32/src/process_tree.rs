@@ -209,3 +209,84 @@ impl Drop for HandleGuard {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    fn spawn_long_lived_child() -> std::process::Child {
+        Command::new("cmd.exe")
+            .args(["/c", "ping", "127.0.0.1", "-n", "30", ">NUL"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x08000000)
+            .spawn()
+            .expect("spawn cmd.exe")
+    }
+
+    fn kill_and_wait(mut child: std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn enumerate_descendants_of_self_includes_a_spawned_child() {
+        let child = spawn_long_lived_child();
+        let child_pid = child.id();
+
+        // Give Windows a moment to register the new process in the
+        // toolhelp snapshot. The snapshot is updated immediately on
+        // CreateProcess so this is usually instant, but a small wait
+        // makes the test less flaky on a heavily-loaded machine.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let self_pid = std::process::id();
+        let descendants = enumerate_descendants(self_pid).expect("enumerate descendants");
+        let found = descendants.iter().any(|p| p.pid == child_pid);
+        assert!(
+            found,
+            "expected child pid {child_pid} in descendants of self ({self_pid}): {descendants:?}"
+        );
+
+        kill_and_wait(child);
+    }
+
+    #[test]
+    fn enumerate_descendants_of_unknown_pid_returns_empty() {
+        // An unreachable PID (Windows PIDs are multiples of 4; 0xFFFF_FFFC
+        // is never a real process). The BFS finds no children of a PID that
+        // does not appear in the snapshot, so the result must be empty.
+        // The function returns Ok(vec![]) rather than Err in this case
+        // because CreateToolhelp32Snapshot succeeds; the PID just has no
+        // entry in the snapshot.
+        let result = enumerate_descendants(0xFFFF_FFFC);
+        match result {
+            Ok(list) => assert!(
+                list.is_empty(),
+                "expected empty list for nonexistent pid, got {list:?}"
+            ),
+            Err(_) => { /* erroring is also acceptable */ }
+        }
+    }
+
+    #[test]
+    fn enumerate_descendants_has_no_duplicate_pids() {
+        // The BFS seen-set should prevent any PID from appearing twice
+        // even if the process tree has cycles in the parent-pid data.
+        let self_pid = std::process::id();
+        let descendants = enumerate_descendants(self_pid).expect("enumerate descendants");
+        let mut seen: HashSet<u32> = HashSet::new();
+        for p in &descendants {
+            assert!(
+                seen.insert(p.pid),
+                "duplicate pid {} in descendant list",
+                p.pid
+            );
+        }
+    }
+}
