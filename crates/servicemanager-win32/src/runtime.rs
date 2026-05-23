@@ -177,13 +177,21 @@ impl ServiceContext {
     }
 
     fn bump_checkpoint(&self) -> u32 {
-        let mut guard = self.inner.checkpoint.lock().unwrap();
+        let mut guard = self
+            .inner
+            .checkpoint
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         *guard = guard.saturating_add(1);
         *guard
     }
 
     fn reset_checkpoint(&self) {
-        *self.inner.checkpoint.lock().unwrap() = 0;
+        *self
+            .inner
+            .checkpoint
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = 0;
     }
 }
 
@@ -201,7 +209,7 @@ static CONTEXT_PTR: OnceLock<usize> = OnceLock::new();
 pub fn run_service_dispatcher<L: ServiceLifecycle>(service_name: &str, lifecycle: L) -> Result<()> {
     let slot = LIFECYCLE.get_or_init(|| Mutex::new(None));
     {
-        let mut guard = slot.lock().unwrap();
+        let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
         if guard.is_some() {
             return Err(Error::other(
                 "run_service_dispatcher must only be called once per process",
@@ -243,7 +251,7 @@ extern "system" fn service_main_thunk(_argc: u32, _argv: *mut PWSTR) {
     };
 
     let name_wide = match SERVICE_NAME.get() {
-        Some(m) => m.lock().unwrap().clone(),
+        Some(m) => m.lock().unwrap_or_else(|p| p.into_inner()).clone(),
         None => return,
     };
     let name = String::from_utf16_lossy(strip_trailing_nul(&name_wide));

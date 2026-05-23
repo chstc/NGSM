@@ -26,7 +26,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 pub fn post_wm_close_to_process(pid: u32) -> Result<usize> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let lock = LOCK.get_or_init(|| Mutex::new(()));
-    let _guard = lock.lock().unwrap();
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
 
     // Stash the target pid + count where the C callback can find them.
     let mut state = EnumState {
