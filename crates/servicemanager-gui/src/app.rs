@@ -175,7 +175,12 @@ fn wire_callbacks(window: &MainWindow) {
         STATE.with(|s| {
             if let Some(st) = s.borrow().as_ref() {
                 if let Some(win) = st.window.upgrade() {
-                    if !st.warnings.is_empty() {
+                    // Open the warnings dialog when there is either a startup
+                    // config warning OR per-scan service warnings. Previously
+                    // only st.warnings was checked, so a startup_warning-only
+                    // scenario left the dialog unreachable.
+                    let has_any = st.startup_warning.is_some() || !st.warnings.is_empty();
+                    if has_any {
                         win.set_active_modal(5);
                     }
                 }
