@@ -10,27 +10,53 @@ use servicemanager_core::events::EventRecord;
 use servicemanager_core::paths;
 
 /// Read up to `max` most-recent records across both log files.
+/// Reads only the trailing TAIL_BYTES from each file (rather than the
+/// whole thing), so cost is bounded regardless of file size. Sorts by
+/// the RFC 3339 ts field descending — newest first — to tolerate
+/// out-of-order writes from clock skew between concurrent supervisors.
 /// Caller is on the worker thread; this is allowed to do file I/O.
 pub fn read_recent(max: usize) -> Vec<EventRecord> {
     let active = paths::events_log().ok();
     let backup = paths::events_log_backup().ok();
     let mut all: Vec<EventRecord> = Vec::new();
     if let Some(b) = backup {
-        parse_into(&b, &mut all);
+        parse_tail_into(&b, &mut all);
     }
     if let Some(a) = active {
-        parse_into(&a, &mut all);
+        parse_tail_into(&a, &mut all);
     }
-    all.reverse();
+    // ts is RFC 3339 UTC — lexicographic order matches time order.
+    all.sort_by(|a, b| b.ts.cmp(&a.ts));
     all.truncate(max);
     all
 }
 
-fn parse_into(path: &std::path::Path, out: &mut Vec<EventRecord>) {
-    let Ok(raw) = std::fs::read_to_string(path) else {
+/// Read the last TAIL_BYTES of `path`, drop the first (possibly partial)
+/// line when the seek landed mid-file, and JSON-parse every remaining
+/// non-empty line into `out`. Malformed lines are silently skipped.
+fn parse_tail_into(path: &std::path::Path, out: &mut Vec<EventRecord>) {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL_BYTES: u64 = 64 * 1024;
+    let Ok(mut f) = std::fs::File::open(path) else {
         return;
     };
-    for line in raw.lines() {
+    let Ok(meta) = f.metadata() else { return };
+    let len = meta.len();
+    let partial = len > TAIL_BYTES;
+    if partial && f.seek(SeekFrom::Start(len - TAIL_BYTES)).is_err() {
+        return;
+    }
+    let mut buf = Vec::with_capacity(TAIL_BYTES as usize);
+    if f.read_to_end(&mut buf).is_err() {
+        return;
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines = text.lines();
+    // A mid-file seek leaves the first line truncated — drop it.
+    if partial {
+        let _ = lines.next();
+    }
+    for line in lines {
         if line.is_empty() {
             continue;
         }
@@ -186,5 +212,56 @@ mod tests {
         assert_eq!(s.len(), 8);
         assert_eq!(&s[2..3], ":");
         assert_eq!(&s[5..6], ":");
+    }
+
+    #[test]
+    fn tail_reads_only_recent_records_from_large_active_file() {
+        let (_g, _dir) = isolate();
+        let path = paths::events_log().unwrap();
+        // Write 10k records — far more than fit in 64 KiB.
+        let mut all_text = String::new();
+        for i in 0..10_000 {
+            let rec = EventRecord {
+                ts: format!("2026-05-22T14:{:02}:{:02}Z", (i / 60) % 60, i % 60),
+                service: format!("S{i}"),
+                event: EventKind::Started,
+                pid: Some(i as u32),
+                exit_code: None,
+                lived_ms: None,
+                delay_ms: None,
+                reason: None,
+            };
+            all_text.push_str(&serde_json::to_string(&rec).unwrap());
+            all_text.push('\n');
+        }
+        std::fs::write(&path, &all_text).unwrap();
+        let out = read_recent(50);
+        assert_eq!(out.len(), 50);
+        // The newest records (highest ts) must come first.
+        assert_eq!(out[0].service, "S9999");
+        // The tail window must have captured the very last records, not
+        // the head ones.
+        assert!(out[49].service.starts_with('S'));
+        let last_idx: u32 = out[49].service[1..].parse().unwrap();
+        assert!(
+            last_idx > 9000,
+            "tail did not capture recent records: got S{last_idx}"
+        );
+    }
+
+    #[test]
+    fn sorts_out_of_order_records_newest_first() {
+        let (_g, _dir) = isolate();
+        write_active(&[
+            // Deliberately out of order in the file
+            r#"{"ts":"2026-05-22T14:15:02Z","service":"middle","event":"started","pid":1}"#,
+            r#"{"ts":"2026-05-22T14:15:00Z","service":"oldest","event":"started","pid":2}"#,
+            r#"{"ts":"2026-05-22T14:15:05Z","service":"newest","event":"started","pid":3}"#,
+        ]);
+        let out = read_recent(50);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].service, "newest");
+        assert_eq!(out[1].service, "middle");
+        assert_eq!(out[2].service, "oldest");
     }
 }
