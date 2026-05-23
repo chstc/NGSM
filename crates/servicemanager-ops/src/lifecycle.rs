@@ -52,16 +52,15 @@ pub fn continue_service(name: &str) -> OpResult {
     Ok(format!("Continue requested for '{name}'."))
 }
 
-/// Stop and then start a service, waiting up to 30 seconds for it to reach
-/// the `Stopped` state before re-starting.
+/// Stop and then start a service, waiting up to `stop_timeout_ms` milliseconds
+/// for it to reach the `Stopped` state before re-starting.
 ///
 /// Re-validates NGSM ownership and enabled state before acting. If the service
 /// is already stopped, the stop step is skipped.
 ///
-/// The 30-second deadline matches the GUI, CLI, and broker implementations.
 /// A 250 ms post-stop pause is applied before the start to give the SCM time
 /// to accept a new Start on the same service.
-pub fn restart(name: &str) -> OpResult {
+pub fn restart(name: &str, stop_timeout_ms: u64) -> OpResult {
     use servicemanager_core::ServiceState;
 
     ensure_ngsm_managed(name).map_err(|e| e.to_string())?;
@@ -83,7 +82,7 @@ pub fn restart(name: &str) -> OpResult {
                 }
             }
         }
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_millis(stop_timeout_ms);
         loop {
             let s = query_service(name).map_err(|e| e.to_string())?;
             if matches!(
@@ -93,7 +92,7 @@ pub fn restart(name: &str) -> OpResult {
                 break;
             }
             if Instant::now() >= deadline {
-                return Err(format!("'{name}' did not stop within 30 s"));
+                return Err(format!("'{name}' did not stop within {stop_timeout_ms} ms"));
             }
             thread::sleep(Duration::from_millis(200));
         }

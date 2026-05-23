@@ -214,7 +214,7 @@ fn op_restart(args: &Value) -> Result<Value, String> {
         // Bypass NGSM-managed check — implement restart loop locally.
         op_restart_force_native(&a.name)?;
     } else {
-        servicemanager_ops::restart(&a.name)?;
+        servicemanager_ops::restart(&a.name, 30_000)?;
     }
     Ok(json!({ "restarted": a.name }))
 }

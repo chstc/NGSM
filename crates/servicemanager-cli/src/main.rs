@@ -711,14 +711,12 @@ fn cmd_control(name: &str, action: ServiceAction, force_native: bool, json: bool
 }
 
 fn cmd_restart(name: &str, timeout_ms: u32, force_native: bool, json: bool) -> Result<()> {
-    // Note: ops::restart uses a fixed 30-second stop-wait timeout; the CLI's
-    // --timeout-ms flag is accepted for backward compatibility but ignored
-    // when force_native is false (ops enforces NGSM-managed and fixed timeout).
     if force_native {
         // Bypass the NGSM-managed check — run the restart loop locally.
         cmd_restart_force_native(name, timeout_ms, json)
     } else {
-        let msg = servicemanager_ops::restart(name).map_err(servicemanager_core::Error::other)?;
+        let msg = servicemanager_ops::restart(name, timeout_ms as u64)
+            .map_err(servicemanager_core::Error::other)?;
         if json {
             println!("{}", serde_json::json!({ "restarted": name }));
         } else {
@@ -891,7 +889,16 @@ fn cmd_edit(args: &EditArgs, json: bool) -> Result<()> {
 fn cmd_rotate(name: &str, json: bool) -> Result<()> {
     let msg = servicemanager_ops::rotate(name).map_err(servicemanager_core::Error::other)?;
     if json {
-        println!("{}", serde_json::json!({ "rotated": name }));
+        let state = query_service(name)
+            .ok()
+            .and_then(|s| s.runtime.map(|r| format!("{:?}", r.state)));
+        println!(
+            "{}",
+            serde_json::json!({
+                "rotated": name,
+                "state": state,
+            })
+        );
     } else {
         println!("{msg}");
     }

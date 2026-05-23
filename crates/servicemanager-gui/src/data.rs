@@ -118,7 +118,7 @@ fn execute(job: Job) -> JobResult {
             Ok(msg) => JobResult::Acted(msg),
             Err(e) => JobResult::Error(e),
         },
-        Job::Restart(n) => match servicemanager_ops::restart(&n) {
+        Job::Restart(n) => match servicemanager_ops::restart(&n, 30_000) {
             Ok(msg) => JobResult::Acted(msg),
             Err(e) => JobResult::Error(e),
         },
