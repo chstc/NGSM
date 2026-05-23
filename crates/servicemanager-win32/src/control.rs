@@ -102,6 +102,9 @@ pub fn install_service(opts: &InstallOptions) -> Result<()> {
     let name = to_wide(&opts.name);
     let display = to_wide(&opts.display_name);
     let path = to_wide(&opts.binary_path);
+    // SAFETY: `scm.0` is a valid SCM handle opened with `SC_MANAGER_CREATE_SERVICE`;
+    // `name`, `display`, and `path` are null-terminated UTF-16 vecs that outlive
+    // this block. The returned service handle is wrapped in ScHandle for RAII close.
     unsafe {
         let handle = CreateServiceW(
             scm.0,
@@ -249,6 +252,7 @@ pub fn remove_service(name: &str) -> Result<()> {
     validate_service_name(name)?;
     let scm = open_scm(SC_MANAGER_CONNECT)?;
     let svc = open_service_handle(&scm, name, DELETE_ACCESS)?;
+    // SAFETY: `svc.0` is a valid service handle opened with `DELETE_ACCESS`.
     unsafe {
         DeleteService(svc.0).map_err(|e| map_win_error(&format!("DeleteService({name})"), e))?;
     }
@@ -279,6 +283,9 @@ pub fn update_native_config(
         None => SERVICE_START_TYPE(SERVICE_NO_CHANGE),
     };
 
+    // SAFETY: `svc.0` is a valid service handle opened with `SERVICE_CHANGE_CONFIG`;
+    // `display_wide` (when Some) outlives this block; null PCWSTR args are the
+    // documented way to leave the corresponding fields unchanged.
     unsafe {
         ChangeServiceConfigW(
             svc.0,
@@ -304,6 +311,9 @@ pub fn start_service(name: &str) -> Result<()> {
     validate_service_name(name)?;
     let scm = open_scm(SC_MANAGER_CONNECT)?;
     let svc = open_service_handle(&scm, name, SERVICE_START)?;
+    // SAFETY: `svc.0` is a valid service handle opened with `SERVICE_START`;
+    // passing `None` for the arguments array is the documented way to start
+    // with no arguments.
     unsafe {
         StartServiceW(svc.0, None)
             .map_err(|e| map_win_error(&format!("StartService({name})"), e))?;
@@ -320,6 +330,9 @@ pub fn control_service(name: &str, signal: ServiceControlSignal) -> Result<Servi
     let scm = open_scm(SC_MANAGER_CONNECT)?;
     let svc = open_service_handle(&scm, name, signal.required_access())?;
     let mut status = SERVICE_STATUS::default();
+    // SAFETY: `svc.0` is a valid service handle opened with the access rights
+    // required by the signal; `status` is a local struct whose pointer is only
+    // used for the duration of this call.
     unsafe {
         ControlService(svc.0, signal.to_win32(), &mut status as *mut SERVICE_STATUS)
             .map_err(|e| map_win_error(&format!("ControlService({name})"), e))?;
@@ -327,6 +340,9 @@ pub fn control_service(name: &str, signal: ServiceControlSignal) -> Result<Servi
     // Re-query for the richer process-aware status.
     let mut proc_status = SERVICE_STATUS_PROCESS::default();
     let mut written = 0u32;
+    // SAFETY: `svc.0` is still valid (the handle is alive for the scope of
+    // `svc`); the slice covers exactly `size_of::<SERVICE_STATUS_PROCESS>()`
+    // bytes of the local `proc_status`, satisfying the API buffer contract.
     unsafe {
         QueryServiceStatusEx(
             svc.0,

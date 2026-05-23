@@ -135,6 +135,10 @@ fn collect_dependencies(ptr: *const u16) -> (Vec<String>, Vec<String>) {
         return (Vec::new(), Vec::new());
     }
     let mut len = 0usize;
+    // SAFETY: `ptr` is non-null (checked above) and points to a
+    // double-null-terminated wide string returned by `QueryServiceConfigW` and
+    // stored inside a heap buffer that outlives this call. The 64 KiB limit
+    // prevents unbounded reads if the data is malformed.
     unsafe {
         loop {
             if *ptr.add(len) == 0 && *ptr.add(len + 1) == 0 {
@@ -173,6 +177,10 @@ pub fn enumerate_services() -> Result<Vec<NativeService>> {
     let mut out = Vec::new();
 
     loop {
+        // SAFETY: `scm.0` is a valid SCM handle opened with
+        // `SC_MANAGER_ENUMERATE_SERVICE`; `buffer` is a heap-allocated byte
+        // slice whose length is passed to the API; all other arguments are
+        // by-reference or null.
         let ret = unsafe {
             EnumServicesStatusExW(
                 scm.0,
@@ -206,13 +214,21 @@ pub fn enumerate_services() -> Result<Vec<NativeService>> {
         if services_returned > 0 {
             let entry_size = size_of::<ENUM_SERVICE_STATUS_PROCESSW>();
             for i in 0..services_returned as usize {
+                // SAFETY: `buffer` was written by `EnumServicesStatusExW` which
+                // guarantees `services_returned` valid `ENUM_SERVICE_STATUS_PROCESSW`
+                // entries at the start; `read_unaligned` handles any platform
+                // alignment padding the API may impose.
                 let raw = unsafe {
                     let p =
                         buffer.as_ptr().add(i * entry_size) as *const ENUM_SERVICE_STATUS_PROCESSW;
                     ptr::read_unaligned(p)
                 };
 
+                // SAFETY: `raw.lpServiceName` is a null-terminated wide-string
+                // pointer written into `buffer` by `EnumServicesStatusExW`;
+                // `buffer` outlives this block.
                 let name = unsafe { wide_to_string(raw.lpServiceName.0).unwrap_or_default() };
+                // SAFETY: same as above for `raw.lpDisplayName`.
                 let display = unsafe { wide_to_string(raw.lpDisplayName.0).unwrap_or_default() };
 
                 let runtime = ServiceRuntimeState {
@@ -291,6 +307,8 @@ fn query_service_inner(
 
 fn query_config(svc: &ScHandle, name: &str) -> Result<NativeServiceConfig> {
     let mut bytes_needed = 0u32;
+    // SAFETY: passing `None`/0 is the documented probe pattern to get the
+    // required buffer size; we ignore the error return from the probe.
     unsafe {
         let _ = QueryServiceConfigW(svc.0, None, 0, &mut bytes_needed);
     }
@@ -301,6 +319,10 @@ fn query_config(svc: &ScHandle, name: &str) -> Result<NativeServiceConfig> {
     }
     let mut buffer = vec![0u8; bytes_needed as usize];
     let mut written = 0u32;
+    // SAFETY: `svc.0` is a valid handle with `SERVICE_QUERY_CONFIG`; `buffer`
+    // is a heap allocation of the exact size the probe reported; the cast to
+    // `*mut QUERY_SERVICE_CONFIGW` is valid because the API writes the struct
+    // plus string data into the contiguous buffer.
     unsafe {
         QueryServiceConfigW(
             svc.0,
@@ -310,10 +332,17 @@ fn query_config(svc: &ScHandle, name: &str) -> Result<NativeServiceConfig> {
         )
         .map_err(|e| map_win_error(&format!("QueryServiceConfig({name})"), e))?;
     }
+    // SAFETY: the API just wrote a valid `QUERY_SERVICE_CONFIGW` at the start
+    // of `buffer`; `read_unaligned` handles any alignment gap the Win32 layout
+    // may impose.
     let cfg = unsafe { ptr::read_unaligned(buffer.as_ptr() as *const QUERY_SERVICE_CONFIGW) };
 
+    // SAFETY: `cfg.lpDisplayName` points into `buffer` (still alive); the API
+    // null-terminates it.
     let display_name = unsafe { wide_to_string(cfg.lpDisplayName.0).unwrap_or_default() };
+    // SAFETY: same as above for `cfg.lpBinaryPathName`.
     let image_path = unsafe { wide_to_string(cfg.lpBinaryPathName.0).unwrap_or_default() };
+    // SAFETY: same as above for `cfg.lpServiceStartName`.
     let account_raw = unsafe { wide_to_string(cfg.lpServiceStartName.0).unwrap_or_default() };
     let account = (!account_raw.is_empty()).then_some(account_raw);
     let (depend_on_services, depend_on_groups) = collect_dependencies(cfg.lpDependencies.0);
@@ -337,6 +366,9 @@ fn query_config(svc: &ScHandle, name: &str) -> Result<NativeServiceConfig> {
 fn query_delayed_auto_start(svc: &ScHandle) -> Result<bool> {
     let mut info = SERVICE_DELAYED_AUTO_START_INFO::default();
     let mut bytes_needed = 0u32;
+    // SAFETY: `svc.0` is a valid handle with `SERVICE_QUERY_CONFIG`; the slice
+    // covers exactly `size_of::<SERVICE_DELAYED_AUTO_START_INFO>()` bytes of
+    // the local `info`, which is the correct buffer type for this info class.
     unsafe {
         QueryServiceConfig2W(
             svc.0,
@@ -354,6 +386,8 @@ fn query_delayed_auto_start(svc: &ScHandle) -> Result<bool> {
 
 fn query_description(svc: &ScHandle) -> Result<Option<String>> {
     let mut bytes_needed = 0u32;
+    // SAFETY: passing `None` is the documented probe pattern; we ignore the
+    // error return — only `bytes_needed` matters at this point.
     unsafe {
         let _ = QueryServiceConfig2W(svc.0, SERVICE_CONFIG_DESCRIPTION, None, &mut bytes_needed);
     }
@@ -362,6 +396,8 @@ fn query_description(svc: &ScHandle) -> Result<Option<String>> {
     }
     let mut buffer = vec![0u8; bytes_needed as usize];
     let mut written = 0u32;
+    // SAFETY: `svc.0` is a valid handle with `SERVICE_QUERY_CONFIG`; `buffer`
+    // is a heap allocation sized to what the probe returned.
     unsafe {
         QueryServiceConfig2W(
             svc.0,
@@ -371,7 +407,10 @@ fn query_description(svc: &ScHandle) -> Result<Option<String>> {
         )
         .map_err(|e| map_win_error("QueryServiceConfig2(description)", e))?;
     }
+    // SAFETY: the API wrote a valid `SERVICE_DESCRIPTIONW` at the start of
+    // `buffer`; `read_unaligned` handles any alignment gap.
     let desc = unsafe { ptr::read_unaligned(buffer.as_ptr() as *const SERVICE_DESCRIPTIONW) };
+    // SAFETY: `desc.lpDescription` points into `buffer` which is still alive.
     let s = unsafe { wide_to_string(desc.lpDescription.0) };
     Ok(s.filter(|v| !v.is_empty()))
 }
@@ -379,6 +418,9 @@ fn query_description(svc: &ScHandle) -> Result<Option<String>> {
 fn query_status(svc: &ScHandle, name: &str) -> Result<ServiceRuntimeState> {
     let mut status = SERVICE_STATUS_PROCESS::default();
     let mut written = 0u32;
+    // SAFETY: `svc.0` is a valid handle with `SERVICE_QUERY_STATUS`; the slice
+    // covers exactly `size_of::<SERVICE_STATUS_PROCESS>()` bytes of the local
+    // `status`, satisfying the API buffer-size contract.
     unsafe {
         QueryServiceStatusEx(
             svc.0,

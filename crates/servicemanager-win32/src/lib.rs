@@ -4,6 +4,7 @@
 //! [`servicemanager_core::Result`] and never expose raw handles.
 
 #![cfg_attr(not(windows), allow(dead_code, unused_imports))]
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 #[cfg(windows)]
 pub mod console_ctrl;

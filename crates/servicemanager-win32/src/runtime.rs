@@ -94,9 +94,14 @@ struct ContextInner {
     checkpoint: Mutex<u32>,
 }
 
-// `SERVICE_STATUS_HANDLE` wraps a raw HANDLE pointer that is opaque and only
-// used by SCM bookkeeping calls. It is safe to share between threads.
+// SAFETY: `SERVICE_STATUS_HANDLE` is an opaque SCM-managed token used only as
+// an argument to `SetServiceStatus`; the SCM itself is thread-safe for that
+// call. `Sender<ServiceControl>` is already `Send + Sync` and `Mutex<u32>`
+// needs no special justification, so the entire `ContextInner` is sound to
+// share across threads.
 unsafe impl Send for ContextInner {}
+// SAFETY: Same reasoning as Send above — all fields are independently
+// thread-safe and no field is mutated without synchronisation.
 unsafe impl Sync for ContextInner {}
 
 /// Safe handle to the per-service status reporting + control-event stream.
@@ -170,6 +175,9 @@ impl ServiceContext {
             dwWaitHint: wait_hint_ms,
             ..Default::default()
         };
+        // SAFETY: `status_handle` was obtained from `RegisterServiceCtrlHandlerExW`
+        // and is valid for the process lifetime; `status` is a local struct on the
+        // stack whose pointer is only used for the duration of this call.
         unsafe {
             SetServiceStatus(self.inner.status_handle, &status as *const SERVICE_STATUS)
                 .map_err(|e: WinError| map_win_error("SetServiceStatus", e))
@@ -234,6 +242,10 @@ pub fn run_service_dispatcher<L: ServiceLifecycle>(service_name: &str, lifecycle
         },
     ];
 
+    // SAFETY: `table` is a valid null-terminated `SERVICE_TABLE_ENTRYW` array;
+    // `name_wide` stays alive until this call returns (it is on the stack above
+    // and we call `clone()` before any move). The SCM dispatcher owns the thread
+    // until the service stops.
     unsafe {
         StartServiceCtrlDispatcherW(table.as_ptr())
             .map_err(|e| map_win_error("StartServiceCtrlDispatcher", e))?;
@@ -269,6 +281,10 @@ extern "system" fn service_main_thunk(_argc: u32, _argv: *mut PWSTR) {
     let inner_ptr = inner as *mut ContextInner;
     let _ = CONTEXT_PTR.set(inner_ptr as usize);
 
+    // SAFETY: `name_wide` is a null-terminated wide string alive for this call;
+    // `control_handler_thunk` has the correct `extern "system"` signature required
+    // by the API; `inner_ptr` points to the `'static` Box-leaked ContextInner so
+    // the pointer remains valid for the entire process lifetime.
     let status_handle = unsafe {
         match RegisterServiceCtrlHandlerExW(
             PCWSTR::from_raw(name_wide.as_ptr()),
@@ -303,6 +319,10 @@ extern "system" fn control_handler_thunk(
     if inner.is_null() {
         return 0;
     }
+    // SAFETY: `lpcontext` was set to `inner_ptr` (a Box-leaked ContextInner) in
+    // `service_main_thunk` and that pointer is valid for the process lifetime.
+    // We checked above that it is non-null. No mutable alias exists: the only
+    // mutation (status_handle backfill) completed before `lifecycle.run()`.
     let inner = unsafe { &*inner };
     let control = ServiceControl::from_win32(dwcontrol, dwevttype);
     let _ = inner.controls_tx.send(control);

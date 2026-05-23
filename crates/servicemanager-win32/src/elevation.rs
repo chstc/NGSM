@@ -9,6 +9,11 @@ use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 /// Return true if the current process token reports an elevated context
 /// (i.e. the user accepted UAC for this process, or is running as Administrator).
 pub fn is_elevated() -> bool {
+    // SAFETY: all Win32 calls here use validated inputs —`GetCurrentProcess`
+    // returns a pseudo-handle that never needs closing; `OpenProcessToken`
+    // writes a new token handle or returns an error; `GetTokenInformation`
+    // writes into a stack-allocated TOKEN_ELEVATION whose size is passed
+    // explicitly; `CloseHandle` is called on the token handle before return.
     unsafe {
         let process: HANDLE = GetCurrentProcess();
         let mut token: HANDLE = HANDLE::default();

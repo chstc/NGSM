@@ -34,6 +34,8 @@ pub struct ProcessInfo {
 /// Walk descendants of `root_pid` (inclusive) using the Toolhelp32 process
 /// snapshot. Order is breadth-first from the root.
 pub fn enumerate_descendants(root_pid: u32) -> Result<Vec<ProcessInfo>> {
+    // SAFETY: `TH32CS_SNAPPROCESS` with pid=0 is the documented way to snapshot
+    // all running processes; the returned handle is wrapped in HandleGuard.
     let snapshot = unsafe {
         CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
             .map_err(|e| Error::other(format!("CreateToolhelp32Snapshot: {e}")))?
@@ -48,6 +50,9 @@ pub fn enumerate_descendants(root_pid: u32) -> Result<Vec<ProcessInfo>> {
     let mut by_parent: HashMap<u32, Vec<ProcessInfo>> = HashMap::new();
     let mut by_pid: HashMap<u32, ProcessInfo> = HashMap::new();
 
+    // SAFETY: `snapshot` is a valid toolhelp snapshot handle (obtained above);
+    // `entry` is initialised with the correct `dwSize`; `Process32FirstW` and
+    // `Process32NextW` write into `entry` in-place per the API contract.
     unsafe {
         if Process32FirstW(snapshot, &mut entry).is_err() {
             return Ok(Vec::new());
@@ -99,6 +104,9 @@ pub fn enumerate_descendants(root_pid: u32) -> Result<Vec<ProcessInfo>> {
 pub fn suspend_process(pid: u32) -> Result<()> {
     let proc = open_for_suspend(pid)?;
     let f = nt_suspend_process()?;
+    // SAFETY: `f` is `NtSuspendProcess` resolved from `ntdll.dll` with the
+    // correct function signature; `proc.0` is a live process handle opened
+    // with `PROCESS_SUSPEND_RESUME` by `open_for_suspend`.
     let status = unsafe { f(proc.0) };
     if status != 0 {
         return Err(Error::other(format!(
@@ -112,6 +120,9 @@ pub fn suspend_process(pid: u32) -> Result<()> {
 pub fn resume_process(pid: u32) -> Result<()> {
     let proc = open_for_suspend(pid)?;
     let f = nt_resume_process()?;
+    // SAFETY: `f` is `NtResumeProcess` resolved from `ntdll.dll` with the
+    // correct function signature; `proc.0` is a live process handle opened
+    // with `PROCESS_SUSPEND_RESUME` by `open_for_suspend`.
     let status = unsafe { f(proc.0) };
     if status != 0 {
         return Err(Error::other(format!(
@@ -179,6 +190,11 @@ fn nt_resume_process() -> Result<NtProcessFn> {
 }
 
 fn load_ntdll_fn(name_with_nul: &str) -> Result<NtProcessFn> {
+    // SAFETY: `ntdll.dll` is always loaded in every Windows process; `s!` is a
+    // null-terminated literal; `name_with_nul` is required by callers to end
+    // with `\0`. The transmute converts the opaque `FARPROC` to the concrete
+    // `NtProcessFn` type — both are function pointers with the `extern "system"`
+    // calling convention and a single `HANDLE` argument, so the cast is sound.
     unsafe {
         let module = GetModuleHandleA(s!("ntdll.dll"))
             .map_err(|e| Error::other(format!("GetModuleHandle(ntdll): {e}")))?;
@@ -203,6 +219,8 @@ struct HandleGuard(HANDLE);
 impl Drop for HandleGuard {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
+            // SAFETY: `self.0` is a process handle obtained from `OpenProcess`;
+            // `is_invalid()` guards against a null handle.
             unsafe {
                 let _ = CloseHandle(self.0);
             }

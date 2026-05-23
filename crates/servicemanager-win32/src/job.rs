@@ -20,9 +20,11 @@ use crate::handles::win32_code;
 
 pub struct JobObject(HANDLE);
 
-// `HANDLE` is `Send + Sync` in windows-rs; the OS handle itself can be used
-// from any thread.
+// SAFETY: `HANDLE` is an opaque OS-managed pointer that is safe to send between
+// threads; every Win32 job-object call is internally synchronized by the kernel.
 unsafe impl Send for JobObject {}
+// SAFETY: All methods take `&self` and rely solely on kernel-level
+// synchronisation for the underlying job-object handle.
 unsafe impl Sync for JobObject {}
 
 impl JobObject {
