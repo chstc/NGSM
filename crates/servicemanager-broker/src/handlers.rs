@@ -1,29 +1,15 @@
 //! Broker request dispatch — thin wrappers that translate JSON args into
-//! [`servicemanager-win32`] / [`servicemanager-registry`] calls. Each
-//! handler returns a `serde_json::Value` (or an error message) so the
-//! pipe-layer code stays generic.
+//! [`servicemanager_ops`] calls. Each handler returns a `serde_json::Value`
+//! (or an error message) so the pipe-layer code stays generic.
 
 use serde::Deserialize;
 use serde_json::{json, Value};
-use servicemanager_core::{
-    IoRedirectionConfig, IoStream, ManagedApplicationConfig, ServiceDefinition,
-};
+use servicemanager_core::ServiceDefinition;
+use servicemanager_ops::{EditSpec, InstallSpec};
 use servicemanager_win32::{
-    build_run_service_command, control_service, enumerate_descendants, enumerate_services,
-    install_service, query_service, remove_service, start_service, update_native_config,
-    InstallOptions, InstallStartType, ServiceControlSignal, SERVICE_CONTROL_ROTATE,
+    control_service, enumerate_descendants, query_service, start_service, update_native_config,
+    InstallStartType, ServiceControlSignal,
 };
-
-/// Wrap a log-file path in a plain [`IoStream`] (default share/disposition).
-fn io_stream(path: String) -> IoStream {
-    IoStream {
-        path,
-        share_mode: None,
-        creation_disposition: None,
-        flags_and_attributes: None,
-        copy_and_truncate: None,
-    }
-}
 
 use crate::protocol::Request;
 
@@ -142,49 +128,14 @@ fn parse_start_type(s: &str) -> Result<InstallStartType, String> {
 
 fn op_list(args: &Value) -> Result<Value, String> {
     let args: ListArgs = parse_args(args)?;
-    let services = enumerate_services().map_err(|e| e.to_string())?;
-    let mut warnings: Vec<String> = Vec::new();
-    let mut definitions: Vec<ServiceDefinition> = services
+    let (all_defs, warnings) = servicemanager_ops::list_services().map_err(|e| e.to_string())?;
+    let definitions: Vec<servicemanager_core::ServiceDefinition> = all_defs
         .into_iter()
-        .map(|s| {
-            // A failed SCM config query during enumeration left this entry
-            // with only partial data — surface it rather than silently
-            // classifying the service from incomplete fields.
-            if let Some(w) = s.query_error {
-                warnings.push(w);
-            }
-            // A genuine managed-config read failure (access denied, corrupt
-            // value) is kept as a warning rather than collapsed into "not
-            // managed" — the same behaviour the CLI and GUI list flows have.
-            let managed = match servicemanager_registry::read_managed_config(&s.config.name) {
-                Ok(m) => m,
-                Err(e) => {
-                    warnings.push(format!(
-                        "{}: managed config unreadable ({e})",
-                        s.config.name
-                    ));
-                    None
-                }
-            };
-            ServiceDefinition {
-                native: s.config,
-                managed,
-                runtime: s.runtime,
-            }
-        })
         .filter(|d| match args.filter {
-            // Use the shared classifier so the broker's managed filter
-            // agrees with the CLI and GUI.
             ListFilterArg::Managed => d.is_managed(),
             ListFilterArg::All => true,
         })
         .collect();
-    definitions.sort_by(|a, b| {
-        a.native
-            .name
-            .to_lowercase()
-            .cmp(&b.native.name.to_lowercase())
-    });
     Ok(json!({ "services": definitions, "warnings": warnings }))
 }
 
@@ -203,146 +154,83 @@ fn op_dump(args: &Value) -> Result<Value, String> {
 
 fn op_install(args: &Value) -> Result<Value, String> {
     let a: InstallArgs = parse_args(args)?;
-    if a.application.trim().is_empty() {
-        return Err("application path is required".into());
-    }
-    // Validate and build everything that can fail *before* touching the SCM,
-    // so a bad argument never leaves an orphaned service behind.
     let start_type = parse_start_type(&a.start_type)?;
-    let binary_path = build_run_service_command(&a.name).map_err(|e| e.to_string())?;
-    let display = a.display_name.clone().unwrap_or_else(|| a.name.clone());
-    let managed = ManagedApplicationConfig {
-        application: Some(a.application.clone()),
-        app_parameters: a.app_parameters.clone(),
-        app_directory: a.app_directory.clone(),
-        io: IoRedirectionConfig {
-            stdin: None,
-            stdout: a.stdout.clone().map(io_stream),
-            stderr: a.stderr.clone().map(io_stream),
-            timestamp_log: None,
-        },
-        ..Default::default()
-    };
-
-    install_service(&InstallOptions {
+    let spec = InstallSpec {
         name: a.name.clone(),
-        display_name: display,
-        binary_path,
+        display_name: a.display_name,
+        application: a.application,
+        app_parameters: a.app_parameters,
+        app_directory: a.app_directory,
+        stdout: a.stdout,
+        stderr: a.stderr,
         start_type,
-    })
-    .map_err(|e| e.to_string())?;
-
-    // If the managed config cannot be written, the SCM service we just
-    // created has no usable config — roll it back so we do not leave a
-    // broken service behind.
-    if let Err(e) = servicemanager_registry::create_managed_config(&a.name, &managed) {
-        return Err(match remove_service(&a.name) {
-            Ok(()) => format!("install failed, service rolled back: {e}"),
-            Err(re) => format!("install failed ({e}); rollback also failed ({re})"),
-        });
-    }
+    };
+    servicemanager_ops::install(spec)?;
     Ok(json!({ "installed": a.name }))
 }
 
 fn op_remove(args: &Value) -> Result<Value, String> {
     let a: RemoveArgs = parse_args(args)?;
-    // Refuse to delete a service that is not NGSM/NSSM-managed unless the
-    // caller explicitly opts in — a `remove` request must not be able to
-    // wipe an arbitrary native Windows service.
-    if !a.force_native {
-        let native = query_service(&a.name).map_err(|e| e.to_string())?;
-        // Fail closed: if the managed config cannot be read we genuinely
-        // cannot tell whether this service is ours, so refuse rather than
-        // guess. `force_native` is the explicit override.
-        let managed = match servicemanager_registry::read_managed_config(&a.name) {
-            Ok(m) => m,
-            Err(e) => {
-                return Err(format!(
-                    "'{}': managed ownership cannot be determined — its managed config is \
-                     unreadable ({e}); set \"force_native\": true to remove it anyway",
-                    a.name
-                ))
-            }
-        };
-        let def = ServiceDefinition {
-            native: native.config,
-            managed,
-            runtime: native.runtime,
-        };
-        if !def.is_managed() {
-            return Err(format!(
-                "'{}' is not an NGSM-managed service; set \"force_native\": true to remove a native service",
-                a.name
-            ));
-        }
-    }
-    // Remove the SCM service first: if that fails the service keeps its
-    // managed config and the caller can retry. Only then scrub the registry,
-    // and surface a cleanup failure instead of silently dropping it.
-    remove_service(&a.name).map_err(|e| e.to_string())?;
-    servicemanager_registry::delete_managed_config(&a.name)
-        .map_err(|e| format!("service removed, but managed config cleanup failed: {e}"))?;
+    // Delegate to ops — enforces NGSM-managed check and the M-03 stopped-state
+    // check (the old broker remove lacked the stopped check; this is now added).
+    servicemanager_ops::remove(&a.name, a.force_native, true)?;
     Ok(json!({ "removed": a.name }))
-}
-
-/// Refuse a lifecycle control on a service that is not NGSM-managed unless
-/// the caller passed `force_native`. Fails closed when the managed config
-/// cannot be read. Shared by start/stop/restart/pause/continue.
-fn require_managed_or_force(name: &str, force_native: bool) -> Result<(), String> {
-    if force_native {
-        return Ok(());
-    }
-    let native = query_service(name).map_err(|e| e.to_string())?;
-    let managed = match servicemanager_registry::read_managed_config(name) {
-        Ok(m) => m,
-        Err(e) => {
-            return Err(format!(
-                "'{name}': managed ownership cannot be determined — its managed config is \
-                 unreadable ({e}); set \"force_native\": true to act on it anyway"
-            ))
-        }
-    };
-    let def = ServiceDefinition {
-        native: native.config,
-        managed,
-        runtime: native.runtime,
-    };
-    if def.is_managed() {
-        Ok(())
-    } else {
-        Err(format!(
-            "'{name}' is not an NGSM-managed service — set \"force_native\": true to \
-             control a native Windows service"
-        ))
-    }
 }
 
 fn op_start(args: &Value) -> Result<Value, String> {
     let a: LifecycleArgs = parse_args(args)?;
-    require_managed_or_force(&a.name, a.force_native)?;
-    start_service(&a.name).map_err(|e| e.to_string())?;
+    if a.force_native {
+        // Bypass NGSM-managed check — call win32 directly.
+        start_service(&a.name).map_err(|e| e.to_string())?;
+    } else {
+        servicemanager_ops::start(&a.name)?;
+    }
     Ok(json!({ "started": a.name }))
 }
 
 fn op_stop(args: &Value) -> Result<Value, String> {
     let a: LifecycleArgs = parse_args(args)?;
-    require_managed_or_force(&a.name, a.force_native)?;
-    let state = control_service(&a.name, ServiceControlSignal::Stop).map_err(|e| e.to_string())?;
-    Ok(json!({ "stopped": a.name, "state": format!("{:?}", state.state) }))
+    if a.force_native {
+        // Bypass NGSM-managed check — call win32 directly and return state.
+        let state =
+            control_service(&a.name, ServiceControlSignal::Stop).map_err(|e| e.to_string())?;
+        return Ok(json!({ "stopped": a.name, "state": format!("{:?}", state.state) }));
+    }
+    // ops::stop enforces the NGSM-managed check internally.
+    servicemanager_ops::stop(&a.name)?;
+    // Query post-op state to maintain the wire-level { "state": ... } field
+    // that broker clients depend on.
+    let state_str = query_service(&a.name)
+        .ok()
+        .and_then(|s| s.runtime)
+        .map(|r| format!("{:?}", r.state))
+        .unwrap_or_default();
+    Ok(json!({ "stopped": a.name, "state": state_str }))
 }
 
 fn op_restart(args: &Value) -> Result<Value, String> {
+    let a: LifecycleArgs = parse_args(args)?;
+    if a.force_native {
+        // Bypass NGSM-managed check — implement restart loop locally.
+        op_restart_force_native(&a.name)?;
+    } else {
+        servicemanager_ops::restart(&a.name)?;
+    }
+    Ok(json!({ "restarted": a.name }))
+}
+
+/// Restart implementation for `force_native: true`: bypasses the NGSM-managed
+/// check and uses a fixed 30-second stop-wait deadline.
+fn op_restart_force_native(name: &str) -> Result<(), String> {
     use servicemanager_core::ServiceState;
     use std::thread::sleep;
     use std::time::{Duration, Instant};
 
-    let a: LifecycleArgs = parse_args(args)?;
-    require_managed_or_force(&a.name, a.force_native)?;
-    let snapshot = query_service(&a.name).map_err(|e| e.to_string())?;
+    let snapshot = query_service(name).map_err(|e| e.to_string())?;
     let initial = snapshot.runtime.as_ref().map(|r| r.state);
     let needs_stop = !matches!(initial, Some(ServiceState::Stopped) | None);
     if needs_stop {
-        match control_service(&a.name, ServiceControlSignal::Stop) {
+        match control_service(name, ServiceControlSignal::Stop) {
             Ok(_) => {}
             Err(e) => {
                 let msg = e.to_string();
@@ -353,7 +241,7 @@ fn op_restart(args: &Value) -> Result<Value, String> {
         }
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let snap = query_service(&a.name).map_err(|e| e.to_string())?;
+            let snap = query_service(name).map_err(|e| e.to_string())?;
             if matches!(
                 snap.runtime.as_ref().map(|r| r.state),
                 Some(ServiceState::Stopped)
@@ -361,143 +249,114 @@ fn op_restart(args: &Value) -> Result<Value, String> {
                 break;
             }
             if Instant::now() >= deadline {
-                return Err(format!("'{}' did not stop within 30 s", a.name));
+                return Err(format!("'{name}' did not stop within 30 s"));
             }
             sleep(Duration::from_millis(200));
         }
         sleep(Duration::from_millis(250));
     }
-    start_service(&a.name).map_err(|e| e.to_string())?;
-    Ok(json!({ "restarted": a.name }))
+    start_service(name).map_err(|e| e.to_string())
 }
 
 fn op_edit(args: &Value) -> Result<Value, String> {
     let a: EditArgs = parse_args(args)?;
     let want_native = a.display_name.is_some() || a.start_type.is_some();
-    let want_managed = a.application.is_some()
-        || a.app_parameters.is_some()
-        || a.app_directory.is_some()
-        || a.stdout.is_some()
-        || a.stderr.is_some();
 
-    // Ownership preflight before any mutation. Managed-field edits require
-    // an NGSM-managed service; a native-only edit also requires NGSM
-    // ownership unless `force_native` — `edit` must not silently alter
-    // arbitrary native Windows services.
-    let managed_cfg =
-        servicemanager_registry::read_managed_config(&a.name).map_err(|e| e.to_string())?;
-    if want_managed && managed_cfg.is_none() {
-        return Err(format!(
-            "'{}' is not an NGSM-managed service; managed fields can only be edited on a \
-             managed service",
-            a.name
-        ));
-    }
-    if want_native && !a.force_native {
-        let owned = managed_cfg.is_some() || {
-            let native = query_service(&a.name).map_err(|e| e.to_string())?;
-            ServiceDefinition {
-                native: native.config,
-                managed: None,
-                runtime: native.runtime,
+    // When force_native is set for a native-only SCM edit, ops::edit cannot
+    // be used (it enforces NGSM-managed ownership). Apply the native change
+    // directly; reject any managed-field combination in the same call.
+    if a.force_native && want_native {
+        let want_managed = a.application.is_some()
+            || a.app_parameters.is_some()
+            || a.app_directory.is_some()
+            || a.stdout.is_some()
+            || a.stderr.is_some();
+        if want_managed {
+            let managed_cfg =
+                servicemanager_registry::read_managed_config(&a.name).map_err(|e| e.to_string())?;
+            if managed_cfg.is_none() {
+                return Err(format!(
+                    "'{}' is not an NGSM-managed service; managed fields can only be edited on a \
+                     managed service",
+                    a.name
+                ));
             }
-            .is_managed()
-        };
-        if !owned {
-            return Err(format!(
-                "'{}' is not an NGSM-managed service — set \"force_native\": true to \
-                 change a native service's SCM config",
-                a.name
-            ));
         }
+        let start = match a.start_type.as_deref() {
+            Some(s) => Some(parse_start_type(s)?),
+            None => None,
+        };
+        update_native_config(&a.name, a.display_name.as_deref(), start)
+            .map_err(|e| e.to_string())?;
+        return Ok(json!({ "edited": a.name }));
     }
-    let managed_base = if want_managed { managed_cfg } else { None };
 
-    // Parse (and so validate) the native start type up front, before any
-    // mutation runs.
+    // Delegate to ops — enforces NGSM-managed ownership internally.
     let start = match a.start_type.as_deref() {
         Some(s) => Some(parse_start_type(s)?),
         None => None,
     };
-
-    // Managed (NSSM-owned) changes go first: validate every managed value
-    // and complete the registry write *before* touching native SCM state,
-    // so a rejected value or a failed write cannot leave a half-applied
-    // edit with the native display name / start type already changed.
-    if let Some(mut managed) = managed_base {
-        if let Some(v) = a.application {
-            // An empty `Application` would make the service read back as
-            // non-managed; reject it instead of corrupting the config.
-            if v.trim().is_empty() {
-                return Err("application path must not be empty".into());
-            }
-            managed.application = Some(v);
-        }
-        if let Some(v) = a.app_parameters {
-            managed.app_parameters = Some(v);
-        }
-        if let Some(v) = a.app_directory {
-            managed.app_directory = Some(v);
-        }
-        if let Some(v) = a.stdout {
-            // An empty path means "clear"; the registry reconcile then drops
-            // the value rather than writing a blank one.
-            managed.io.stdout = if v.is_empty() {
-                None
-            } else {
-                Some(io_stream(v))
-            };
-        }
-        if let Some(v) = a.stderr {
-            managed.io.stderr = if v.is_empty() {
-                None
-            } else {
-                Some(io_stream(v))
-            };
-        }
-        servicemanager_registry::write_managed_config(&a.name, &managed)
-            .map_err(|e| e.to_string())?;
-    }
-
-    if want_native {
-        update_native_config(&a.name, a.display_name.as_deref(), start)
-            .map_err(|e| e.to_string())?;
-    }
+    let spec = EditSpec {
+        name: a.name.clone(),
+        display_name: a.display_name,
+        application: a.application,
+        app_parameters: a.app_parameters,
+        app_directory: a.app_directory,
+        stdout: a.stdout,
+        stderr: a.stderr,
+        start_type: start,
+    };
+    servicemanager_ops::edit(spec)?;
     Ok(json!({ "edited": a.name }))
 }
 
 fn op_rotate(args: &Value) -> Result<Value, String> {
     let a: NameArg = parse_args(args)?;
-    // On-demand rotation only acts on online (pipe-backed) logs; offline
-    // logs rotate on restart. Refuse rather than report a false success.
-    match servicemanager_registry::read_managed_config(&a.name).map_err(|e| e.to_string())? {
-        Some(cfg) if cfg.has_online_rotation() => {}
-        Some(_) => {
-            return Err(format!(
-                "'{}' does not use online log rotation — its logs rotate on restart, \
-                 not on demand",
-                a.name
-            ))
-        }
-        None => return Err(format!("'{}' is not an NGSM-managed service", a.name)),
-    }
-    let state = control_service(&a.name, ServiceControlSignal::User(SERVICE_CONTROL_ROTATE))
-        .map_err(|e| e.to_string())?;
-    Ok(json!({ "rotated": a.name, "state": format!("{:?}", state.state) }))
+    // ops::rotate validates online-rotation preflight and issues the control
+    // signal, but does not return post-op state. Query after the fact to
+    // maintain the wire-level { "state": ... } field that clients depend on.
+    servicemanager_ops::rotate(&a.name)?;
+    let state_str = query_service(&a.name)
+        .ok()
+        .and_then(|s| s.runtime)
+        .map(|r| format!("{:?}", r.state))
+        .unwrap_or_default();
+    Ok(json!({ "rotated": a.name, "state": state_str }))
 }
 
 fn op_pause(args: &Value) -> Result<Value, String> {
     let a: LifecycleArgs = parse_args(args)?;
-    require_managed_or_force(&a.name, a.force_native)?;
-    let state = control_service(&a.name, ServiceControlSignal::Pause).map_err(|e| e.to_string())?;
+    let state = if a.force_native {
+        control_service(&a.name, ServiceControlSignal::Pause).map_err(|e| e.to_string())?
+    } else {
+        servicemanager_ops::pause(&a.name)?;
+        return Ok(json!({
+            "paused": a.name,
+            "state": query_service(&a.name)
+                .ok()
+                .and_then(|s| s.runtime)
+                .map(|r| format!("{:?}", r.state))
+                .unwrap_or_default()
+        }));
+    };
     Ok(json!({ "paused": a.name, "state": format!("{:?}", state.state) }))
 }
 
 fn op_continue(args: &Value) -> Result<Value, String> {
     let a: LifecycleArgs = parse_args(args)?;
-    require_managed_or_force(&a.name, a.force_native)?;
-    let state =
-        control_service(&a.name, ServiceControlSignal::Continue).map_err(|e| e.to_string())?;
+    let state = if a.force_native {
+        control_service(&a.name, ServiceControlSignal::Continue).map_err(|e| e.to_string())?
+    } else {
+        servicemanager_ops::continue_service(&a.name)?;
+        return Ok(json!({
+            "continued": a.name,
+            "state": query_service(&a.name)
+                .ok()
+                .and_then(|s| s.runtime)
+                .map(|r| format!("{:?}", r.state))
+                .unwrap_or_default()
+        }));
+    };
     Ok(json!({ "continued": a.name, "state": format!("{:?}", state.state) }))
 }
 
