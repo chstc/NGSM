@@ -7,6 +7,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Kind of lifecycle event recorded in `%ProgramData%\NGSM\events.log`.
+///
+/// **Append-only.** Variants of this enum are part of the persistent
+/// on-disk schema. New variants may be ADDED at the end safely — older
+/// readers will silently skip lines containing the unknown variant
+/// (acceptable degradation), but the records are NOT lost from the file.
+/// **RENAMING or REMOVING a variant is a breaking change** to the schema
+/// — bump `EventRecord`-level versioning before doing so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
@@ -17,6 +25,7 @@ pub enum EventKind {
     Throttled,
 }
 
+/// Reason the supervisor stopped. **Append-only** — see [`EventKind`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {

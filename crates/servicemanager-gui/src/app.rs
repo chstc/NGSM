@@ -20,6 +20,9 @@ struct AppState {
     job_tx: Sender<Job>,
     result_rx: Receiver<JobResult>,
     defs: Vec<ServiceDefinition>,
+    /// Startup-time warning (e.g. corrupt config.json), shown persistently
+    /// alongside per-scan warnings. `None` when config loaded cleanly.
+    startup_warning: Option<String>,
     /// Per-service warnings from the most recent scan (unreadable config, ...).
     warnings: Vec<String>,
     managed_only: bool,
@@ -105,7 +108,9 @@ pub fn build_ui() -> Result<MainWindow, slint::PlatformError> {
     );
 
     // Load persisted preferences and seed the window from them.
-    let config = config::load();
+    let config_load = config::load();
+    let config_startup_warning = config_load.warning;
+    let config = config_load.config;
     window.set_auto_refresh(config.auto_refresh);
     window.set_managed_only(config.managed_only);
     window.set_auto_refresh_secs(config.auto_refresh_secs as i32);
@@ -125,6 +130,7 @@ pub fn build_ui() -> Result<MainWindow, slint::PlatformError> {
             job_tx: job_tx.clone(),
             result_rx,
             defs: Vec::new(),
+            startup_warning: config_startup_warning,
             warnings: Vec::new(),
             managed_only: config.managed_only,
             running_only: false,
@@ -655,20 +661,29 @@ fn drain_results() {
                     st.defs = defs;
                     st.warnings = warnings;
                     st.event_records = events;
+                    // Merge the persistent startup warning (e.g. corrupt
+                    // config.json) with per-scan service warnings so it
+                    // survives across refreshes.
+                    let all_warnings: Vec<String> = st
+                        .startup_warning
+                        .iter()
+                        .chain(st.warnings.iter())
+                        .cloned()
+                        .collect();
                     let base = format!("{} services", st.defs.len());
                     win.set_status_text(
-                        if st.warnings.is_empty() {
+                        if all_warnings.is_empty() {
                             base
                         } else {
                             format!(
                                 "{base}  —  {} with unreadable config (click for details)",
-                                st.warnings.len()
+                                all_warnings.len()
                             )
                         }
                         .into(),
                     );
                     let shared: Vec<slint::SharedString> =
-                        st.warnings.iter().map(|w| w.as_str().into()).collect();
+                        all_warnings.iter().map(|w| w.as_str().into()).collect();
                     win.set_warnings(slint::ModelRc::new(slint::VecModel::from(shared)));
                     apply_snapshot(&win, st);
                 }

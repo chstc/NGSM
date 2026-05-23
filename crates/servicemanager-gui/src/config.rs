@@ -7,9 +7,18 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+fn default_config_version() -> u32 {
+    1
+}
+
 /// User preferences persisted between sessions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
+    /// On-disk schema version. Files written by NGSM ≤0.2.0 lack this
+    /// field; serde defaults it to 1. Bump when introducing a breaking
+    /// change to the on-disk layout.
+    #[serde(default = "default_config_version")]
+    pub v: u32,
     pub auto_refresh: bool,
     pub auto_refresh_secs: u32,
     pub managed_only: bool,
@@ -18,6 +27,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            v: 1,
             auto_refresh: false,
             auto_refresh_secs: 5,
             managed_only: true,
@@ -25,10 +35,28 @@ impl Default for Config {
     }
 }
 
-/// Parse config JSON, falling back to built-in defaults on any error (missing
-/// keys, corrupt syntax) so a bad file never breaks startup.
-pub fn parse_config(text: &str) -> Config {
-    serde_json::from_str(text).unwrap_or_default()
+/// Parse result: the resolved `Config` plus an optional warning string
+/// when the input was corrupt (parse error). Missing-file is NOT a
+/// corruption — callers handle that case separately and get no warning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigLoad {
+    pub config: Config,
+    pub warning: Option<String>,
+}
+
+/// Parse config JSON. On parse failure, returns defaults with a warning
+/// describing what couldn't be parsed.
+pub fn parse_config(text: &str) -> ConfigLoad {
+    match serde_json::from_str::<Config>(text) {
+        Ok(config) => ConfigLoad {
+            config,
+            warning: None,
+        },
+        Err(e) => ConfigLoad {
+            config: Config::default(),
+            warning: Some(format!("config.json is corrupt — using defaults: {e}")),
+        },
+    }
 }
 
 /// Serialise preferences to pretty JSON.
@@ -42,15 +70,22 @@ fn config_path() -> Option<PathBuf> {
     Some(PathBuf::from(appdata).join("NGSM").join("config.json"))
 }
 
-/// Load preferences, returning built-in defaults if the file is missing,
-/// unreadable, or corrupt.
-pub fn load() -> Config {
+/// Load preferences from `%APPDATA%\NGSM\config.json`. Returns defaults
+/// with no warning if the file is missing; defaults with a warning if
+/// the file exists but is corrupt.
+pub fn load() -> ConfigLoad {
     let Some(path) = config_path() else {
-        return Config::default();
+        return ConfigLoad {
+            config: Config::default(),
+            warning: None,
+        };
     };
     match std::fs::read_to_string(&path) {
         Ok(text) => parse_config(&text),
-        Err(_) => Config::default(),
+        Err(_) => ConfigLoad {
+            config: Config::default(),
+            warning: None,
+        },
     }
 }
 
@@ -72,6 +107,7 @@ mod tests {
     #[test]
     fn default_config_has_expected_values() {
         let c = Config::default();
+        assert_eq!(c.v, 1);
         assert!(!c.auto_refresh);
         assert_eq!(c.auto_refresh_secs, 5);
         assert!(c.managed_only);
@@ -80,16 +116,29 @@ mod tests {
     #[test]
     fn config_round_trips_through_json() {
         let c = Config {
+            v: 1,
             auto_refresh: true,
             auto_refresh_secs: 30,
             managed_only: false,
         };
-        assert_eq!(parse_config(&to_json(&c).expect("serialises")), c);
+        assert_eq!(parse_config(&to_json(&c).expect("serialises")).config, c);
     }
 
     #[test]
     fn parse_config_falls_back_on_corrupt_input() {
-        assert_eq!(parse_config("not json at all }"), Config::default());
-        assert_eq!(parse_config(""), Config::default());
+        let bad = parse_config("not json at all }");
+        assert_eq!(bad.config, Config::default());
+        assert!(bad.warning.is_some());
+        let empty = parse_config("");
+        assert_eq!(empty.config, Config::default());
+        assert!(empty.warning.is_some());
+    }
+
+    #[test]
+    fn parse_config_accepts_v_field_missing_and_defaults_to_one() {
+        let no_v = r#"{"auto_refresh":true,"auto_refresh_secs":30,"managed_only":false}"#;
+        let result = parse_config(no_v);
+        assert_eq!(result.config.v, 1);
+        assert!(result.warning.is_none());
     }
 }
