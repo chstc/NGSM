@@ -573,21 +573,44 @@ fn save_recovery(spec: RecoverySpec) -> Result<String, String> {
 }
 
 /// Read the last ~64 KiB of a file and return up to its last 400 lines.
+///
+/// Decodes as UTF-8 by default. If the file starts with a UTF-16 BOM
+/// (`FF FE` or `FE FF`) the tail is decoded as UTF-16 with the
+/// appropriate endianness, aligned to the BOM. A UTF-8 BOM
+/// (`EF BB BF`) is recognised but does not change behavior.
 fn tail_file(path: &str) -> std::io::Result<Vec<String>> {
     use std::io::{Read, Seek, SeekFrom};
     const TAIL: u64 = 64 * 1024;
     let mut f = std::fs::File::open(path)?;
     let len = f.metadata()?.len();
-    let partial = len > TAIL;
-    if partial {
-        f.seek(SeekFrom::Start(len - TAIL))?;
+
+    // Peek the first 4 bytes to detect a BOM. Encoding is determined
+    // by what we find at byte 0.
+    let mut head = [0u8; 4];
+    let head_read = {
+        let n_to_read = (len.min(4)) as usize;
+        if n_to_read > 0 {
+            f.seek(SeekFrom::Start(0))?;
+            f.read_exact(&mut head[..n_to_read])?;
+        }
+        n_to_read
+    };
+    let encoding = detect_encoding(&head[..head_read]);
+
+    // Compute the tail start. For UTF-16 align to a 2-byte boundary
+    // (relative to the file start) so we don't slice mid-code-unit.
+    let mut tail_start = len.saturating_sub(TAIL);
+    if matches!(encoding, TailEncoding::Utf16Le | TailEncoding::Utf16Be) && tail_start % 2 != 0 {
+        tail_start += 1;
     }
-    let mut buf = Vec::new();
+    let partial = tail_start > 0;
+
+    f.seek(SeekFrom::Start(tail_start))?;
+    let mut buf = Vec::with_capacity(TAIL as usize);
     f.read_to_end(&mut buf)?;
-    let mut lines: Vec<String> = String::from_utf8_lossy(&buf)
-        .lines()
-        .map(|l| l.to_string())
-        .collect();
+
+    let text = decode_tail(&buf, encoding);
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     // A mid-file seek leaves the first line truncated — drop it.
     if partial && !lines.is_empty() {
         lines.remove(0);
@@ -597,4 +620,113 @@ fn tail_file(path: &str) -> std::io::Result<Vec<String>> {
         lines.drain(0..extra);
     }
     Ok(lines)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TailEncoding {
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+}
+
+fn detect_encoding(head: &[u8]) -> TailEncoding {
+    if head.len() >= 2 && head[0] == 0xFF && head[1] == 0xFE {
+        TailEncoding::Utf16Le
+    } else if head.len() >= 2 && head[0] == 0xFE && head[1] == 0xFF {
+        TailEncoding::Utf16Be
+    } else {
+        TailEncoding::Utf8
+    }
+}
+
+fn decode_tail(buf: &[u8], encoding: TailEncoding) -> String {
+    match encoding {
+        TailEncoding::Utf8 => String::from_utf8_lossy(buf).into_owned(),
+        TailEncoding::Utf16Le => {
+            // Truncate to a whole code-unit count.
+            let n = (buf.len() / 2) * 2;
+            let codes: Vec<u16> = buf[..n]
+                .chunks_exact(2)
+                .map(|p| u16::from_le_bytes([p[0], p[1]]))
+                .collect();
+            String::from_utf16_lossy(&codes)
+        }
+        TailEncoding::Utf16Be => {
+            let n = (buf.len() / 2) * 2;
+            let codes: Vec<u16> = buf[..n]
+                .chunks_exact(2)
+                .map(|p| u16::from_be_bytes([p[0], p[1]]))
+                .collect();
+            String::from_utf16_lossy(&codes)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_temp(bytes: &[u8]) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(bytes).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[test]
+    fn tail_decodes_utf8_without_bom() {
+        let f = write_temp(b"hello\nworld\n");
+        let lines = tail_file(f.path().to_str().unwrap()).unwrap();
+        assert_eq!(lines, vec!["hello".to_string(), "world".to_string()]);
+    }
+
+    #[test]
+    fn tail_decodes_utf8_with_bom() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"hello\nworld\n");
+        let f = write_temp(&bytes);
+        let lines = tail_file(f.path().to_str().unwrap()).unwrap();
+        // The first "line" includes the BOM chars at the start; the
+        // line content after that is still ASCII.
+        assert!(lines.iter().any(|l| l.contains("hello")));
+        assert!(lines.iter().any(|l| l.contains("world")));
+    }
+
+    #[test]
+    fn tail_decodes_utf16_le_with_bom() {
+        // "hi\n" in UTF-16 LE with BOM
+        let mut bytes = vec![0xFF, 0xFE];
+        for ch in "hi\n".chars() {
+            let mut units = [0u16; 2];
+            let s = ch.encode_utf16(&mut units);
+            for u in s {
+                bytes.extend_from_slice(&u.to_le_bytes());
+            }
+        }
+        let f = write_temp(&bytes);
+        let lines = tail_file(f.path().to_str().unwrap()).unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("hi")),
+            "expected 'hi' in {lines:?}"
+        );
+    }
+
+    #[test]
+    fn tail_decodes_utf16_be_with_bom() {
+        let mut bytes = vec![0xFE, 0xFF];
+        for ch in "hi\n".chars() {
+            let mut units = [0u16; 2];
+            let s = ch.encode_utf16(&mut units);
+            for u in s {
+                bytes.extend_from_slice(&u.to_be_bytes());
+            }
+        }
+        let f = write_temp(&bytes);
+        let lines = tail_file(f.path().to_str().unwrap()).unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("hi")),
+            "expected 'hi' in {lines:?}"
+        );
+    }
 }

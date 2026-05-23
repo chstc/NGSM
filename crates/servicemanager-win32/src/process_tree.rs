@@ -189,10 +189,12 @@ fn load_ntdll_fn(name_with_nul: &str) -> Result<NtProcessFn> {
                     name_with_nul.trim_end_matches('\0')
                 ))
             })?;
-        Ok(std::mem::transmute::<
-            unsafe extern "system" fn() -> isize,
-            NtProcessFn,
-        >(proc))
+        // Retyping a function pointer via raw-pointer cast is the
+        // documented idiom — direct transmute between two different
+        // fn-pointer signatures is UB on calling conventions like
+        // __stdcall (x86) where the callee cleans up the stack.
+        let raw: *const () = proc as *const ();
+        Ok(std::mem::transmute::<*const (), NtProcessFn>(raw))
     }
 }
 
