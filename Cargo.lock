@@ -4045,7 +4045,7 @@ dependencies = [
 
 [[package]]
 name = "servicemanager-broker"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4058,7 +4058,7 @@ dependencies = [
 
 [[package]]
 name = "servicemanager-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "embed-resource",
@@ -4074,7 +4074,7 @@ dependencies = [
 
 [[package]]
 name = "servicemanager-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4084,7 +4084,7 @@ dependencies = [
 
 [[package]]
 name = "servicemanager-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rfd",
  "serde",
@@ -4101,7 +4101,7 @@ dependencies = [
 
 [[package]]
 name = "servicemanager-registry"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "servicemanager-core",
  "thiserror 1.0.69",
@@ -4110,7 +4110,7 @@ dependencies = [
 
 [[package]]
 name = "servicemanager-runner"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "servicemanager-core",
  "servicemanager-registry",
@@ -4120,7 +4120,7 @@ dependencies = [
 
 [[package]]
 name = "servicemanager-supervisor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "os_pipe",
  "serde_json",
@@ -4133,7 +4133,7 @@ dependencies = [
 
 [[package]]
 name = "servicemanager-win32"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "servicemanager-core",

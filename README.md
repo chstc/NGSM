@@ -33,14 +33,21 @@ here with the equally permissive **0BSD** license.
 
 - **One self-contained binary.** `ngsm.exe` is the GUI, the CLI, and the
   service runner. It statically links the C runtime — no DLLs to ship.
-- **Desktop GUI** — double-click `ngsm.exe` to browse, install, and manage
-  services.
+- **Desktop GUI** — double-click `ngsm.exe` for a dashboard with live
+  service stats, install / edit / remove, a recovery-policy editor, a
+  Recent Events feed, and a settings view (auto-refresh, managed-only
+  filter persistence).
 - **Full CLI** — `install`, `remove`, `edit`, `list`, `status`,
   `start` / `stop` / `restart` / `pause` / `continue`, `rotate`,
   `get` / `set` / `unset`.
 - **Process supervision** — restart and throttle policies, per-exit-code
   actions (`AppExit`), and a Job Object so the whole process tree dies with
   the service.
+- **Persistent event log** — every supervisor records lifecycle events
+  (start, stop, restart, child exit, throttle) to
+  `%ProgramData%\NGSM\events.log` as JSON Lines, so the GUI's Recent Events
+  panel survives restarts and the history is observable from any tool that
+  can read a text file.
 - **Graceful shutdown** — CTRL+BREAK → WM_CLOSE → WM_QUIT → terminate, each
   step configurable.
 - **Log handling** — redirect stdout/stderr to files, with offline
