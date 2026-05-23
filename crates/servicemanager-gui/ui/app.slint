@@ -27,7 +27,13 @@ export component MainWindow inherits Window {
     in property <string> stat-total: "0";
     in property <string> stat-running: "0";
     in property <string> stat-stopped: "0";
-    in property <string> stat-attention: "0";
+    in property <string> stat-manual-start: "0";
+    in property <string> stat-failed: "0";
+    in property <string> stat-auto-recovering: "0";
+    in property <string> stat-availability-title: "Availability (30d)";
+    in property <string> stat-availability-value: "—";
+    in property <string> stat-availability-line: "";
+    in property <string> stat-availability-area: "";
     in property <[EventEntry]> events;
     in property <string> status-text;
     in property <[string]> warnings;
@@ -279,7 +285,13 @@ export component MainWindow inherits Window {
                         stat-total: root.stat-total;
                         stat-running: root.stat-running;
                         stat-stopped: root.stat-stopped;
-                        stat-attention: root.stat-attention;
+                        stat-manual-start: root.stat-manual-start;
+                        stat-failed: root.stat-failed;
+                        stat-auto-recovering: root.stat-auto-recovering;
+                        stat-availability-title: root.stat-availability-title;
+                        stat-availability-value: root.stat-availability-value;
+                        stat-availability-line: root.stat-availability-line;
+                        stat-availability-area: root.stat-availability-area;
                         events: root.events;
                     }
                     if root.view == 1 : ServicesView {

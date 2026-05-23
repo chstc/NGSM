@@ -794,7 +794,6 @@ fn apply_snapshot(win: &MainWindow, st: &mut AppState) {
     win.set_stat_total(stats.total.to_string().into());
     win.set_stat_running(stats.running.to_string().into());
     win.set_stat_stopped(stats.stopped.to_string().into());
-    win.set_stat_attention(stats.attention.to_string().into());
 
     // Recent Events: render from the supervisor's persistent log.
     use servicemanager_core::events::{EventKind as Ek, EventRecord};

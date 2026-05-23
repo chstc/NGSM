@@ -9,10 +9,25 @@ export struct EventEntry {
 
 export component DashboardView inherits Rectangle {
     background: transparent;
+
+    // Tile 1: Managed services (with Running sub-count).
     in property <string> stat-total: "0";
     in property <string> stat-running: "0";
+
+    // Tile 2: Stopped (with Manual-start sub-count).
     in property <string> stat-stopped: "0";
-    in property <string> stat-attention: "0";
+    in property <string> stat-manual-start: "0";
+
+    // Tile 3: Failed (with Auto-recovering sub-count).
+    in property <string> stat-failed: "0";
+    in property <string> stat-auto-recovering: "0";
+
+    // Tile 4: Availability (XXd) with sparkline.
+    in property <string> stat-availability-title: "Availability (30d)";
+    in property <string> stat-availability-value: "—";
+    in property <string> stat-availability-line: "";
+    in property <string> stat-availability-area: "";
+
     in property <[EventEntry]> events;
 
     VerticalLayout {
@@ -25,29 +40,30 @@ export component DashboardView inherits Rectangle {
                 title: "Managed services";
                 value: root.stat-total;
                 accent: Theme.green;
-                caption: "tracked by NGSM";
-                caption-value: "";
-            }
-            StatCard {
-                title: "Running";
-                value: root.stat-running;
-                accent: Theme.green;
-                caption: "healthy";
-                caption-value: "";
+                caption: "Running";
+                caption-value: root.stat-running;
             }
             StatCard {
                 title: "Stopped";
                 value: root.stat-stopped;
                 accent: Theme.cyan;
-                caption: "idle";
-                caption-value: "";
+                caption: "Manual start";
+                caption-value: root.stat-manual-start;
             }
             StatCard {
-                title: "Needs attention";
-                value: root.stat-attention;
+                title: "Failed";
+                value: root.stat-failed;
                 accent: Theme.amber;
-                caption: "auto-start, stopped";
-                caption-value: "";
+                caption: "Auto-recovering";
+                caption-value: root.stat-auto-recovering;
+            }
+            StatCard {
+                title: root.stat-availability-title;
+                value: root.stat-availability-value;
+                accent: Theme.green;
+                show-chart: true;
+                chart-line: root.stat-availability-line;
+                chart-area: root.stat-availability-area;
             }
         }
 
