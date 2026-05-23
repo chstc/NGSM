@@ -57,9 +57,10 @@ enum Command {
     Remove {
         /// Service name.
         name: String,
-        /// Also delete the managed config under `Parameters` (default: true).
-        #[arg(long, default_value_t = true)]
-        purge_config: bool,
+        /// Keep the NGSM-managed registry config when removing the service.
+        /// By default, `remove` scrubs the registry config too.
+        #[arg(long)]
+        no_purge_config: bool,
         /// Allow removing a service that is NOT NGSM/NSSM-managed. Without
         /// this flag `remove` refuses to delete native Windows services.
         #[arg(long, default_value_t = false)]
@@ -374,9 +375,9 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Install(args) => cmd_install(args, cli.json),
         Command::Remove {
             name,
-            purge_config,
+            no_purge_config,
             force_native,
-        } => cmd_remove(name, *purge_config, *force_native, cli.json),
+        } => cmd_remove(name, !no_purge_config, *force_native, cli.json),
         Command::Start { name, force_native } => {
             cmd_control(name, ServiceAction::Start, *force_native, cli.json)
         }
