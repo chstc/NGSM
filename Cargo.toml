@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 # Real minimum: the resolved dependency graph (image 1.88, clap 1.85,
 # slint/embed-resource) needs 1.88. Declaring less would make a
