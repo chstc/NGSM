@@ -13,5 +13,6 @@ Thumbs.db
 # Local working files — code-review notes and scratch build logs.
 # Not part of the project.
 /Findings.md
+/findings_*.md
 /build.log
 /check.log
