@@ -998,17 +998,13 @@ fn cmd_recovery(args: &RecoveryArgs, global_json: bool) -> Result<()> {
 }
 
 fn cmd_recovery_show(name: &str, json: bool) -> Result<()> {
-    let spec = servicemanager_ops::read_recovery(name).map_err(servicemanager_core::Error::other)?;
+    let spec =
+        servicemanager_ops::read_recovery(name).map_err(servicemanager_core::Error::other)?;
     if json {
         let exit_map: BTreeMap<&str, String> = spec
             .exit_actions
             .iter()
-            .map(|(code, action)| {
-                (
-                    code.as_str(),
-                    format!("{:?}", action).to_ascii_lowercase(),
-                )
-            })
+            .map(|(code, action)| (code.as_str(), format!("{:?}", action).to_ascii_lowercase()))
             .collect();
         println!(
             "{}",
@@ -1076,9 +1072,7 @@ fn cmd_recovery_set(name: &str, args: &RecoverySetArgs, json: bool) -> Result<()
             ))
         })?;
         let action = parse_exit_action(action_str).map_err(|e| {
-            servicemanager_core::Error::InvalidConfig(format!(
-                "exit-action '{raw}': {e}"
-            ))
+            servicemanager_core::Error::InvalidConfig(format!("exit-action '{raw}': {e}"))
         })?;
         exit_actions.insert(code_str.trim().to_string(), action);
     }
