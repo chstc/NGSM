@@ -44,8 +44,9 @@ pub fn compute_metrics(
     now: OffsetDateTime,
 ) -> DashboardMetrics {
     let counts = compute_counts(defs, events, now);
-    // Availability fields filled in by later tasks; default for now so this
-    // task ships a runnable build without breaking callers.
+    let window_start = now - time::Duration::days(30);
+    let timelines = build_service_timelines(defs, events, window_start, now);
+    let avail = compute_availability(&timelines, window_start, now);
     DashboardMetrics {
         total: counts.total,
         running: counts.running,
@@ -53,10 +54,158 @@ pub fn compute_metrics(
         manual_start: counts.manual_start,
         failed: counts.failed,
         auto_recovering: counts.auto_recovering,
-        availability_pct: 100.0,
-        availability_window_days: 30,
-        availability_daily: vec![100.0; 30],
+        availability_pct: avail.aggregate_pct,
+        availability_window_days: avail.window_days,
+        // Sparkline filled in by Task 6 (still uses aggregate as placeholder
+        // so the build stays green; a real per-bucket vec lands in Task 6).
+        availability_daily: vec![avail.aggregate_pct; 30],
         availability_unknown: false,
+    }
+}
+
+/// One service's up/down history across the 30-day window. Intervals are
+/// disjoint, ordered, and clipped to `[window_start, now]` so downstream
+/// clippers (per-day, per-window) can be O(n_intervals) without re-parsing.
+struct ServiceTimeline {
+    /// Per-service window start = `max(first_event_ts, global_window_start)`.
+    window_start: OffsetDateTime,
+    /// Up-intervals, oldest first.
+    intervals: Vec<(OffsetDateTime, OffsetDateTime)>,
+}
+
+struct AvailabilityResult {
+    aggregate_pct: f32,
+    window_days: u32,
+}
+
+fn build_service_timelines(
+    defs: &[ServiceDefinition],
+    events: &[EventRecord],
+    window_start: OffsetDateTime,
+    now: OffsetDateTime,
+) -> Vec<ServiceTimeline> {
+    let mut out = Vec::new();
+    for def in defs.iter().filter(|d| d.is_managed()) {
+        let svc = def.native.name.as_str();
+        let svc_events: Vec<&EventRecord> =
+            events.iter().filter(|e| e.service == svc).collect();
+        if svc_events.is_empty() {
+            continue;
+        }
+        let Some(first_ts) = parse_ts(&svc_events[0].ts) else {
+            continue;
+        };
+        let svc_window_start = first_ts.max(window_start);
+        let state = def.runtime.as_ref().map(|r| r.state);
+        let intervals = build_up_intervals(&svc_events, svc_window_start, now, state);
+        out.push(ServiceTimeline {
+            window_start: svc_window_start,
+            intervals,
+        });
+    }
+    out
+}
+
+/// Build the list of up-intervals for one service across `[start, now]`.
+/// `state` decides whether a still-open `up_since` at end-of-log extends
+/// to `now`. Future timestamps are clamped to `now` (clock skew safety).
+fn build_up_intervals(
+    events: &[&EventRecord],
+    start: OffsetDateTime,
+    now: OffsetDateTime,
+    state: Option<ServiceState>,
+) -> Vec<(OffsetDateTime, OffsetDateTime)> {
+    let mut intervals: Vec<(OffsetDateTime, OffsetDateTime)> = Vec::new();
+    let mut up_since: Option<OffsetDateTime> = None;
+    let mut last_event_kind: Option<EventKind> = None;
+    for rec in events {
+        let Some(ts) = parse_ts(&rec.ts) else { continue };
+        let ts = ts.min(now); // Clamp future skew.
+        if ts < start {
+            continue;
+        }
+        match rec.event {
+            EventKind::Started | EventKind::Restarted => {
+                if up_since.is_none() {
+                    up_since = Some(ts.max(start));
+                }
+            }
+            EventKind::ChildExited
+            | EventKind::Stopped
+            | EventKind::Throttled => {
+                if let Some(s) = up_since.take() {
+                    if ts > s {
+                        intervals.push((s, ts));
+                    }
+                }
+            }
+        }
+        last_event_kind = Some(rec.event);
+    }
+    // Extend an open `up_since` to `now` only when (a) the SCM thinks the
+    // service is Running AND (b) the last event was a start-like event.
+    // A Throttled event would already have closed `up_since`; this is a
+    // consistency safeguard for the SCM-state safeguard test.
+    if let Some(s) = up_since {
+        if state == Some(ServiceState::Running)
+            && matches!(last_event_kind, Some(EventKind::Started | EventKind::Restarted))
+            && now > s
+        {
+            intervals.push((s, now));
+        }
+    }
+    intervals
+}
+
+/// Sum the milliseconds of `intervals` overlap with `[win_start, win_end]`.
+/// Used both at window scale (availability) and at day scale (sparkline)
+/// — the same intervals are clipped repeatedly.
+fn up_ms_in_window(
+    intervals: &[(OffsetDateTime, OffsetDateTime)],
+    win_start: OffsetDateTime,
+    win_end: OffsetDateTime,
+) -> f32 {
+    let mut total: f32 = 0.0;
+    for (s, e) in intervals {
+        let cs = (*s).max(win_start);
+        let ce = (*e).min(win_end);
+        if ce > cs {
+            total += (ce - cs).whole_milliseconds().max(0) as f32;
+        }
+    }
+    total
+}
+
+fn compute_availability(
+    timelines: &[ServiceTimeline],
+    window_start: OffsetDateTime,
+    now: OffsetDateTime,
+) -> AvailabilityResult {
+    let mut ratios: Vec<f32> = Vec::new();
+    let mut earliest: Option<OffsetDateTime> = None;
+    for t in timelines {
+        let window_len = (now - t.window_start).whole_milliseconds().max(1) as f32;
+        let up_ms = up_ms_in_window(&t.intervals, t.window_start, now);
+        let pct = (up_ms / window_len * 100.0).clamp(0.0, 100.0);
+        ratios.push(pct);
+        earliest = Some(earliest.map_or(t.window_start, |prev| prev.min(t.window_start)));
+    }
+    let aggregate_pct = if ratios.is_empty() {
+        100.0
+    } else {
+        ratios.iter().sum::<f32>() / ratios.len() as f32
+    };
+    let window_days = match earliest {
+        None => 30,
+        Some(ts) => {
+            let span = now - ts.max(window_start);
+            let days = (span.whole_seconds() as f32 / 86_400.0).ceil() as i64;
+            days.clamp(1, 30) as u32
+        }
+    };
+    AvailabilityResult {
+        aggregate_pct,
+        window_days,
     }
 }
 
@@ -427,5 +576,75 @@ mod tests {
             m.auto_recovering, 1,
             "A's auto_recovering classification must ignore B's interleaved stopped event"
         );
+    }
+
+    #[test]
+    fn availability_100_when_no_events() {
+        let m = compute_metrics(&[], &[], datetime!(2026-05-23 12:00:00 UTC));
+        assert!((m.availability_pct - 100.0).abs() < 0.01);
+        assert_eq!(m.availability_window_days, 30);
+    }
+
+    #[test]
+    fn availability_100_for_continuously_running_service() {
+        let now = datetime!(2026-05-23 12:00:00 UTC);
+        let defs = vec![ngsm("A", StartupType::Automatic, Some(ServiceState::Running))];
+        let events = vec![ev("A", now - time::Duration::days(7), EventKind::Started, None)];
+        let m = compute_metrics(&defs, &events, now);
+        assert!(
+            (m.availability_pct - 100.0).abs() < 0.1,
+            "got {}",
+            m.availability_pct
+        );
+    }
+
+    #[test]
+    fn availability_reflects_brief_outage() {
+        // 24h window; 1h down → 23/24 = ~95.83%
+        let now = datetime!(2026-05-23 12:00:00 UTC);
+        let defs = vec![ngsm("A", StartupType::Automatic, Some(ServiceState::Running))];
+        let events = vec![
+            ev("A", now - time::Duration::hours(24), EventKind::Started, None),
+            ev("A", now - time::Duration::hours(5), EventKind::ChildExited, Some(1)),
+            ev("A", now - time::Duration::hours(4), EventKind::Restarted, None),
+        ];
+        let m = compute_metrics(&defs, &events, now);
+        assert!(
+            (m.availability_pct - 95.83).abs() < 0.5,
+            "got {}",
+            m.availability_pct
+        );
+    }
+
+    #[test]
+    fn availability_aggregate_is_unweighted_mean() {
+        // Two services: A always up, B up half the time.
+        let now = datetime!(2026-05-23 12:00:00 UTC);
+        let defs = vec![
+            ngsm("A", StartupType::Automatic, Some(ServiceState::Running)),
+            ngsm("B", StartupType::Automatic, Some(ServiceState::Stopped)),
+        ];
+        let events = vec![
+            ev("A", now - time::Duration::days(2), EventKind::Started, None),
+            ev("B", now - time::Duration::days(2), EventKind::Started, None),
+            ev("B", now - time::Duration::days(1), EventKind::ChildExited, Some(0)),
+        ];
+        let m = compute_metrics(&defs, &events, now);
+        // A=100, B=50 → mean 75
+        assert!(
+            (m.availability_pct - 75.0).abs() < 1.0,
+            "got {}",
+            m.availability_pct
+        );
+    }
+
+    #[test]
+    fn window_days_clamps_to_actual_history() {
+        let now = datetime!(2026-05-23 12:00:00 UTC);
+        let defs = vec![ngsm("A", StartupType::Automatic, Some(ServiceState::Running))];
+        // Only 7d of history.
+        let events = vec![ev("A", now - time::Duration::days(7), EventKind::Started, None)];
+        let m = compute_metrics(&defs, &events, now);
+        assert!(m.availability_window_days >= 7 && m.availability_window_days <= 8);
     }
 }
