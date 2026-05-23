@@ -2,13 +2,13 @@
 //! bridge, and the UI callbacks.
 
 use std::cell::RefCell;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver};
 
 use servicemanager_core::ServiceDefinition;
 use servicemanager_win32::InstallStartType;
 use slint::ComponentHandle;
 
-use crate::data::{spawn_worker, Job, JobResult};
+use crate::data::{spawn_worker, Job, JobResult, JobSender};
 use crate::{adapter, config, forms, recovery};
 use crate::{EventEntry, MainWindow, ProcessRow, RecoveryRow, ServiceRow};
 
@@ -17,7 +17,7 @@ use crate::{EventEntry, MainWindow, ProcessRow, RecoveryRow, ServiceRow};
 /// reach this only after hopping onto the UI thread.
 struct AppState {
     window: slint::Weak<MainWindow>,
-    job_tx: Sender<Job>,
+    job_tx: JobSender,
     result_rx: Receiver<JobResult>,
     defs: Vec<ServiceDefinition>,
     /// Startup-time warning (e.g. corrupt config.json), shown persistently

@@ -5,7 +5,9 @@
 //! freeze the frame. We send `Job`s to a worker and post `JobResult`s
 //! back, calling a `wake` callback after each so the UI drains them promptly.
 
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError};
+use std::sync::Arc;
 use std::thread;
 
 use servicemanager_core::ServiceDefinition;
@@ -69,20 +71,100 @@ pub enum JobResult {
     Error(String),
 }
 
-/// Spawn the worker thread. Returns the job sender; results land on
-/// `result_tx`. The worker calls `wake` after each result so the UI thread
-/// can drain and apply them.
-pub fn spawn_worker(result_tx: Sender<JobResult>, wake: Box<dyn Fn() + Send>) -> Sender<Job> {
-    let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
-    thread::spawn(move || worker_loop(job_rx, result_tx, wake));
-    job_tx
+/// Maximum number of jobs held in the worker queue. 16 is plenty for any
+/// realistic UI burst; it prevents stale auto-refresh ticks from piling up.
+const JOB_CHANNEL_CAP: usize = 16;
+
+/// A clonable sender that coalesces `Job::Refresh` requests and delivers jobs
+/// to the bounded worker queue without blocking the UI thread.
+#[derive(Clone)]
+pub struct JobSender {
+    inner: SyncSender<Job>,
+    /// Set to `true` when a `Refresh` is queued; cleared to `false` when the
+    /// worker starts handling it. Prevents N identical Refresh jobs from
+    /// stacking up during rapid auto-refresh ticks.
+    pending_refresh: Arc<AtomicBool>,
 }
 
-fn worker_loop(rx: Receiver<Job>, tx: Sender<JobResult>, wake: Box<dyn Fn() + Send>) {
+impl JobSender {
+    /// Try to send `job` to the worker. Returns an error if the channel is
+    /// full (back-pressure) or disconnected. Never blocks the caller.
+    ///
+    /// A `Job::Refresh` is silently dropped when one is already pending —
+    /// the in-flight refresh will pick up the latest state when it runs.
+    pub fn send(&self, job: Job) -> Result<(), TrySendError<Job>> {
+        if matches!(job, Job::Refresh) {
+            // swap returns the previous value; if it was already true there is
+            // already a pending Refresh — discard this duplicate.
+            if self.pending_refresh.swap(true, Ordering::AcqRel) {
+                return Ok(());
+            }
+        }
+        self.inner.try_send(job)
+    }
+}
+
+/// Spawn the worker thread. Returns the `JobSender`; results land on
+/// `result_tx`. The worker calls `wake` after each result so the UI thread
+/// can drain and apply them.
+pub fn spawn_worker(result_tx: Sender<JobResult>, wake: Box<dyn Fn() + Send>) -> JobSender {
+    let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<Job>(JOB_CHANNEL_CAP);
+    let pending_refresh = Arc::new(AtomicBool::new(false));
+    let pending_refresh_worker = Arc::clone(&pending_refresh);
+    thread::spawn(move || worker_loop(job_rx, result_tx, wake, pending_refresh_worker));
+    JobSender {
+        inner: job_tx,
+        pending_refresh,
+    }
+}
+
+fn worker_loop(
+    rx: Receiver<Job>,
+    tx: Sender<JobResult>,
+    wake: Box<dyn Fn() + Send>,
+    pending_refresh: Arc<AtomicBool>,
+) {
     while let Ok(job) = rx.recv() {
+        if matches!(job, Job::Refresh) {
+            // Clear the flag now so the UI can enqueue the next Refresh as
+            // soon as this one starts executing (rather than after it finishes).
+            pending_refresh.store(false, Ordering::Release);
+        }
         let result = execute(job);
+        // If the result channel closed the UI has gone away; continue draining
+        // jobs so the worker exits cleanly rather than leaving them unhandled.
         let _ = tx.send(result);
         wake();
+    }
+}
+
+#[cfg(test)]
+mod job_sender_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn refresh_coalescing_skips_duplicate() {
+        let (tx, _rx) = mpsc::sync_channel::<Job>(16);
+        let pending = Arc::new(AtomicBool::new(false));
+        let sender = JobSender {
+            inner: tx,
+            pending_refresh: Arc::clone(&pending),
+        };
+
+        // First Refresh: flag transitions false→true, job enqueued.
+        sender.send(Job::Refresh).unwrap();
+        assert!(pending.load(Ordering::Acquire), "flag should be set");
+
+        // Second Refresh while flag is still true: silently dropped.
+        sender.send(Job::Refresh).unwrap();
+
+        // Simulate the worker clearing the flag.
+        pending.store(false, Ordering::Release);
+
+        // Now a third Refresh should be accepted again.
+        sender.send(Job::Refresh).unwrap();
+        assert!(pending.load(Ordering::Acquire), "flag should be set again");
     }
 }
 
