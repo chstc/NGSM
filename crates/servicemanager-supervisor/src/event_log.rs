@@ -21,8 +21,10 @@ use servicemanager_core::paths;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-/// Rotation threshold for `events.log`. Single backup at `events.log.1`.
-pub(crate) const ROTATION_THRESHOLD_BYTES: u64 = 1024 * 1024;
+/// Rotation threshold for `events.log`. Bumped to 8 MiB for v0.3 so the
+/// retained history (4 backups × 8 MiB ≈ 32 MiB) covers 30 days of typical
+/// supervisor activity without hand-holding.
+pub(crate) const ROTATION_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 
 /// One writer per supervisor process. Holds the service name so callers
 /// don't pass it on every event.
@@ -163,16 +165,22 @@ fn maybe_rotate(active: &PathBuf) -> std::io::Result<()> {
 
     #[cfg(not(windows))]
     {
-        let backup = paths::events_log_backup()?;
-        // Remove existing backup first so rename succeeds even when the
-        // backup file already exists (mirrors the Windows mutex path).
-        if let Err(e) = std::fs::remove_file(&backup) {
+        let oldest = paths::events_log_backup_n(paths::BACKUP_RETENTION_COUNT)?;
+        if let Err(e) = std::fs::remove_file(&oldest) {
             if e.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("[supervisor] event log rotation: cannot remove existing backup: {e}");
+                eprintln!("[supervisor] event log rotation: cannot remove oldest backup: {e}");
                 return Ok(());
             }
         }
-        std::fs::rename(active, &backup)
+        for i in (1..paths::BACKUP_RETENTION_COUNT).rev() {
+            let from = paths::events_log_backup_n(i)?;
+            let to = paths::events_log_backup_n(i + 1)?;
+            if from.exists() {
+                std::fs::rename(&from, &to)?;
+            }
+        }
+        let dest_1 = paths::events_log_backup_n(1)?;
+        std::fs::rename(active, &dest_1)
     }
 }
 
@@ -237,17 +245,33 @@ fn rotate_with_mutex(active: &PathBuf) -> std::io::Result<()> {
         return Ok(());
     }
 
-    let backup = paths::events_log_backup()?;
-    // On Windows, rename fails if the destination exists, so a previous
-    // rotation's events.log.1 would block every future rotation. Remove
-    // the stale backup first — NotFound is the only acceptable error.
-    if let Err(e) = std::fs::remove_file(&backup) {
+    // Shift: events.log.(N-1) → events.log.N, ..., events.log.1 → events.log.2,
+    // then active events.log → events.log.1. The oldest backup (.N) is removed
+    // first because Windows rename refuses to overwrite an existing target.
+    let oldest = paths::events_log_backup_n(paths::BACKUP_RETENTION_COUNT)?;
+    if let Err(e) = std::fs::remove_file(&oldest) {
         if e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!("[supervisor] event log rotation: cannot remove existing backup: {e}");
+            eprintln!(
+                "[supervisor] event log rotation: cannot remove oldest backup: {e}"
+            );
             return Ok(());
         }
     }
-    std::fs::rename(active, &backup)
+    for i in (1..paths::BACKUP_RETENTION_COUNT).rev() {
+        let from = paths::events_log_backup_n(i)?;
+        let to = paths::events_log_backup_n(i + 1)?;
+        if !from.exists() {
+            continue;
+        }
+        if let Err(e) = std::fs::rename(&from, &to) {
+            eprintln!(
+                "[supervisor] event log rotation: cannot shift {from:?} → {to:?}: {e}"
+            );
+            return Ok(());
+        }
+    }
+    let dest_1 = paths::events_log_backup_n(1)?;
+    std::fs::rename(active, &dest_1)
 }
 
 #[cfg(test)]
@@ -472,5 +496,34 @@ mod tests {
                 &backup_body[..backup_body.len().min(40)]
             );
         }
+    }
+
+    #[test]
+    fn rotation_shifts_existing_backups_and_drops_oldest() {
+        let (_g, _dir) = isolate();
+        // Pre-seed all four backups with distinct sentinel content.
+        std::fs::write(paths::events_log_backup_n(1).unwrap(), b"BAK1\n").unwrap();
+        std::fs::write(paths::events_log_backup_n(2).unwrap(), b"BAK2\n").unwrap();
+        std::fs::write(paths::events_log_backup_n(3).unwrap(), b"BAK3\n").unwrap();
+        std::fs::write(paths::events_log_backup_n(4).unwrap(), b"BAK4_OLDEST\n").unwrap();
+        // Seed active over threshold.
+        let active = paths::events_log().unwrap();
+        std::fs::write(&active, vec![b'x'; (ROTATION_THRESHOLD_BYTES + 1) as usize]).unwrap();
+
+        let w = EventWriter::for_service("Shifter");
+        w.started(7);
+
+        // After rotation: oldest backup is gone; .1..=.4 are the prior .0..=.3.
+        let b1 = std::fs::read(paths::events_log_backup_n(1).unwrap()).unwrap();
+        let b2 = std::fs::read(paths::events_log_backup_n(2).unwrap()).unwrap();
+        let b3 = std::fs::read(paths::events_log_backup_n(3).unwrap()).unwrap();
+        let b4 = std::fs::read(paths::events_log_backup_n(4).unwrap()).unwrap();
+        // .1 is the rotated old active (1MB+ of 'x' followed by the new event).
+        assert!(b1.len() > ROTATION_THRESHOLD_BYTES as usize);
+        assert_eq!(&b2[..], b"BAK1\n");
+        assert_eq!(&b3[..], b"BAK2\n");
+        assert_eq!(&b4[..], b"BAK3\n");
+        // The previous BAK4_OLDEST is gone (replaced).
+        assert!(!b4.starts_with(b"BAK4_OLDEST"));
     }
 }
