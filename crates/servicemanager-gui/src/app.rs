@@ -812,11 +812,11 @@ fn apply_snapshot(win: &MainWindow, st: &mut AppState) {
         format!("{:.1}%", m.availability_pct)
     };
     win.set_stat_availability_value(availability_text.into());
-    // Hide the sparkline visually when we have no trustworthy signal — the
-    // empty path strings make the chart render as a flat line at 0, which
-    // would mislead. `sparkline_paths` already returns ("", "") for an
-    // empty slice; force that path here.
-    let (line, area) = if m.availability_unknown {
+    // Hide the sparkline whenever the "—" text is shown — either there are
+    // no managed services (`total == 0`) or the event-log read failed
+    // (`availability_unknown`). Otherwise a flat 100% line under "—" would
+    // mislead.
+    let (line, area) = if m.total == 0 || m.availability_unknown {
         (String::new(), String::new())
     } else {
         crate::metrics::sparkline_paths(&m.availability_daily)
