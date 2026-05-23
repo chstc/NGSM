@@ -15,9 +15,11 @@ pub fn list_services() -> servicemanager_core::Result<(Vec<ServiceDefinition>, V
         .map(|s| {
             // A failed SCM config query during enumeration left this entry
             // with only partial data — surface it rather than silently
-            // classifying the service from incomplete fields.
+            // classifying the service from incomplete fields. Prefix the
+            // service name so the warning identifies the row at a glance
+            // (matches the shape used by the managed-config warning below).
             if let Some(w) = s.query_error {
-                warnings.push(w);
+                warnings.push(format!("{}: {w}", s.config.name));
             }
             // A genuine managed-config read failure (access denied, corrupt
             // value) is kept as a warning rather than collapsed into "not

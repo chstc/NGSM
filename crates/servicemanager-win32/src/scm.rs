@@ -260,7 +260,7 @@ pub fn enumerate_services() -> Result<Vec<NativeService>> {
                             depend_on_groups: Vec::new(),
                         },
                         Some(format!(
-                            "{name}: SCM config query failed ({e}) — listed with partial data"
+                            "SCM config query failed ({e}) — listed with partial data"
                         )),
                     ),
                 };
@@ -347,12 +347,16 @@ fn query_config(svc: &ScHandle, name: &str) -> Result<(NativeServiceConfig, Opti
     let account = (!account_raw.is_empty()).then_some(account_raw);
     let (depend_on_services, depend_on_groups) = collect_dependencies(cfg.lpDependencies.0);
 
-    let mut query_error: Option<String> = None;
+    // Accumulate failures into a Vec so we can join them cleanly at the end
+    // — without this, a description-only failure would produce a string that
+    // starts with "; " because the previous get-or-insert-empty pattern
+    // pre-pended the separator unconditionally.
+    let mut errors: Vec<String> = Vec::new();
 
     let delayed = match query_delayed_auto_start(svc) {
         Ok(v) => v,
         Err(e) => {
-            query_error = Some(format!("delayed auto-start: {e}"));
+            errors.push(format!("delayed-auto-start unreadable ({e})"));
             false
         }
     };
@@ -360,11 +364,15 @@ fn query_config(svc: &ScHandle, name: &str) -> Result<(NativeServiceConfig, Opti
         Ok(Some(d)) => Some(d),
         Ok(None) => None,
         Err(e) => {
-            query_error
-                .get_or_insert_with(String::new)
-                .push_str(&format!("; description: {e}"));
+            errors.push(format!("description unreadable ({e})"));
             None
         }
+    };
+
+    let query_error = if errors.is_empty() {
+        None
+    } else {
+        Some(errors.join("; "))
     };
 
     Ok((

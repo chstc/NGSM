@@ -695,10 +695,9 @@ fn drain_results() {
                         if all_warnings.is_empty() {
                             base
                         } else {
-                            format!(
-                                "{base}  —  {} with unreadable config (click for details)",
-                                all_warnings.len()
-                            )
+                            let n = all_warnings.len();
+                            let noun = if n == 1 { "warning" } else { "warnings" };
+                            format!("{base}  —  {n} {noun} (click for details)")
                         }
                         .into(),
                     );

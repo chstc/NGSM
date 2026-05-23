@@ -382,15 +382,16 @@ export component WarningsDialog inherits Rectangle {
             padding: 24px;
             spacing: 8px;
             Text {
-                text: "Refresh warnings";
+                text: "Scan warnings";
                 color: Theme.text;
                 font-size: 18px;
                 font-weight: 800;
             }
             Text {
-                text: "Services whose managed configuration could not be read.";
+                text: "Issues encountered while reading services from the SCM and registry. Each entry is prefixed with the service name.";
                 color: Theme.text-faint;
                 font-size: 12px;
+                wrap: word-wrap;
             }
             Rectangle { height: 4px; }
             ScrollView {
