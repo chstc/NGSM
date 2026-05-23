@@ -241,11 +241,11 @@ pub fn enumerate_services() -> Result<Vec<NativeService>> {
                 };
 
                 let (config, query_error) = match query_service_inner(&scm, &name) {
-                    Ok((mut config, _)) => {
+                    Ok((mut config, _, inner_query_error)) => {
                         if config.display_name.is_empty() {
                             config.display_name = display;
                         }
-                        (config, None)
+                        (config, inner_query_error)
                     }
                     Err(e) => (
                         NativeServiceConfig {
@@ -287,25 +287,25 @@ pub fn query_service(name: &str) -> Result<NativeService> {
     // A single-service query only needs CONNECT; ENUMERATE_SERVICE would be
     // an unnecessary (and sometimes denied) extra right.
     let scm = open_scm(SC_MANAGER_CONNECT)?;
-    let (config, runtime) = query_service_inner(&scm, name)?;
+    let (config, runtime, query_error) = query_service_inner(&scm, name)?;
     Ok(NativeService {
         config,
         runtime: Some(runtime),
-        query_error: None,
+        query_error,
     })
 }
 
 fn query_service_inner(
     scm: &ScHandle,
     name: &str,
-) -> Result<(NativeServiceConfig, ServiceRuntimeState)> {
+) -> Result<(NativeServiceConfig, ServiceRuntimeState, Option<String>)> {
     let svc = open_service_handle(scm, name, SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS)?;
-    let config = query_config(&svc, name)?;
+    let (config, query_error) = query_config(&svc, name)?;
     let runtime = query_status(&svc, name)?;
-    Ok((config, runtime))
+    Ok((config, runtime, query_error))
 }
 
-fn query_config(svc: &ScHandle, name: &str) -> Result<NativeServiceConfig> {
+fn query_config(svc: &ScHandle, name: &str) -> Result<(NativeServiceConfig, Option<String>)> {
     let mut bytes_needed = 0u32;
     // SAFETY: passing `None`/0 is the documented probe pattern to get the
     // required buffer size; we ignore the error return from the probe.
@@ -347,20 +347,40 @@ fn query_config(svc: &ScHandle, name: &str) -> Result<NativeServiceConfig> {
     let account = (!account_raw.is_empty()).then_some(account_raw);
     let (depend_on_services, depend_on_groups) = collect_dependencies(cfg.lpDependencies.0);
 
-    let delayed = query_delayed_auto_start(svc).unwrap_or(false);
-    let description = query_description(svc).ok().flatten();
+    let mut query_error: Option<String> = None;
 
-    Ok(NativeServiceConfig {
-        name: name.to_string(),
-        display_name,
-        description,
-        startup: classify_startup(cfg.dwStartType.0, delayed),
-        service_type: classify_type(cfg.dwServiceType.0),
-        image_path,
-        account,
-        depend_on_services,
-        depend_on_groups,
-    })
+    let delayed = match query_delayed_auto_start(svc) {
+        Ok(v) => v,
+        Err(e) => {
+            query_error = Some(format!("delayed auto-start: {e}"));
+            false
+        }
+    };
+    let description = match query_description(svc) {
+        Ok(Some(d)) => Some(d),
+        Ok(None) => None,
+        Err(e) => {
+            query_error
+                .get_or_insert_with(String::new)
+                .push_str(&format!("; description: {e}"));
+            None
+        }
+    };
+
+    Ok((
+        NativeServiceConfig {
+            name: name.to_string(),
+            display_name,
+            description,
+            startup: classify_startup(cfg.dwStartType.0, delayed),
+            service_type: classify_type(cfg.dwServiceType.0),
+            image_path,
+            account,
+            depend_on_services,
+            depend_on_groups,
+        },
+        query_error,
+    ))
 }
 
 fn query_delayed_auto_start(svc: &ScHandle) -> Result<bool> {
