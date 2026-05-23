@@ -71,8 +71,9 @@ fn config_path() -> Option<PathBuf> {
 }
 
 /// Load preferences from `%APPDATA%\NGSM\config.json`. Returns defaults
-/// with no warning if the file is missing; defaults with a warning if
-/// the file exists but is corrupt.
+/// with no warning if the file is missing (clean first run); defaults with
+/// a warning if the file exists but cannot be read (permission denied, IO
+/// error, etc.) or is corrupt.
 pub fn load() -> ConfigLoad {
     let Some(path) = config_path() else {
         return ConfigLoad {
@@ -82,9 +83,17 @@ pub fn load() -> ConfigLoad {
     };
     match std::fs::read_to_string(&path) {
         Ok(text) => parse_config(&text),
-        Err(_) => ConfigLoad {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            ConfigLoad {
+                config: Config::default(),
+                warning: None,
+            }
+        }
+        Err(e) => ConfigLoad {
             config: Config::default(),
-            warning: None,
+            warning: Some(format!(
+                "config.json could not be read — using defaults: {e}"
+            )),
         },
     }
 }
