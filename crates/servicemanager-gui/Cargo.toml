@@ -14,7 +14,7 @@ servicemanager-win32 = { workspace = true }
 servicemanager-registry = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-slint = { version = "~1.16", default-features = false, features = ["std", "backend-winit", "renderer-femtovg", "compat-1-2"] }
+slint = { workspace = true }
 rfd = { version = "0.15", default-features = false, features = ["common-controls-v6"] }
 time = { version = "0.3", default-features = false, features = ["std", "formatting", "parsing", "macros", "local-offset"] }
 
@@ -22,7 +22,7 @@ time = { version = "0.3", default-features = false, features = ["std", "formatti
 tempfile = "3"
 
 [build-dependencies]
-slint-build = "~1.16"
+slint-build = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }

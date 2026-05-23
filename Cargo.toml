@@ -40,6 +40,11 @@ thiserror = "1"
 clap = { version = "4", features = ["derive"] }
 os_pipe = "1"
 
+# Slint runtime + build helper share one version so a `cargo update`
+# cannot drift them across patch releases.
+slint = { version = "~1.16", default-features = false, features = ["std", "backend-winit", "renderer-femtovg", "compat-1-2"] }
+slint-build = "~1.16"
+
 [workspace.dependencies.windows]
 version = "0.58"
 features = [
