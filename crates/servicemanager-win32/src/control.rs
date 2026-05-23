@@ -10,7 +10,7 @@ use windows::core::PCWSTR;
 use windows::Win32::System::Services::{
     ChangeServiceConfigW, ControlService, CreateServiceW, DeleteService, QueryServiceStatusEx,
     StartServiceW, ENUM_SERVICE_TYPE, SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE,
-    SC_STATUS_PROCESS_INFO, SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CHANGE_CONFIG,
+    SC_STATUS_PROCESS_INFO, SERVICE_AUTO_START, SERVICE_CHANGE_CONFIG,
     SERVICE_CONTROL_CONTINUE, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_PAUSE,
     SERVICE_CONTROL_STOP, SERVICE_DEMAND_START, SERVICE_DISABLED, SERVICE_ERROR,
     SERVICE_ERROR_NORMAL, SERVICE_INTERROGATE, SERVICE_NO_CHANGE, SERVICE_PAUSE_CONTINUE,
@@ -107,7 +107,11 @@ pub fn install_service(opts: &InstallOptions) -> Result<()> {
             scm.0,
             PCWSTR::from_raw(name.as_ptr()),
             PCWSTR::from_raw(display.as_ptr()),
-            SERVICE_ALL_ACCESS,
+            // We immediately drop the handle; no operations are performed on
+            // it, so we request only the minimum access right. SERVICE_QUERY_STATUS
+            // is the smallest valid right that is always granted to admins and
+            // satisfies CloseServiceHandle (which requires no specific access).
+            SERVICE_QUERY_STATUS,
             SERVICE_WIN32_OWN_PROCESS,
             opts.start_type.to_win32(),
             SERVICE_ERROR_NORMAL,
