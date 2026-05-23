@@ -80,20 +80,54 @@ pub fn validate_hook_component(name: &str, kind: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate that a configured filesystem path is absolute.
+/// Validate that a configured filesystem path is unambiguously absolute on
+/// Windows.
 ///
 /// A managed service's executable, working directory, and stdio paths run
 /// with the service account's privileges. A relative path would be resolved
 /// through that account's `PATH` / current directory (search-path
 /// confusion), and a relative log path is ambiguous — so every such path
 /// must be absolute. `field` names the offending field for the error.
+///
+/// "Absolute" here is stricter than `Path::is_absolute()`. On Windows the
+/// stdlib treats drive-relative `\foo` as absolute even though its meaning
+/// depends on the current process's drive. We require one of:
+///
+/// - A drive-letter prefix: `X:\...` or `X:/...` (letter, colon, slash).
+/// - A UNC prefix: `\\server\share\...` or `//server/share/...`.
+///
+/// Drive-relative (`\foo`), drive-with-no-separator (`C:foo`), and any
+/// non-rooted path (`foo`, `..\foo`) are rejected.
 pub fn validate_absolute_path(field: &str, value: &str) -> Result<()> {
-    if !std::path::Path::new(value).is_absolute() {
+    if !is_unambiguously_absolute_windows(value) {
         return Err(Error::InvalidConfig(format!(
-            "{field} must be an absolute path, got '{value}'"
+            "{field} must be an absolute path (e.g. C:\\path or \\\\server\\share\\path), \
+             got '{value}'"
         )));
     }
     Ok(())
+}
+
+/// True if `value` is unambiguously absolute on Windows — either a
+/// drive-rooted path (`X:\...` / `X:/...`) or a UNC path (`\\...` / `//...`).
+fn is_unambiguously_absolute_windows(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    // UNC: starts with \\ or //.
+    if bytes.len() >= 2
+        && (bytes[0] == b'\\' || bytes[0] == b'/')
+        && (bytes[1] == b'\\' || bytes[1] == b'/')
+    {
+        return true;
+    }
+    // Drive-rooted: letter + ':' + slash.
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return true;
+    }
+    false
 }
 
 /// Quote a single argument for a Windows command line so that
@@ -184,6 +218,43 @@ mod tests {
         assert!(validate_absolute_path("Application", "\\\\server\\share\\svc.exe").is_ok());
         assert!(validate_absolute_path("Application", "svc.exe").is_err());
         assert!(validate_absolute_path("Application", "bin\\svc.exe").is_err());
+    }
+
+    #[test]
+    fn validate_absolute_path_accepts_drive_rooted_and_unc() {
+        assert!(validate_absolute_path("p", r"C:\foo").is_ok());
+        assert!(validate_absolute_path("p", "C:/foo").is_ok());
+        assert!(validate_absolute_path("p", r"D:\path with spaces\file.exe").is_ok());
+        assert!(validate_absolute_path("p", r"\\server\share\file").is_ok());
+        assert!(validate_absolute_path("p", "//server/share/file").is_ok());
+    }
+
+    #[test]
+    fn validate_absolute_path_rejects_drive_relative_and_relative() {
+        // Drive-relative: depends on per-process CWD.
+        assert!(validate_absolute_path("p", r"\foo").is_err());
+        assert!(validate_absolute_path("p", "/foo").is_err());
+        // Drive with no separator: relative to the per-drive CWD.
+        assert!(validate_absolute_path("p", "C:foo").is_err());
+        // Plain relative.
+        assert!(validate_absolute_path("p", "foo").is_err());
+        assert!(validate_absolute_path("p", r"..\foo").is_err());
+        assert!(validate_absolute_path("p", "").is_err());
+        // Single-char paths that look almost absolute.
+        assert!(validate_absolute_path("p", "C").is_err());
+        assert!(validate_absolute_path("p", "C:").is_err());
+    }
+
+    #[test]
+    fn validate_absolute_path_error_message_mentions_expected_shape() {
+        let err = validate_absolute_path("Application", r"\foo").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Application"), "missing field name in {msg:?}");
+        assert!(msg.contains("absolute"), "missing 'absolute' in {msg:?}");
+        assert!(
+            msg.contains(r"\foo") || msg.contains("\\foo"),
+            "missing the offending value in {msg:?}"
+        );
     }
 
     #[test]
