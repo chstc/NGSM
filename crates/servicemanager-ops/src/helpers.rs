@@ -22,9 +22,12 @@ pub(crate) fn io_stream(path: String) -> IoStream {
 /// cannot be read.
 pub(crate) fn ensure_ngsm_managed(name: &str) -> servicemanager_core::Result<()> {
     let native = query_service(name)?;
-    let managed = servicemanager_registry::read_managed_config(name)
-        .ok()
-        .flatten();
+    let managed = servicemanager_registry::read_managed_config(name).map_err(|e| {
+        servicemanager_core::Error::other(format!(
+            "'{name}': managed ownership cannot be determined — its managed config \
+             is unreadable ({e})"
+        ))
+    })?;
     let def = ServiceDefinition {
         native: native.config,
         managed,
