@@ -295,7 +295,13 @@ extern "system" fn service_main_thunk(_argc: u32, _argv: *mut PWSTR) {
             Some(inner_ptr as *const c_void),
         ) {
             Ok(h) => h,
-            Err(_) => return,
+            Err(e) => {
+                eprintln!(
+                    "[runtime] RegisterServiceCtrlHandlerExW failed: {}",
+                    std::io::Error::from_raw_os_error(e.code().0)
+                );
+                return;
+            }
         }
     };
 
@@ -308,7 +314,12 @@ extern "system" fn service_main_thunk(_argc: u32, _argv: *mut PWSTR) {
         controls_rx: rx,
     };
 
-    let _ = ctx.report_start_pending(3000);
+    // Report START_PENDING so SCM knows we are initialising. A failure here
+    // is non-fatal: the wait hint is advisory and startup may still succeed;
+    // log it for post-mortem diagnostics and continue.
+    if let Err(e) = ctx.report_start_pending(3000) {
+        eprintln!("[runtime] could not report START_PENDING to SCM: {e}");
+    }
     lifecycle.run(ctx);
 }
 
