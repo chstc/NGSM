@@ -2,6 +2,57 @@
 
 All notable changes to NGSM. Versions follow `vMAJOR.MINOR.PATCH`; categories follow [Keep a Changelog](https://keepachangelog.com).
 
+## [v0.3.0] — 2026-05-23
+
+Dashboard v0.3 — availability metric + tile classification breakdowns. The
+mockup's CPU/Memory live charts are deferred to v0.4.
+
+### Added
+
+- **Availability (30d) tile** on the Dashboard, computed from the supervisor
+  event log. Per-service availability = fraction of the 30-day window the
+  service was up (started/restarted → child_exited/stopped/throttled). The
+  aggregate is the unweighted mean across services with any event history.
+- **30-day availability sparkline** rendered into the Availability tile,
+  one bucket per UTC calendar day. Days with no data carry forward from
+  the previous bucket.
+- **Tile sub-captions:** "Running N" under Managed services, "Manual start N"
+  under Stopped, "Auto-recovering N" under Failed.
+- **`Failed` tile** — managed service currently Stopped, last event
+  `child_exited` with non-zero exit code within the last 24 h. Future-dated
+  events excluded (clock-skew safety).
+- **`Auto-recovering` sub-count** — managed service whose last event is
+  `throttled` (or a `restarted` following a `child_exited`) within the last
+  5 minutes. Future-dated events excluded.
+- **"Availability unknown" handling** — when the event log can't be read,
+  the tile renders "—" instead of falsely showing 100 %, and a warning
+  surfaces in the scan-warnings dialog.
+- **`metrics` module** in `servicemanager-gui` (pure, ~30 unit tests
+  including cross-bucket carry-over and future-ts regressions).
+- **`event_log_reader::read_since`** — windowed scan across all retained
+  log files, returns `Result<Vec<EventRecord>>` sorted by parsed
+  `OffsetDateTime` (not raw string), with a per-file 16 MiB cap.
+
+### Changed
+
+- **Supervisor event-log retention** widened from 1 MiB / 1 backup to
+  8 MiB / 4 backups — 32 MiB in backups, ~40 MiB including the active
+  log. Existing v0.2.3 deployments grow their retained history naturally
+  on the next rotation; no migration is needed.
+- Dashboard "Needs attention" tile replaced by "Failed" + Availability —
+  the underlying signal (managed + Automatic + Stopped) is now expressed
+  more precisely as "Failed" + the per-tile sub-captions.
+
+### Notes
+
+- Stopped-via-SCM (intentional shutdowns) currently count as downtime in
+  the availability metric and sparkline. Planned vs. unplanned distinction
+  will follow once event categorisation is richer.
+- Daily buckets use UTC calendar days for stability (no DST midnight
+  surprises; the supervisor log is also UTC). Drift relative to a user's
+  local clock is at most a few hours — well within the precision of a
+  30-bucket sparkline.
+
 ## [v0.2.3] — 2026-05-23
 
 Two days of intensive iteration since v0.1.0 — three feature increments, two end-to-end code reviews, and substantial remediation. 114 commits.
@@ -63,5 +114,6 @@ Initial public release.
 - Optional named-pipe broker for headless automation (feature-gated, off by default).
 - Statically-linked C runtime — no DLLs to ship.
 
+[v0.3.0]: https://github.com/chstc/NGSM/releases/tag/v0.3.0
 [v0.2.3]: https://github.com/chstc/NGSM/releases/tag/v0.2.3
 [v0.1.0]: https://github.com/chstc/NGSM/releases/tag/v0.1.0
