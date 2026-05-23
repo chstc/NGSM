@@ -28,6 +28,8 @@ pub fn dispatch(req: &Request) -> Result<Value, String> {
         "processes" => op_processes(&req.args)?,
         "pause" => op_pause(&req.args)?,
         "continue" => op_continue(&req.args)?,
+        "recovery_get" => op_recovery_get(&req.args)?,
+        "recovery_set" => op_recovery_set(&req.args)?,
         other => return Err(format!("unknown op '{other}'")),
     };
     Ok(result)
@@ -374,4 +376,58 @@ fn op_processes(args: &Value) -> Result<Value, String> {
         .ok_or_else(|| format!("service '{}' is not running (no PID reported)", a.name))?;
     let descendants = enumerate_descendants(pid).map_err(|e| e.to_string())?;
     Ok(json!({ "service": a.name, "root_pid": pid, "processes": descendants }))
+}
+
+#[derive(Deserialize)]
+struct OpRecoveryGetArgs {
+    name: String,
+}
+
+fn op_recovery_get(args: &Value) -> Result<Value, String> {
+    let OpRecoveryGetArgs { name } = parse_args(args)?;
+    let spec = servicemanager_ops::read_recovery(&name)?;
+    // Use the same JSON shape the CLI uses.
+    let exit_map: std::collections::BTreeMap<_, _> = spec
+        .exit_actions
+        .iter()
+        .map(|(code, action)| (code.clone(), action))
+        .collect();
+    Ok(json!({
+        "service": spec.name,
+        "restart_delay_ms": spec.restart_delay_ms,
+        "throttle_delay_ms": spec.throttle_delay_ms,
+        "default_action": spec.default_action,
+        "exit_actions": exit_map,
+    }))
+}
+
+#[derive(Deserialize)]
+struct OpRecoverySetArgs {
+    name: String,
+    #[serde(default)]
+    restart_delay_ms: Option<u32>,
+    #[serde(default)]
+    throttle_delay_ms: Option<u32>,
+    default_action: servicemanager_core::ExitAction,
+    #[serde(default)]
+    exit_actions: Option<std::collections::BTreeMap<String, servicemanager_core::ExitAction>>,
+}
+
+fn op_recovery_set(args: &Value) -> Result<Value, String> {
+    let OpRecoverySetArgs {
+        name,
+        restart_delay_ms,
+        throttle_delay_ms,
+        default_action,
+        exit_actions,
+    } = parse_args(args)?;
+    let spec = servicemanager_ops::RecoverySpec {
+        name: name.clone(),
+        restart_delay_ms,
+        throttle_delay_ms,
+        default_action,
+        exit_actions: exit_actions.unwrap_or_default(),
+    };
+    let msg = servicemanager_ops::save_recovery(spec)?;
+    Ok(json!({ "saved": name, "message": msg }))
 }
