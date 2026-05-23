@@ -1,4 +1,4 @@
-# NGSM
+# Next-Gen Service Manager (NGSM)
 
 **A modern Windows service manager** — run any application as a Windows
 service, and supervise it properly.
