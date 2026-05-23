@@ -131,8 +131,9 @@ fn worker_loop(
             pending_refresh.store(false, Ordering::Release);
         }
         let result = execute(job);
-        // If the result channel closed the UI has gone away; continue draining
-        // jobs so the worker exits cleanly rather than leaving them unhandled.
+        // Intentionally ignore the send result: if the UI-thread receiver has
+        // been dropped (window closed) there is nothing useful the worker can
+        // do — just keep draining until `rx.recv()` returns `Err` and exits.
         let _ = tx.send(result);
         wake();
     }

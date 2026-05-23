@@ -72,7 +72,7 @@ fn auto_refresh_tick() {
         if let Some(st) = s.borrow().as_ref() {
             if let Some(win) = st.window.upgrade() {
                 if win.get_auto_refresh() {
-                    let _ = st.job_tx.send(Job::Refresh);
+                    try_send_job(st, &win, Job::Refresh);
                 }
             }
         }
@@ -156,7 +156,9 @@ pub fn build_ui() -> Result<MainWindow, slint::PlatformError> {
     wire_callbacks(&window);
 
     window.set_status_text("Loading…".into());
-    let _ = job_tx.send(Job::Refresh);
+    if let Err(e) = job_tx.send(Job::Refresh) {
+        window.set_status_text(format!("Background worker unavailable: {e}").into());
+    }
 
     Ok(window)
 }
@@ -167,7 +169,9 @@ fn wire_callbacks(window: &MainWindow) {
     window.on_refresh(|| {
         STATE.with(|s| {
             if let Some(st) = s.borrow().as_ref() {
-                let _ = st.job_tx.send(Job::Refresh);
+                if let Some(win) = st.window.upgrade() {
+                    try_send_job(st, &win, Job::Refresh);
+                }
             }
         });
     });
@@ -377,7 +381,7 @@ fn wire_callbacks(window: &MainWindow) {
                     win.set_status_text(format!("Installing '{}'…", spec.name).into());
                     win.set_modal_error("".into());
                     win.set_modal_busy(true);
-                    let _ = st.job_tx.send(Job::Install(spec));
+                    try_send_job(st, &win, Job::Install(spec));
                 }
                 Err(e) => win.set_modal_error(e.into()),
             }
@@ -405,7 +409,7 @@ fn wire_callbacks(window: &MainWindow) {
                     win.set_status_text(format!("Editing '{}'…", spec.name).into());
                     win.set_modal_error("".into());
                     win.set_modal_busy(true);
-                    let _ = st.job_tx.send(Job::Edit(spec));
+                    try_send_job(st, &win, Job::Edit(spec));
                 }
                 Err(e) => win.set_modal_error(e.into()),
             }
@@ -420,7 +424,7 @@ fn wire_callbacks(window: &MainWindow) {
             };
             let name = win.get_modal_service_name().to_string();
             win.set_status_text(format!("Removing '{name}'…").into());
-            let _ = st.job_tx.send(Job::Remove(name));
+            try_send_job(st, &win, Job::Remove(name));
             win.set_active_modal(0);
         });
     });
@@ -544,7 +548,7 @@ fn wire_callbacks(window: &MainWindow) {
             match form.to_spec() {
                 Ok(spec) => {
                     win.set_recovery_status(format!("Saving '{}'…", spec.name).into());
-                    let _ = st.job_tx.send(Job::SaveRecovery(spec));
+                    try_send_job(st, &win, Job::SaveRecovery(spec));
                 }
                 Err(e) => win.set_recovery_status(e.into()),
             }
@@ -594,10 +598,21 @@ fn wire_callbacks(window: &MainWindow) {
     });
 }
 
+/// Try to send `job` to the worker, surfacing failures in the status bar.
+///
+/// On a full or disconnected channel the user sees a recovery message and any
+/// "in-progress" modal spinner is cleared, preventing an infinite busy state.
+fn try_send_job(st: &AppState, win: &MainWindow, job: Job) {
+    if let Err(e) = st.job_tx.send(job) {
+        win.set_status_text(format!("Background worker unavailable: {e}").into());
+        win.set_modal_busy(false);
+    }
+}
+
 /// Send a worker job and show a pending message in the status bar.
 fn dispatch(st: &AppState, win: &MainWindow, job: Job, msg: String) {
     win.set_status_text(msg.into());
-    let _ = st.job_tx.send(job);
+    try_send_job(st, win, job);
 }
 
 /// Populate the shared modal fields from a service's config and open Edit.
@@ -694,7 +709,7 @@ fn drain_results() {
                 }
                 JobResult::Acted(msg) => {
                     win.set_status_text(msg.into());
-                    let _ = st.job_tx.send(Job::Refresh);
+                    try_send_job(st, &win, Job::Refresh);
                 }
                 JobResult::Processes { service, processes } => {
                     st.proc_rows = processes
@@ -732,7 +747,7 @@ fn drain_results() {
                     Ok(msg) => {
                         win.set_recovery_status(msg.clone().into());
                         win.set_status_text(msg.into());
-                        let _ = st.job_tx.send(Job::Refresh);
+                        try_send_job(st, &win, Job::Refresh);
                     }
                     Err(e) => {
                         win.set_recovery_status(format!("Error: {e}").into());
@@ -743,7 +758,7 @@ fn drain_results() {
                         win.set_modal_busy(false);
                         win.set_active_modal(0);
                         win.set_status_text(msg.into());
-                        let _ = st.job_tx.send(Job::Refresh);
+                        try_send_job(st, &win, Job::Refresh);
                     }
                     Err(e) => {
                         win.set_modal_busy(false);
@@ -756,7 +771,7 @@ fn drain_results() {
                         st.edit_form = None;
                         win.set_active_modal(0);
                         win.set_status_text(msg.into());
-                        let _ = st.job_tx.send(Job::Refresh);
+                        try_send_job(st, &win, Job::Refresh);
                     }
                     Err(e) => {
                         win.set_modal_busy(false);
@@ -841,10 +856,14 @@ fn request_log(win: &MainWindow, st: &mut AppState) {
             win.set_log_service_name(name.clone().into());
             win.set_log_status("Loading…".into());
             st.log_request = Some((name.clone(), st.log_stderr));
-            let _ = st.job_tx.send(Job::ReadLog {
-                service: name,
-                stderr: st.log_stderr,
-            });
+            try_send_job(
+                st,
+                win,
+                Job::ReadLog {
+                    service: name,
+                    stderr: st.log_stderr,
+                },
+            );
         }
         None => {
             st.log_request = None;
