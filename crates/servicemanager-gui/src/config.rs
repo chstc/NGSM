@@ -83,12 +83,10 @@ pub fn load() -> ConfigLoad {
     };
     match std::fs::read_to_string(&path) {
         Ok(text) => parse_config(&text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            ConfigLoad {
-                config: Config::default(),
-                warning: None,
-            }
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ConfigLoad {
+            config: Config::default(),
+            warning: None,
+        },
         Err(e) => ConfigLoad {
             config: Config::default(),
             warning: Some(format!(

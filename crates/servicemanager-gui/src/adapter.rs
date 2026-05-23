@@ -389,7 +389,10 @@ mod tests {
             Some(ServiceState::Stopped),
         );
         let row = to_service_row(&stopped, true);
-        assert!(!row.can_restart, "stopped service should not be restartable");
+        assert!(
+            !row.can_restart,
+            "stopped service should not be restartable"
+        );
         assert!(row.can_start, "stopped service should be startable");
     }
 

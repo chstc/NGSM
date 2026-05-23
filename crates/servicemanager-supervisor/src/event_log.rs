@@ -168,9 +168,7 @@ fn maybe_rotate(active: &PathBuf) -> std::io::Result<()> {
         // backup file already exists (mirrors the Windows mutex path).
         if let Err(e) = std::fs::remove_file(&backup) {
             if e.kind() != std::io::ErrorKind::NotFound {
-                eprintln!(
-                    "[supervisor] event log rotation: cannot remove existing backup: {e}"
-                );
+                eprintln!("[supervisor] event log rotation: cannot remove existing backup: {e}");
                 return Ok(());
             }
         }
@@ -245,9 +243,7 @@ fn rotate_with_mutex(active: &PathBuf) -> std::io::Result<()> {
     // the stale backup first — NotFound is the only acceptable error.
     if let Err(e) = std::fs::remove_file(&backup) {
         if e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!(
-                "[supervisor] event log rotation: cannot remove existing backup: {e}"
-            );
+            eprintln!("[supervisor] event log rotation: cannot remove existing backup: {e}");
             return Ok(());
         }
     }
@@ -419,7 +415,11 @@ mod tests {
             body.len() > ROTATION_THRESHOLD_BYTES as usize,
             "backup should be the rotated old active"
         );
-        assert_ne!(&body[..3], b"old", "backup should no longer be the pre-seeded sentinel");
+        assert_ne!(
+            &body[..3],
+            b"old",
+            "backup should no longer be the pre-seeded sentinel"
+        );
     }
 
     #[test]
