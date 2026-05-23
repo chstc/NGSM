@@ -164,6 +164,16 @@ fn maybe_rotate(active: &PathBuf) -> std::io::Result<()> {
     #[cfg(not(windows))]
     {
         let backup = paths::events_log_backup()?;
+        // Remove existing backup first so rename succeeds even when the
+        // backup file already exists (mirrors the Windows mutex path).
+        if let Err(e) = std::fs::remove_file(&backup) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "[supervisor] event log rotation: cannot remove existing backup: {e}"
+                );
+                return Ok(());
+            }
+        }
         std::fs::rename(active, &backup)
     }
 }
@@ -230,6 +240,17 @@ fn rotate_with_mutex(active: &PathBuf) -> std::io::Result<()> {
     }
 
     let backup = paths::events_log_backup()?;
+    // On Windows, rename fails if the destination exists, so a previous
+    // rotation's events.log.1 would block every future rotation. Remove
+    // the stale backup first — NotFound is the only acceptable error.
+    if let Err(e) = std::fs::remove_file(&backup) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!(
+                "[supervisor] event log rotation: cannot remove existing backup: {e}"
+            );
+            return Ok(());
+        }
+    }
     std::fs::rename(active, &backup)
 }
 
@@ -376,6 +397,29 @@ mod tests {
         w.started(1); // must not panic
                       // Cleanup
         let _ = std::fs::remove_file(&bogus);
+    }
+
+    #[test]
+    fn second_rotation_overwrites_existing_backup() {
+        let (_g, _dir) = isolate();
+        // Pre-seed backup AND active over threshold.
+        std::fs::write(paths::events_log_backup().unwrap(), b"old\n").unwrap();
+        let active = paths::events_log().unwrap();
+        std::fs::write(&active, vec![b'x'; (ROTATION_THRESHOLD_BYTES + 1) as usize]).unwrap();
+
+        let w = EventWriter::for_service("Foo");
+        w.started(42); // triggers rotation; the existing backup must be replaced
+
+        let backup = paths::events_log_backup().unwrap();
+        assert!(backup.exists(), "backup should still exist (just replaced)");
+        let body = std::fs::read(&backup).unwrap();
+        // The backup should now be the OLD active file (1MB+ of 'x'), not
+        // the original "old\n" sentinel.
+        assert!(
+            body.len() > ROTATION_THRESHOLD_BYTES as usize,
+            "backup should be the rotated old active"
+        );
+        assert_ne!(&body[..3], b"old", "backup should no longer be the pre-seeded sentinel");
     }
 
     #[test]
