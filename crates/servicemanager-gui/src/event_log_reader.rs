@@ -66,6 +66,82 @@ fn parse_tail_into(path: &std::path::Path, out: &mut Vec<EventRecord>) {
     }
 }
 
+/// Maximum bytes scanned per log file. 2× the supervisor's rotation
+/// threshold — a file larger than this is either a manual paste or a
+/// rotation race, and the GUI must not be forced into multi-MB scans
+/// every refresh. Over-cap files are tail-read (lose oldest records),
+/// not error.
+const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read every record across all retained log files whose parsed `ts`
+/// is `>= since`, returned ascending by parsed `OffsetDateTime` (NOT by
+/// the raw `ts` string — fractional seconds and non-Z offsets can lex-
+/// sort differently from their chronological order).
+///
+/// `Err` indicates a real I/O failure (open succeeded, read failed
+/// mid-stream). Missing files are NOT errors — they yield `Ok(empty)`.
+/// Malformed lines and records with unparseable `ts` are silently
+/// skipped. Per-file size capped at `MAX_FILE_BYTES`; over that, the
+/// file is tail-read and the first (partial) line dropped.
+pub fn read_since(since: time::OffsetDateTime) -> std::io::Result<Vec<EventRecord>> {
+    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+    use time::format_description::well_known::Rfc3339;
+
+    let mut parsed: Vec<(time::OffsetDateTime, EventRecord)> = Vec::new();
+
+    // Scan oldest backup first (.4) through active. The final sort makes
+    // file order irrelevant for correctness, but oldest-first keeps the
+    // intermediate vector roughly time-ordered, which the sort handles
+    // efficiently.
+    let paths: Vec<std::path::PathBuf> = (1..=servicemanager_core::paths::BACKUP_RETENTION_COUNT)
+        .rev()
+        .filter_map(|n| servicemanager_core::paths::events_log_backup_n(n).ok())
+        .chain(servicemanager_core::paths::events_log().ok())
+        .collect();
+
+    for path in &paths {
+        let mut file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        let len = file.metadata()?.len();
+        let mut partial = false;
+        if len > MAX_FILE_BYTES {
+            file.seek(SeekFrom::Start(len - MAX_FILE_BYTES))?;
+            partial = true;
+        }
+        let reader = BufReader::new(file);
+        let mut lines = reader.lines();
+        if partial {
+            // The seek landed mid-line; drop the truncated first record.
+            let _ = lines.next();
+        }
+        for line_res in lines {
+            let line = line_res?; // I/O failure mid-read → propagate.
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(rec) = serde_json::from_str::<EventRecord>(&line) else {
+                continue;
+            };
+            let Ok(ts) = time::OffsetDateTime::parse(&rec.ts, &Rfc3339) else {
+                continue;
+            };
+            if ts >= since {
+                parsed.push((ts, rec));
+            }
+        }
+    }
+
+    // Sort by parsed instant — NOT the raw ts string. RFC 3339 with
+    // fractional seconds or non-Z offsets parses correctly but does not
+    // lex-sort chronologically, and downstream interval math depends on
+    // true chronological order.
+    parsed.sort_by_key(|(ts, _)| *ts);
+    Ok(parsed.into_iter().map(|(_, rec)| rec).collect())
+}
+
 /// Convert an RFC 3339 UTC `ts` (as produced by the supervisor) into a
 /// local `HH:MM:SS` string for display. Falls back to the first eight
 /// characters of the input (or the empty string) on parse failure — the
@@ -263,5 +339,125 @@ mod tests {
         assert_eq!(out[0].service, "newest");
         assert_eq!(out[1].service, "middle");
         assert_eq!(out[2].service, "oldest");
+    }
+
+    use time::macros::datetime;
+
+    fn write_backup_n(n: u8, lines: &[&str]) {
+        let path = servicemanager_core::paths::events_log_backup_n(n).unwrap();
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    }
+
+    #[test]
+    fn read_since_returns_records_within_window_ascending() {
+        let (_g, _dir) = isolate();
+        write_active(&[
+            r#"{"ts":"2026-05-22T14:15:02Z","service":"B","event":"started","pid":2}"#,
+            r#"{"ts":"2026-05-22T14:15:00Z","service":"A","event":"started","pid":1}"#,
+            r#"{"ts":"2026-05-22T14:15:05Z","service":"C","event":"started","pid":3}"#,
+        ]);
+        let since = datetime!(2026-05-22 14:15:00 UTC);
+        let out = read_since(since).unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].service, "A");
+        assert_eq!(out[1].service, "B");
+        assert_eq!(out[2].service, "C");
+    }
+
+    #[test]
+    fn read_since_filters_older_records() {
+        let (_g, _dir) = isolate();
+        write_active(&[
+            r#"{"ts":"2026-04-01T00:00:00Z","service":"Old","event":"started","pid":1}"#,
+            r#"{"ts":"2026-05-22T14:15:00Z","service":"New","event":"started","pid":2}"#,
+        ]);
+        let since = datetime!(2026-05-01 00:00:00 UTC);
+        let out = read_since(since).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].service, "New");
+    }
+
+    #[test]
+    fn read_since_reads_all_four_backups_plus_active() {
+        let (_g, _dir) = isolate();
+        write_backup_n(4, &[r#"{"ts":"2026-05-20T00:00:00Z","service":"B4","event":"started","pid":1}"#]);
+        write_backup_n(3, &[r#"{"ts":"2026-05-21T00:00:00Z","service":"B3","event":"started","pid":2}"#]);
+        write_backup_n(2, &[r#"{"ts":"2026-05-22T00:00:00Z","service":"B2","event":"started","pid":3}"#]);
+        write_backup_n(1, &[r#"{"ts":"2026-05-23T00:00:00Z","service":"B1","event":"started","pid":4}"#]);
+        write_active(&[r#"{"ts":"2026-05-23T12:00:00Z","service":"Active","event":"started","pid":5}"#]);
+        let since = datetime!(2026-05-19 00:00:00 UTC);
+        let out = read_since(since).unwrap();
+        assert_eq!(out.len(), 5);
+        // Ascending by ts:
+        assert_eq!(out[0].service, "B4");
+        assert_eq!(out[1].service, "B3");
+        assert_eq!(out[2].service, "B2");
+        assert_eq!(out[3].service, "B1");
+        assert_eq!(out[4].service, "Active");
+    }
+
+    #[test]
+    fn read_since_skips_malformed_lines() {
+        let (_g, _dir) = isolate();
+        write_active(&[
+            r#"{"ts":"2026-05-22T14:15:00Z","service":"A","event":"started","pid":1}"#,
+            r#"GARBAGE"#,
+            r#"{"ts":"NOT-A-DATE","service":"B","event":"started","pid":2}"#,
+            r#"{"ts":"2026-05-22T14:15:05Z","service":"C","event":"started","pid":3}"#,
+        ]);
+        let since = datetime!(2026-01-01 00:00:00 UTC);
+        let out = read_since(since).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].service, "A");
+        assert_eq!(out[1].service, "C");
+    }
+
+    #[test]
+    fn read_since_missing_files_yields_empty_ok() {
+        let (_g, _dir) = isolate();
+        let out = read_since(datetime!(2026-01-01 00:00:00 UTC)).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn read_since_sorts_by_parsed_instant_not_string() {
+        // D2 regression: records with non-Z offsets parse correctly but
+        // lex-sort differently from their chronological order.
+        //   T1 = 2026-05-23T09:00:00+01:00  (08:00:00 UTC) — string lex-LARGER
+        //   T2 = 2026-05-23T08:30:00Z      (08:30:00 UTC) — string lex-SMALLER
+        // Instant order: T1 (08:00) < T2 (08:30). String order: T2 < T1.
+        let (_g, _dir) = isolate();
+        write_active(&[
+            r#"{"ts":"2026-05-23T08:30:00Z","service":"second","event":"started","pid":1}"#,
+            r#"{"ts":"2026-05-23T09:00:00+01:00","service":"first","event":"started","pid":2}"#,
+        ]);
+        let since = datetime!(2026-01-01 00:00:00 UTC);
+        let out = read_since(since).unwrap();
+        assert_eq!(out.len(), 2);
+        // True instant order: first (08:00 UTC) before second (08:30 UTC).
+        assert_eq!(out[0].service, "first");
+        assert_eq!(out[1].service, "second");
+    }
+
+    #[test]
+    fn read_since_caps_file_size_with_tail_read() {
+        // D7 regression: a file larger than MAX_FILE_BYTES must be
+        // tail-read (oldest records silently lost), NOT errored.
+        let (_g, _dir) = isolate();
+        let path = servicemanager_core::paths::events_log().unwrap();
+        let pad_line = "x".repeat(1024);
+        let mut text = String::new();
+        for _ in 0..(17 * 1024) {
+            text.push_str(&pad_line);
+            text.push('\n');
+        }
+        text.push_str(r#"{"ts":"2026-05-23T12:00:00Z","service":"tail","event":"started","pid":99}"#);
+        text.push('\n');
+        std::fs::write(&path, text).unwrap();
+
+        let out = read_since(datetime!(2026-01-01 00:00:00 UTC))
+            .expect("over-cap file should tail-read, not error");
+        // Pad lines are not valid JSON → skipped. The tail record survives.
+        assert!(out.iter().any(|r| r.service == "tail"));
     }
 }
