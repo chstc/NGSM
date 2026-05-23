@@ -19,6 +19,7 @@ embed-resource = "3"
 servicemanager-core = { workspace = true }
 servicemanager-win32 = { workspace = true }
 servicemanager-registry = { workspace = true }
+servicemanager-ops = { workspace = true }
 servicemanager-runner = { workspace = true }
 servicemanager-gui = { workspace = true }
 servicemanager-broker = { workspace = true, optional = true }
