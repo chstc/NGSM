@@ -4045,11 +4045,12 @@ dependencies = [
 
 [[package]]
 name = "servicemanager-broker"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
  "serde_json",
  "servicemanager-core",
+ "servicemanager-ops",
  "servicemanager-registry",
  "servicemanager-win32",
  "thiserror 1.0.69",
@@ -4058,7 +4059,7 @@ dependencies = [
 
 [[package]]
 name = "servicemanager-cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "embed-resource",
@@ -4067,6 +4068,7 @@ dependencies = [
  "servicemanager-broker",
  "servicemanager-core",
  "servicemanager-gui",
+ "servicemanager-ops",
  "servicemanager-registry",
  "servicemanager-runner",
  "servicemanager-win32",
@@ -4074,7 +4076,7 @@ dependencies = [
 
 [[package]]
 name = "servicemanager-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -4084,12 +4086,13 @@ dependencies = [
 
 [[package]]
 name = "servicemanager-gui"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "rfd",
  "serde",
  "serde_json",
  "servicemanager-core",
+ "servicemanager-ops",
  "servicemanager-registry",
  "servicemanager-win32",
  "slint",
@@ -4100,8 +4103,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "servicemanager-ops"
+version = "0.2.2"
+dependencies = [
+ "servicemanager-core",
+ "servicemanager-registry",
+ "servicemanager-win32",
+]
+
+[[package]]
 name = "servicemanager-registry"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "servicemanager-core",
  "thiserror 1.0.69",
@@ -4110,7 +4122,7 @@ dependencies = [
 
 [[package]]
 name = "servicemanager-runner"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "servicemanager-core",
  "servicemanager-registry",
@@ -4120,7 +4132,7 @@ dependencies = [
 
 [[package]]
 name = "servicemanager-supervisor"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "os_pipe",
  "serde_json",
@@ -4134,10 +4146,11 @@ dependencies = [
 
 [[package]]
 name = "servicemanager-win32"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
  "servicemanager-core",
+ "tempfile",
  "thiserror 1.0.69",
  "windows 0.58.0",
 ]
