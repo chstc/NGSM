@@ -833,26 +833,31 @@ fn cmd_unset(name: &str, param: &str, json: bool) -> Result<()> {
 fn cmd_edit(args: &EditArgs, json: bool) -> Result<()> {
     let want_native = args.display.is_some() || args.start.is_some();
 
-    // When --force-native is set and only native SCM fields are being changed,
-    // ops::edit is not usable (it always enforces NGSM-managed ownership).
-    // Fall through to the direct SCM call for that narrow case.
-    if args.force_native && want_native {
-        // Also reject managed-field edits on a non-managed service even with
-        // --force-native: the managed registry key must exist for those to make
-        // sense.
-        let managed_cfg = servicemanager_registry::read_managed_config(&args.name)?;
-        let want_managed = args.application.is_some()
+    // Refuse to mix --force-native (which targets only native SCM metadata)
+    // with managed-field flags. The operator's intent is ambiguous: a partial
+    // success that updates only the native fields would silently swallow the
+    // managed-field changes.
+    if args.force_native {
+        let any_managed = args.application.is_some()
             || args.app_parameters.is_some()
             || args.app_directory.is_some()
             || args.stdout.is_some()
             || args.stderr.is_some();
-        if want_managed && managed_cfg.is_none() {
-            return Err(servicemanager_core::Error::InvalidConfig(format!(
-                "'{}' is not an NGSM-managed service — managed fields can only be edited on \
-                 a service installed via NGSM; use `install` instead",
-                args.name
-            )));
+        if any_managed {
+            return Err(servicemanager_core::Error::other(
+                "--force-native cannot be combined with managed-field flags \
+                 (--application, --app-parameters, --app-directory, --stdout, --stderr). \
+                 Run two separate `ngsm edit` invocations — one with --force-native for \
+                 native-only fields, and one without it for managed fields."
+                    .to_string(),
+            ));
         }
+    }
+
+    // When --force-native is set and only native SCM fields are being changed,
+    // ops::edit is not usable (it always enforces NGSM-managed ownership).
+    // Fall through to the direct SCM call for that narrow case.
+    if args.force_native && want_native {
         update_native_config(
             &args.name,
             args.display.as_deref(),

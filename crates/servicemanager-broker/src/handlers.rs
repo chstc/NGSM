@@ -262,26 +262,30 @@ fn op_edit(args: &Value) -> Result<Value, String> {
     let a: EditArgs = parse_args(args)?;
     let want_native = a.display_name.is_some() || a.start_type.is_some();
 
-    // When force_native is set for a native-only SCM edit, ops::edit cannot
-    // be used (it enforces NGSM-managed ownership). Apply the native change
-    // directly; reject any managed-field combination in the same call.
-    if a.force_native && want_native {
-        let want_managed = a.application.is_some()
+    // Refuse to mix force_native (which targets only native SCM metadata)
+    // with managed-field flags. A partial success that updates only the native
+    // fields would silently swallow the managed-field changes.
+    if a.force_native {
+        let any_managed = a.application.is_some()
             || a.app_parameters.is_some()
             || a.app_directory.is_some()
             || a.stdout.is_some()
             || a.stderr.is_some();
-        if want_managed {
-            let managed_cfg =
-                servicemanager_registry::read_managed_config(&a.name).map_err(|e| e.to_string())?;
-            if managed_cfg.is_none() {
-                return Err(format!(
-                    "'{}' is not an NGSM-managed service; managed fields can only be edited on a \
-                     managed service",
-                    a.name
-                ));
-            }
+        if any_managed {
+            return Err(
+                "--force-native cannot be combined with managed-field flags \
+                 (application, app_parameters, app_directory, stdout, stderr). \
+                 Run two separate edit calls — one with force_native for \
+                 native-only fields, and one without it for managed fields."
+                    .to_string(),
+            );
         }
+    }
+
+    // When force_native is set for a native-only SCM edit, ops::edit cannot
+    // be used (it enforces NGSM-managed ownership). Apply the native change
+    // directly.
+    if a.force_native && want_native {
         let start = match a.start_type.as_deref() {
             Some(s) => Some(parse_start_type(s)?),
             None => None,
