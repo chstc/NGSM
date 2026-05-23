@@ -5,8 +5,9 @@
 //! freeze the frame. We send `Job`s to a worker and post `JobResult`s
 //! back, calling a `wake` callback after each so the UI drains them promptly.
 
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError};
+use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::sync::Arc;
 use std::thread;
 
@@ -75,6 +76,28 @@ pub enum JobResult {
 /// realistic UI burst; it prevents stale auto-refresh ticks from piling up.
 const JOB_CHANNEL_CAP: usize = 16;
 
+/// Error returned by [`JobSender::send`].
+///
+/// Does not carry the rejected `Job` to keep the variant size small — `Job`
+/// can contain large payloads (specs, strings) and clippy's `result_large_err`
+/// lint would fire if the error variant propagated those.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobSendError {
+    /// The worker queue is full (back-pressure from a slow worker).
+    Full,
+    /// The worker thread has exited and the receiver is gone.
+    Disconnected,
+}
+
+impl fmt::Display for JobSendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            JobSendError::Full => write!(f, "job queue full"),
+            JobSendError::Disconnected => write!(f, "worker thread disconnected"),
+        }
+    }
+}
+
 /// A clonable sender that coalesces `Job::Refresh` requests and delivers jobs
 /// to the bounded worker queue without blocking the UI thread.
 #[derive(Clone)]
@@ -87,12 +110,13 @@ pub struct JobSender {
 }
 
 impl JobSender {
-    /// Try to send `job` to the worker. Returns an error if the channel is
-    /// full (back-pressure) or disconnected. Never blocks the caller.
+    /// Try to send `job` to the worker. Returns [`JobSendError`] if the
+    /// channel is full or disconnected. Never blocks the caller.
     ///
-    /// A `Job::Refresh` is silently dropped when one is already pending —
-    /// the in-flight refresh will pick up the latest state when it runs.
-    pub fn send(&self, job: Job) -> Result<(), TrySendError<Job>> {
+    /// A `Job::Refresh` is silently dropped (returns `Ok`) when one is already
+    /// pending — the in-flight refresh will pick up the latest state when it
+    /// runs.
+    pub fn send(&self, job: Job) -> Result<(), JobSendError> {
         if matches!(job, Job::Refresh) {
             // swap returns the previous value; if it was already true there is
             // already a pending Refresh — discard this duplicate.
@@ -100,7 +124,10 @@ impl JobSender {
                 return Ok(());
             }
         }
-        self.inner.try_send(job)
+        self.inner.try_send(job).map_err(|e| match e {
+            std::sync::mpsc::TrySendError::Full(_) => JobSendError::Full,
+            std::sync::mpsc::TrySendError::Disconnected(_) => JobSendError::Disconnected,
+        })
     }
 }
 
