@@ -67,7 +67,6 @@ export component ServicesView inherits Rectangle {
     callback filter-changed(bool);
     callback running-changed(bool);
     in-out property <bool> running-only;
-    callback row-selected(int);
     callback sort-changed(int);
     callback auto-refresh-changed(bool);
     in property <int> sort-column;
@@ -288,7 +287,6 @@ export component ServicesView inherits Rectangle {
                                 mouse-cursor: pointer;
                                 clicked => {
                                     root.selected = idx;
-                                    root.row-selected(idx);
                                 }
                             }
                             HorizontalLayout {

@@ -37,7 +37,6 @@ export component MainWindow inherits Window {
     callback action(string, string);
     callback filter-changed(bool);
     callback search-changed(string);
-    callback row-selected(int);
     callback relaunch-admin();
     callback sort-changed(int);
     in property <int> sort-column;
@@ -297,7 +296,6 @@ export component MainWindow inherits Window {
                         action(verb, name) => { root.action(verb, name); }
                         filter-changed(managed) => { root.filter-changed(managed); }
                         running-changed(v) => { root.running-changed(v); }
-                        row-selected(idx) => { root.row-selected(idx); }
                         sort-changed(c) => { root.sort-changed(c); }
                         auto-refresh-changed(v) => { root.settings-set-auto-refresh(v); }
                     }
