@@ -326,6 +326,14 @@ pub fn start_service(name: &str) -> Result<()> {
 /// does not include the per-process exit code; callers can pull that
 /// separately via [`crate::scm::query_service`].
 pub fn control_service(name: &str, signal: ServiceControlSignal) -> Result<ServiceRuntimeState> {
+    if let ServiceControlSignal::User(code) = signal {
+        if !(128..=255).contains(&code) {
+            return Err(Error::other(format!(
+                "user-defined service control code {code} is out of range; SCM reserves \
+                 128..=255 for user controls"
+            )));
+        }
+    }
     validate_service_name(name)?;
     let scm = open_scm(SC_MANAGER_CONNECT)?;
     let svc = open_service_handle(&scm, name, signal.required_access())?;
@@ -613,4 +621,49 @@ mod tests {
     // reject it. The formatting logic itself (`quote_windows_arg`) is tested
     // in servicemanager-core; end-to-end formatting is covered by integration
     // testing during the install flow.
+
+    // -----------------------------------------------------------------------
+    // control_service — user control code range validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn control_service_rejects_user_code_below_128() {
+        let err = control_service("AnyName", ServiceControlSignal::User(5))
+            .expect_err("code 5 is in SCM-reserved range, not user range");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("out of range"),
+            "error should mention out of range: {msg}"
+        );
+        assert!(
+            msg.contains("128..=255") || (msg.contains("128") && msg.contains("255")),
+            "error should mention the valid range: {msg}"
+        );
+    }
+
+    #[test]
+    fn control_service_rejects_user_code_above_255() {
+        let err = control_service("AnyName", ServiceControlSignal::User(256))
+            .expect_err("code 256 is out of user range");
+        assert!(err.to_string().contains("out of range"));
+    }
+
+    #[test]
+    fn control_service_accepts_user_code_174() {
+        // SERVICE_CONTROL_ROTATE is 174, the NGSM rotate signal.
+        // This test verifies the guard passes for 174 — the call will
+        // then fail because "AnyName" doesn't exist, but the failure
+        // must NOT be the out-of-range error. It must be an SCM error
+        // (or similar) about the service not existing.
+        let err = control_service(
+            "DoesNotExistService_xyz123",
+            ServiceControlSignal::User(174),
+        )
+        .expect_err("service doesn't exist, so the call fails — but not for range reasons");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("out of range"),
+            "code 174 must pass range validation: got {msg}"
+        );
+    }
 }
