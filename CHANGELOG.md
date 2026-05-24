@@ -2,6 +2,89 @@
 
 All notable changes to NGSM. Versions follow `vMAJOR.MINOR.PATCH`; categories follow [Keep a Changelog](https://keepachangelog.com).
 
+## [v0.3.1] — 2026-05-23
+
+Code-review remediation cycle on top of v0.3.0. 20 findings addressed across
+3 HIGH (security and correctness), 10 MEDIUM (validation, race, registry
+hygiene, doc accuracy), and 7 LOW (cosmetic, error reporting). No new
+features; no public API breakage.
+
+### Fixed
+
+- **(H-01)** `validate_absolute_path` now rejects embedded NUL and control
+  characters, closing a latent path-truncation hazard at the registry/Win32
+  boundary.
+- **(H-02)** GUI's `JobSender` no longer leaves `pending_refresh` stuck on
+  `true` when a Refresh `try_send` fails — previously, a single transient
+  queue-full / disconnected error would silently disable all future
+  refreshes until restart.
+- **(H-03)** Broker connection watchdog now operates on a duplicated handle
+  it owns, eliminating a TOCTOU race where the watchdog could cancel or
+  disconnect a reused handle value belonging to an unrelated object.
+- **(M-01)** Install now validates the full managed config before touching
+  SCM. Invalid `Application` paths, exit-action keys, or hooks are rejected
+  up front; rollback remains as defense-in-depth.
+- **(M-02)** Supervisor records the child-exit result before clearing
+  `current_pid`, so a Stop arriving after the exit but before the
+  ChildExited message no longer skips `record_child_exit` (Exit/Post hook
+  + `last_exit_code` update).
+- **(M-03)** Broker post-op state-query failures are now reported as
+  `state: null` + a `warning` field, instead of being collapsed to an empty
+  string that looks like success.
+- **(M-04)** Registry path-valued fields cleared via the GUI now delete the
+  value instead of writing `""`. For stdio paths, the associated
+  sharing/disposition/flags/copy-and-truncate attributes are also deleted
+  so no orphan settings linger.
+- **(M-05)** Registry writer pre-validates every string for embedded NUL
+  before any mutation, so a later invalid field can no longer leave earlier
+  fields partially written.
+- **(M-06)** Recovery exit-action map keys are now validated at the ops
+  boundary: only numeric `i32` strings are accepted; `"default"`, empty
+  strings, and embedded controls/whitespace/`=` are rejected.
+- **(M-07)** CLI hook parser now rejects unsupported `event/action` pairs
+  and empty hook commands, so a hook that would never run can no longer
+  install successfully.
+- **(M-08)** Event-schema doc-comments corrected: unknown variants are
+  serde rejections (the GUI reader catches and skips), not silent passes.
+  Tests pin the current behavior so adding `#[serde(other)]` later is a
+  deliberate, test-breaking change.
+- **(M-09)** GUI edit-form trims leading/trailing whitespace in path-like
+  fields (`application`, `app_directory`, `stdout`, `stderr`) before
+  diffing, so accidental whitespace no longer reaches the registry.
+  `app_parameters` whitespace is preserved (CLI args may carry intentional
+  spacing).
+- **(M-10)** GUI config loader clamps `auto_refresh_secs` into `1..=3600`
+  on disk, with a startup warning when correction is needed. Previously
+  a hand-edited `0` would display `0` while ticking every second.
+- **(L-01)** `cargo fmt` applied across v0.3.0-introduced files
+  (paths.rs, data.rs, event_log_reader.rs, metrics.rs, event_log.rs).
+- **(L-02)** Supervisor stop/rotate/power signal send failures are now
+  logged with the specific signal name instead of being silently dropped.
+- **(L-03)** `create_dir_all` failures before log open are now logged with
+  the parent path, giving clearer diagnostics than the downstream open
+  error alone.
+
+### Changed
+
+- **(L-04)** Supervisor stop-method comment now describes the four
+  implemented phases (console, window, thread, terminate) accurately,
+  matching the current `AppStopMethodSkip` behavior.
+- **(L-05)** CLI package description updated to reflect the full v0.3
+  command surface.
+- **(L-06)** Runner and supervisor package descriptions dropped historical
+  "Phase 2" labels.
+- **(L-07)** README architecture statement clarified: NGSM targets all
+  Windows architectures, with x64 as the only one routinely built and
+  tested.
+
+### Notes
+
+This is a code-review remediation release. The new validation surfaces
+(M-01, M-06, M-07, H-01, M-05) reject configurations that v0.3.0 (and
+earlier) accepted but the runtime then quietly mishandled. Upgrading from
+v0.3.0 will surface those as install/edit errors at the boundary instead
+of broken services at runtime.
+
 ## [v0.3.0] — 2026-05-23
 
 Dashboard v0.3 — availability metric + tile classification breakdowns. The
@@ -114,6 +197,7 @@ Initial public release.
 - Optional named-pipe broker for headless automation (feature-gated, off by default).
 - Statically-linked C runtime — no DLLs to ship.
 
+[v0.3.1]: https://github.com/chstc/NGSM/releases/tag/v0.3.1
 [v0.3.0]: https://github.com/chstc/NGSM/releases/tag/v0.3.0
 [v0.2.3]: https://github.com/chstc/NGSM/releases/tag/v0.2.3
 [v0.1.0]: https://github.com/chstc/NGSM/releases/tag/v0.1.0
