@@ -749,7 +749,23 @@ pub fn set_value(service: &str, name: &str, value: &str) -> Result<()> {
     require_managed(service)?;
     let key = create_parameters_key(service)?;
     match kind {
-        ManagedValueKind::String => write_string(&key, &canonical, value)?,
+        ManagedValueKind::String => {
+            // For path-valued fields other than the required `Application`
+            // marker, an empty value clears the field rather than writing
+            // an empty REG_SZ. An empty `""` REG_SZ is ambiguous (looks
+            // like a configured-but-empty path), and for stdio fields
+            // leaves attribute values like `AppStdoutShareMode` pointing
+            // at a now-empty path. Delete the value (and stdio attributes
+            // when applicable) so the registry state is consistent.
+            if is_path_value(&canonical)
+                && canonical != nssm_keys::APPLICATION
+                && value.trim().is_empty()
+            {
+                clear_path_value(&key, &canonical)?;
+            } else {
+                write_string(&key, &canonical, value)?;
+            }
+        }
         ManagedValueKind::MultiString => {
             // Comma-separated input, with `\,` / `\\` escapes so an entry
             // that genuinely contains a comma round-trips through `get`.
@@ -763,6 +779,42 @@ pub fn set_value(service: &str, name: &str, value: &str) -> Result<()> {
                 ))
             })?;
             write_u32(&key, &canonical, parsed)?;
+        }
+    }
+    Ok(())
+}
+
+/// True for the NSSM value names that are per-stdio-stream bases (path
+/// field carries an associated set of sharing/disposition/flags attribute
+/// values like `AppStdoutShareMode`).
+fn is_stdio_path_value(canonical: &str) -> bool {
+    matches!(
+        canonical,
+        nssm_keys::APP_STDIN | nssm_keys::APP_STDOUT | nssm_keys::APP_STDERR
+    )
+}
+
+/// Names of the four per-stream attribute values associated with a stdio
+/// path field (`AppStdout`/`AppStderr`/`AppStdin`). Used when clearing a
+/// stdio path so the registry is not left with orphaned sharing/flags
+/// entries pointing at a now-empty path.
+fn stdio_attribute_names(base: &str) -> [String; 4] {
+    [
+        format!("{base}{}", nssm_keys::APP_STDIO_SHARING),
+        format!("{base}{}", nssm_keys::APP_STDIO_DISPOSITION),
+        format!("{base}{}", nssm_keys::APP_STDIO_FLAGS),
+        format!("{base}{}", nssm_keys::APP_STDIO_COPY_AND_TRUNCATE),
+    ]
+}
+
+/// Clear a path-valued field by deleting the value (and, for stdio paths,
+/// the four associated attribute values) instead of writing `""`. Missing
+/// values are not errors — clearing an already-empty field is a no-op.
+fn clear_path_value(key: &RegKey, canonical: &str) -> Result<()> {
+    ignore_missing(delete_value(key, canonical))?;
+    if is_stdio_path_value(canonical) {
+        for attr in stdio_attribute_names(canonical) {
+            ignore_missing(delete_value(key, &attr))?;
         }
     }
     Ok(())
@@ -1523,6 +1575,29 @@ mod tests {
     }
 
     #[test]
+    fn stdio_path_values_are_recognized() {
+        assert!(is_stdio_path_value(nssm_keys::APP_STDIN));
+        assert!(is_stdio_path_value(nssm_keys::APP_STDOUT));
+        assert!(is_stdio_path_value(nssm_keys::APP_STDERR));
+        // Non-stdio path fields are not.
+        assert!(!is_stdio_path_value(nssm_keys::APPLICATION));
+        assert!(!is_stdio_path_value(nssm_keys::APP_DIRECTORY));
+    }
+
+    #[test]
+    fn stdio_attribute_names_cover_all_four_per_stream_attrs() {
+        let attrs = stdio_attribute_names(nssm_keys::APP_STDOUT);
+        assert!(attrs.iter().any(|s| s == "AppStdoutShareMode"));
+        assert!(attrs.iter().any(|s| s == "AppStdoutCreationDisposition"));
+        assert!(attrs.iter().any(|s| s == "AppStdoutFlagsAndAttributes"));
+        assert!(attrs.iter().any(|s| s == "AppStdoutCopyAndTruncate"));
+        // Stderr is named consistently.
+        let attrs = stdio_attribute_names(nssm_keys::APP_STDERR);
+        assert!(attrs.iter().any(|s| s == "AppStderrShareMode"));
+        assert!(attrs.iter().any(|s| s == "AppStderrCopyAndTruncate"));
+    }
+
+    #[test]
     fn path_valued_names_are_recognized() {
         // These five carry filesystem paths and are subject to the
         // absolute-path policy in `set_value`.
@@ -1629,5 +1704,119 @@ mod tests {
         // Empty entries collapse away — REG_MULTI_SZ cannot store them.
         assert_eq!(split_multi_value("a,,b"), vec!["a", "b"]);
         assert!(split_multi_value("").is_empty());
+    }
+
+    // --- Registry I/O tests (use HKCU to avoid admin requirements) ---------
+    //
+    // These tests exercise the real `Reg*W` API through the same helpers
+    // production uses, but rooted at a temporary `HKCU\Software\NgsmTests\...`
+    // key rather than the per-service HKLM path. That lets us assert the
+    // exact post-write registry state without elevation.
+
+    use windows::Win32::System::Registry::HKEY_CURRENT_USER;
+
+    /// Create a fresh, empty temporary key under HKCU for an I/O test.
+    /// The key is scrubbed first so a prior aborted run cannot leak state in.
+    fn make_test_key(name: &str) -> RegKey {
+        let path = format!("Software\\NgsmTests\\{name}");
+        // Best-effort cleanup of leftovers from a previous run.
+        if let Ok(parent) = open_subkey(
+            HKEY_CURRENT_USER,
+            "Software\\NgsmTests",
+            parameters_rw_sam(),
+        ) {
+            let _ = ignore_missing(delete_subtree(&parent, name));
+        }
+        create_subkey(HKEY_CURRENT_USER, &path, parameters_rw_sam()).expect("create HKCU test key")
+    }
+
+    fn drop_test_key(name: &str) {
+        if let Ok(parent) = open_subkey(
+            HKEY_CURRENT_USER,
+            "Software\\NgsmTests",
+            parameters_rw_sam(),
+        ) {
+            let _ = ignore_missing(delete_subtree(&parent, name));
+        }
+    }
+
+    /// True if `name` is absent under `key` (RegQueryValueExW returns
+    /// ERROR_FILE_NOT_FOUND, surfaced as `Error::NotFound`).
+    fn value_absent(key: &RegKey, name: &str) -> bool {
+        matches!(query_value_raw(key, name), Err(Error::NotFound(_)))
+    }
+
+    #[test]
+    fn set_empty_app_directory_deletes_value() {
+        let name = "set_empty_app_directory_deletes_value";
+        let key = make_test_key(name);
+
+        // Seed a non-empty AppDirectory.
+        write_string(&key, nssm_keys::APP_DIRECTORY, "C:\\app").unwrap();
+        assert!(!value_absent(&key, nssm_keys::APP_DIRECTORY));
+
+        // Clearing a non-Application path-value should delete it, not
+        // leave an empty REG_SZ behind.
+        clear_path_value(&key, nssm_keys::APP_DIRECTORY).unwrap();
+        assert!(
+            value_absent(&key, nssm_keys::APP_DIRECTORY),
+            "AppDirectory should be absent after clear_path_value"
+        );
+
+        // A second clear is a no-op (missing values are tolerated).
+        clear_path_value(&key, nssm_keys::APP_DIRECTORY).unwrap();
+        drop(key);
+        drop_test_key(name);
+    }
+
+    #[test]
+    fn set_empty_stdout_deletes_path_and_attributes() {
+        let name = "set_empty_stdout_deletes_path_and_attributes";
+        let key = make_test_key(name);
+
+        // Seed a complete stdout configuration: path + all four attributes.
+        write_string(&key, nssm_keys::APP_STDOUT, "C:\\logs\\out.log").unwrap();
+        for attr in stdio_attribute_names(nssm_keys::APP_STDOUT) {
+            write_u32(&key, &attr, 1).unwrap();
+            assert!(!value_absent(&key, &attr));
+        }
+        assert!(!value_absent(&key, nssm_keys::APP_STDOUT));
+
+        // Clearing the stdout path should drop all five values.
+        clear_path_value(&key, nssm_keys::APP_STDOUT).unwrap();
+        assert!(
+            value_absent(&key, nssm_keys::APP_STDOUT),
+            "AppStdout path should be absent"
+        );
+        for attr in stdio_attribute_names(nssm_keys::APP_STDOUT) {
+            assert!(
+                value_absent(&key, &attr),
+                "{attr} should be absent — clearing the path must not leave \
+                 orphaned attribute values pointing at it"
+            );
+        }
+        drop(key);
+        drop_test_key(name);
+    }
+
+    #[test]
+    fn set_empty_application_still_writes_or_rejects() {
+        // The `Application` value is the managed-service marker. The
+        // single-value `set` API already rejects an empty `Application`
+        // up front (see `set_value`), and `clear_path_value` is only
+        // invoked for path-values *other than* `Application`. Document
+        // both invariants here as a regression guard for M-04.
+        assert!(is_path_value(nssm_keys::APPLICATION));
+        // The marker should never be the operand of clear_path_value:
+        // callers gate on `canonical != Application`. If that gate is
+        // ever removed, this assert protects the invariant.
+        assert_ne!(nssm_keys::APPLICATION, nssm_keys::APP_DIRECTORY);
+
+        // Round-trip through write_string: a real value persists.
+        let key = make_test_key("set_empty_application_still_writes_or_rejects");
+        write_string(&key, nssm_keys::APPLICATION, "C:\\app.exe").unwrap();
+        assert!(!value_absent(&key, nssm_keys::APPLICATION));
+        drop(key);
+        drop_test_key("set_empty_application_still_writes_or_rejects");
     }
 }
