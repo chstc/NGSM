@@ -606,11 +606,44 @@ fn cmd_status(name: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_install(args: &InstallArgs, json: bool) -> Result<()> {
-    let has_hooks = !args.hook.is_empty();
-    let has_rotation = args.rotate_bytes.is_some()
+/// True when the user passed any `--rotate-*` flag — i.e. asked install to
+/// configure log rotation. Centralised so the cmd_install dispatch, the
+/// extended path, and the validator below agree on what "rotation requested"
+/// means.
+fn install_args_have_rotation(args: &InstallArgs) -> bool {
+    args.rotate_bytes.is_some()
         || args.rotate_seconds.is_some()
-        || args.rotate_online != RotateOnlineArg::Offline;
+        || args.rotate_online != RotateOnlineArg::Offline
+}
+
+/// Reject install configurations that ask for log rotation without a log
+/// stream to rotate.
+///
+/// `ManagedApplicationConfig::has_online_rotation` (and the
+/// supervisor's rotate request path) require at least one redirected
+/// stdout/stderr stream; without one, the rotation config is inert and a
+/// later `ngsm rotate` is silently refused. Catching this at the CLI
+/// boundary surfaces the misconfiguration immediately, instead of
+/// installing a service whose rotation flags do nothing.
+pub(crate) fn validate_install_args(args: &InstallArgs) -> Result<()> {
+    if install_args_have_rotation(args) && args.stdout.is_none() && args.stderr.is_none() {
+        return Err(servicemanager_core::Error::InvalidConfig(
+            "rotation flags (--rotate-bytes, --rotate-seconds, --rotate-online) \
+             require --stdout and/or --stderr; rotation cannot operate without \
+             a redirected log stream"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn cmd_install(args: &InstallArgs, json: bool) -> Result<()> {
+    // Reject rotation flags without a redirected log stream before any
+    // SCM / registry side effect.
+    validate_install_args(args)?;
+
+    let has_hooks = !args.hook.is_empty();
+    let has_rotation = install_args_have_rotation(args);
 
     if has_hooks || has_rotation {
         // ops::install does not yet carry hooks or rotation in InstallSpec.
@@ -661,10 +694,7 @@ fn cmd_install_extended(args: &InstallArgs, json: bool) -> Result<()> {
         },
         ..Default::default()
     };
-    if args.rotate_bytes.is_some()
-        || args.rotate_seconds.is_some()
-        || args.rotate_online != RotateOnlineArg::Offline
-    {
+    if install_args_have_rotation(args) {
         managed.rotation = LogRotationConfig {
             enabled: Some(true),
             online: Some(args.rotate_online.as_nssm_value()),
@@ -1365,5 +1395,81 @@ mod tests {
     fn parse_exit_action_rejects_unknown() {
         assert!(parse_exit_action("reboot").is_err());
         assert!(parse_exit_action("").is_err());
+    }
+
+    /// Build an `InstallArgs` with the minimum required positional fields
+    /// and every optional knob at its default. Tests then mutate only the
+    /// flags they care about, so an unrelated field flip later cannot
+    /// silently broaden test coverage.
+    fn install_args_defaults() -> InstallArgs {
+        InstallArgs {
+            name: "TestSvc".into(),
+            application: "C:\\app\\svc.exe".into(),
+            app_parameters: None,
+            app_directory: None,
+            display: None,
+            start: StartTypeArg::Manual,
+            stdout: None,
+            stderr: None,
+            rotate_bytes: None,
+            rotate_seconds: None,
+            rotate_online: RotateOnlineArg::Offline,
+            hook: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn parse_install_args_rejects_rotation_flags_without_stdout_or_stderr() {
+        // --rotate-bytes alone (no --stdout / --stderr) must be rejected.
+        // Without a redirected log stream, `has_online_rotation` returns
+        // false and `ngsm rotate` later refuses the request — install
+        // should not silently accept inert rotation config.
+        let mut args = install_args_defaults();
+        args.rotate_bytes = Some(1_024_000);
+        let err = validate_install_args(&args).expect_err(
+            "--rotate-bytes without --stdout/--stderr must be rejected at the CLI boundary",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--stdout") && msg.contains("--stderr"),
+            "error should name the missing flags, got {msg:?}"
+        );
+        assert!(
+            msg.contains("rotation"),
+            "error should explain why rotation needs them, got {msg:?}"
+        );
+
+        // --rotate-seconds alone — same rejection.
+        let mut args = install_args_defaults();
+        args.rotate_seconds = Some(3600);
+        assert!(validate_install_args(&args).is_err());
+
+        // --rotate-online online — same rejection.
+        let mut args = install_args_defaults();
+        args.rotate_online = RotateOnlineArg::Online;
+        assert!(validate_install_args(&args).is_err());
+    }
+
+    #[test]
+    fn parse_install_args_accepts_rotation_flags_with_stdout() {
+        // The complementary positive case: rotation flags + --stdout
+        // (or --stderr) is the supported configuration and must pass.
+        let mut args = install_args_defaults();
+        args.rotate_bytes = Some(1_024_000);
+        args.stdout = Some("C:\\logs\\out.log".into());
+        validate_install_args(&args).expect("rotation + stdout is valid");
+
+        let mut args = install_args_defaults();
+        args.rotate_seconds = Some(3600);
+        args.stderr = Some("C:\\logs\\err.log".into());
+        validate_install_args(&args).expect("rotation + stderr is valid");
+    }
+
+    #[test]
+    fn parse_install_args_accepts_no_rotation_and_no_streams() {
+        // The vanilla install path (no rotation, no streams) must keep
+        // passing — the validator only fires when rotation is requested.
+        let args = install_args_defaults();
+        validate_install_args(&args).expect("plain install with no rotation must pass");
     }
 }
