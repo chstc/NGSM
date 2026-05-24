@@ -204,18 +204,15 @@ fn execute(job: Job) -> JobResult {
             Ok((defs, mut warnings)) => {
                 let now = time::OffsetDateTime::now_utc();
                 let since = now - time::Duration::days(30);
-                let (events_window, read_failed) =
-                    match crate::event_log_reader::read_since(since) {
-                        Ok(v) => (v, false),
-                        Err(e) => {
-                            warnings.push(format!(
-                                "event log unreadable: {e} — availability unknown"
-                            ));
-                            (Vec::new(), true)
-                        }
-                    };
-                let mut metrics =
-                    crate::metrics::compute_metrics(&defs, &events_window, now);
+                let (events_window, read_failed) = match crate::event_log_reader::read_since(since)
+                {
+                    Ok(v) => (v, false),
+                    Err(e) => {
+                        warnings.push(format!("event log unreadable: {e} — availability unknown"));
+                        (Vec::new(), true)
+                    }
+                };
+                let mut metrics = crate::metrics::compute_metrics(&defs, &events_window, now);
                 if read_failed {
                     metrics.availability_unknown = true;
                 }

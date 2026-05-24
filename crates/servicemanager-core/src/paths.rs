@@ -52,9 +52,7 @@ pub fn events_log_backup_n(n: u8) -> std::io::Result<PathBuf> {
     if !(1..=BACKUP_RETENTION_COUNT).contains(&n) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!(
-                "events_log_backup_n: n must be 1..={BACKUP_RETENTION_COUNT}, got {n}"
-            ),
+            format!("events_log_backup_n: n must be 1..={BACKUP_RETENTION_COUNT}, got {n}"),
         ));
     }
     Ok(ngsm_program_data()?.join(format!("events.log.{n}")))

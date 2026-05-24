@@ -83,8 +83,7 @@ fn build_service_timelines(
     let mut out = Vec::new();
     for def in defs.iter().filter(|d| d.is_managed()) {
         let svc = def.native.name.as_str();
-        let svc_events: Vec<&EventRecord> =
-            events.iter().filter(|e| e.service == svc).collect();
+        let svc_events: Vec<&EventRecord> = events.iter().filter(|e| e.service == svc).collect();
         if svc_events.is_empty() {
             continue;
         }
@@ -115,7 +114,9 @@ fn build_up_intervals(
     let mut up_since: Option<OffsetDateTime> = None;
     let mut last_event_kind: Option<EventKind> = None;
     for rec in events {
-        let Some(ts) = parse_ts(&rec.ts) else { continue };
+        let Some(ts) = parse_ts(&rec.ts) else {
+            continue;
+        };
         let ts = ts.min(now); // Clamp future skew.
         if ts < start {
             continue;
@@ -126,9 +127,7 @@ fn build_up_intervals(
                     up_since = Some(ts.max(start));
                 }
             }
-            EventKind::ChildExited
-            | EventKind::Stopped
-            | EventKind::Throttled => {
+            EventKind::ChildExited | EventKind::Stopped | EventKind::Throttled => {
                 if let Some(s) = up_since.take() {
                     if ts > s {
                         intervals.push((s, ts));
@@ -144,7 +143,10 @@ fn build_up_intervals(
     // consistency safeguard for the SCM-state safeguard test.
     if let Some(s) = up_since {
         if state == Some(ServiceState::Running)
-            && matches!(last_event_kind, Some(EventKind::Started | EventKind::Restarted))
+            && matches!(
+                last_event_kind,
+                Some(EventKind::Started | EventKind::Restarted)
+            )
             && now > s
         {
             intervals.push((s, now));
@@ -211,10 +213,7 @@ fn compute_availability(
 /// today's bucket via the "up" interval they opened. Days with no
 /// contributing service carry forward from the previous bucket; the
 /// first bucket with no data falls back to 100.
-fn compute_daily_sparkline(
-    timelines: &[ServiceTimeline],
-    now: OffsetDateTime,
-) -> Vec<f32> {
+fn compute_daily_sparkline(timelines: &[ServiceTimeline], now: OffsetDateTime) -> Vec<f32> {
     let mut out: Vec<f32> = Vec::with_capacity(30);
     // Day boundaries in UTC for stability. `today_start` = midnight UTC of
     // `now`'s date; today's bucket length is `now - today_start`.
@@ -350,7 +349,9 @@ fn classify_failed(
     if matches!(rec.exit_code, None | Some(0)) {
         return false;
     }
-    let Some(ts) = parse_ts(&rec.ts) else { return false };
+    let Some(ts) = parse_ts(&rec.ts) else {
+        return false;
+    };
     if ts > now {
         return false;
     }
@@ -372,7 +373,9 @@ fn classify_auto_recovering(
         return false;
     }
     let Some(rec) = last else { return false };
-    let Some(ts) = parse_ts(&rec.ts) else { return false };
+    let Some(ts) = parse_ts(&rec.ts) else {
+        return false;
+    };
     if ts > now {
         return false;
     }
@@ -408,7 +411,12 @@ mod tests {
     };
     use time::macros::datetime;
 
-    fn def(name: &str, image: &str, startup: StartupType, state: Option<ServiceState>) -> ServiceDefinition {
+    fn def(
+        name: &str,
+        image: &str,
+        startup: StartupType,
+        state: Option<ServiceState>,
+    ) -> ServiceDefinition {
         ServiceDefinition {
             native: NativeServiceConfig {
                 name: name.into(),
@@ -433,7 +441,12 @@ mod tests {
     }
 
     fn ngsm(name: &str, startup: StartupType, state: Option<ServiceState>) -> ServiceDefinition {
-        def(name, &format!("C:\\NGSM\\ngsm.exe run-service {name}"), startup, state)
+        def(
+            name,
+            &format!("C:\\NGSM\\ngsm.exe run-service {name}"),
+            startup,
+            state,
+        )
     }
 
     fn ev(svc: &str, ts: OffsetDateTime, kind: EventKind, exit_code: Option<i32>) -> EventRecord {
@@ -463,7 +476,12 @@ mod tests {
             ngsm("A", StartupType::Manual, Some(ServiceState::Running)),
             ngsm("B", StartupType::Automatic, Some(ServiceState::Stopped)),
             // Native service: must NOT count.
-            def("Spooler", "C:\\Windows\\spoolsv.exe", StartupType::Automatic, Some(ServiceState::Running)),
+            def(
+                "Spooler",
+                "C:\\Windows\\spoolsv.exe",
+                StartupType::Automatic,
+                Some(ServiceState::Running),
+            ),
         ];
         let m = compute_metrics(&defs, &[], datetime!(2026-05-23 12:00:00 UTC));
         assert_eq!(m.total, 2);
@@ -474,9 +492,21 @@ mod tests {
     #[test]
     fn manual_start_counts_only_stopped_manual() {
         let defs = vec![
-            ngsm("ManualStopped", StartupType::Manual, Some(ServiceState::Stopped)),
-            ngsm("ManualRunning", StartupType::Manual, Some(ServiceState::Running)),
-            ngsm("AutoStopped", StartupType::Automatic, Some(ServiceState::Stopped)),
+            ngsm(
+                "ManualStopped",
+                StartupType::Manual,
+                Some(ServiceState::Stopped),
+            ),
+            ngsm(
+                "ManualRunning",
+                StartupType::Manual,
+                Some(ServiceState::Running),
+            ),
+            ngsm(
+                "AutoStopped",
+                StartupType::Automatic,
+                Some(ServiceState::Stopped),
+            ),
         ];
         let m = compute_metrics(&defs, &[], datetime!(2026-05-23 12:00:00 UTC));
         assert_eq!(m.manual_start, 1);
@@ -485,7 +515,11 @@ mod tests {
     #[test]
     fn failed_requires_stopped_plus_recent_nonzero_exit() {
         let now = datetime!(2026-05-23 12:00:00 UTC);
-        let defs = vec![ngsm("A", StartupType::Automatic, Some(ServiceState::Stopped))];
+        let defs = vec![ngsm(
+            "A",
+            StartupType::Automatic,
+            Some(ServiceState::Stopped),
+        )];
         let events = vec![ev(
             "A",
             now - time::Duration::hours(1),
@@ -512,7 +546,11 @@ mod tests {
     #[test]
     fn failed_excludes_old_exit_beyond_24h() {
         let now = datetime!(2026-05-23 12:00:00 UTC);
-        let defs = vec![ngsm("A", StartupType::Automatic, Some(ServiceState::Stopped))];
+        let defs = vec![ngsm(
+            "A",
+            StartupType::Automatic,
+            Some(ServiceState::Stopped),
+        )];
         let events = vec![ev(
             "A",
             now - time::Duration::hours(48),
@@ -525,7 +563,11 @@ mod tests {
     #[test]
     fn auto_recovering_for_recent_throttled() {
         let now = datetime!(2026-05-23 12:00:00 UTC);
-        let defs = vec![ngsm("A", StartupType::Automatic, Some(ServiceState::Stopped))];
+        let defs = vec![ngsm(
+            "A",
+            StartupType::Automatic,
+            Some(ServiceState::Stopped),
+        )];
         let events = vec![ev(
             "A",
             now - time::Duration::minutes(2),
@@ -538,10 +580,24 @@ mod tests {
     #[test]
     fn auto_recovering_for_restarted_following_child_exited() {
         let now = datetime!(2026-05-23 12:00:00 UTC);
-        let defs = vec![ngsm("A", StartupType::Automatic, Some(ServiceState::StartPending))];
+        let defs = vec![ngsm(
+            "A",
+            StartupType::Automatic,
+            Some(ServiceState::StartPending),
+        )];
         let events = vec![
-            ev("A", now - time::Duration::minutes(3), EventKind::ChildExited, Some(1)),
-            ev("A", now - time::Duration::minutes(2), EventKind::Restarted, None),
+            ev(
+                "A",
+                now - time::Duration::minutes(3),
+                EventKind::ChildExited,
+                Some(1),
+            ),
+            ev(
+                "A",
+                now - time::Duration::minutes(2),
+                EventKind::Restarted,
+                None,
+            ),
         ];
         assert_eq!(compute_metrics(&defs, &events, now).auto_recovering, 1);
     }
@@ -549,7 +605,11 @@ mod tests {
     #[test]
     fn auto_recovering_excluded_when_running_and_old() {
         let now = datetime!(2026-05-23 12:00:00 UTC);
-        let defs = vec![ngsm("A", StartupType::Automatic, Some(ServiceState::Running))];
+        let defs = vec![ngsm(
+            "A",
+            StartupType::Automatic,
+            Some(ServiceState::Running),
+        )];
         let events = vec![ev(
             "A",
             now - time::Duration::minutes(2),
@@ -558,7 +618,11 @@ mod tests {
         )];
         assert_eq!(compute_metrics(&defs, &events, now).auto_recovering, 0);
 
-        let stopped = vec![ngsm("A", StartupType::Automatic, Some(ServiceState::Stopped))];
+        let stopped = vec![ngsm(
+            "A",
+            StartupType::Automatic,
+            Some(ServiceState::Stopped),
+        )];
         let old = vec![ev(
             "A",
             now - time::Duration::minutes(10),
@@ -574,7 +638,11 @@ mod tests {
         // be negative, which would trivially satisfy "within 24h" / "within
         // 5min". Both classifiers must guard against that.
         let now = datetime!(2026-05-23 12:00:00 UTC);
-        let defs = vec![ngsm("Skew", StartupType::Automatic, Some(ServiceState::Stopped))];
+        let defs = vec![ngsm(
+            "Skew",
+            StartupType::Automatic,
+            Some(ServiceState::Stopped),
+        )];
         let future_exit = vec![ev(
             "Skew",
             now + time::Duration::minutes(10),
@@ -582,7 +650,10 @@ mod tests {
             Some(1),
         )];
         let m = compute_metrics(&defs, &future_exit, now);
-        assert_eq!(m.failed, 0, "future child_exited must not classify as failed");
+        assert_eq!(
+            m.failed, 0,
+            "future child_exited must not classify as failed"
+        );
 
         let future_throttle = vec![ev(
             "Skew",
@@ -605,11 +676,30 @@ mod tests {
         // appears earlier in the history, the `stopped` in between breaks
         // the chain.
         let now = datetime!(2026-05-23 12:00:00 UTC);
-        let defs = vec![ngsm("A", StartupType::Automatic, Some(ServiceState::StartPending))];
+        let defs = vec![ngsm(
+            "A",
+            StartupType::Automatic,
+            Some(ServiceState::StartPending),
+        )];
         let events = vec![
-            ev("A", now - time::Duration::minutes(10), EventKind::ChildExited, Some(1)),
-            ev("A", now - time::Duration::minutes(8), EventKind::Stopped, None),
-            ev("A", now - time::Duration::minutes(2), EventKind::Restarted, None),
+            ev(
+                "A",
+                now - time::Duration::minutes(10),
+                EventKind::ChildExited,
+                Some(1),
+            ),
+            ev(
+                "A",
+                now - time::Duration::minutes(8),
+                EventKind::Stopped,
+                None,
+            ),
+            ev(
+                "A",
+                now - time::Duration::minutes(2),
+                EventKind::Restarted,
+                None,
+            ),
         ];
         assert_eq!(
             compute_metrics(&defs, &events, now).auto_recovering,
@@ -625,16 +715,35 @@ mod tests {
         // filters by service name; this test pins that filter.
         let now = datetime!(2026-05-23 12:00:00 UTC);
         let defs = vec![
-            ngsm("A", StartupType::Automatic, Some(ServiceState::StartPending)),
+            ngsm(
+                "A",
+                StartupType::Automatic,
+                Some(ServiceState::StartPending),
+            ),
             ngsm("B", StartupType::Automatic, Some(ServiceState::Running)),
         ];
         // B's `stopped` is interleaved between A's `child_exited` and A's
         // `restarted`. A must still classify as auto_recovering because
         // B's event is unrelated.
         let events = vec![
-            ev("A", now - time::Duration::minutes(3), EventKind::ChildExited, Some(1)),
-            ev("B", now - time::Duration::minutes(2) - time::Duration::seconds(30), EventKind::Stopped, None),
-            ev("A", now - time::Duration::minutes(2), EventKind::Restarted, None),
+            ev(
+                "A",
+                now - time::Duration::minutes(3),
+                EventKind::ChildExited,
+                Some(1),
+            ),
+            ev(
+                "B",
+                now - time::Duration::minutes(2) - time::Duration::seconds(30),
+                EventKind::Stopped,
+                None,
+            ),
+            ev(
+                "A",
+                now - time::Duration::minutes(2),
+                EventKind::Restarted,
+                None,
+            ),
         ];
         let m = compute_metrics(&defs, &events, now);
         assert_eq!(
@@ -653,8 +762,17 @@ mod tests {
     #[test]
     fn availability_100_for_continuously_running_service() {
         let now = datetime!(2026-05-23 12:00:00 UTC);
-        let defs = vec![ngsm("A", StartupType::Automatic, Some(ServiceState::Running))];
-        let events = vec![ev("A", now - time::Duration::days(7), EventKind::Started, None)];
+        let defs = vec![ngsm(
+            "A",
+            StartupType::Automatic,
+            Some(ServiceState::Running),
+        )];
+        let events = vec![ev(
+            "A",
+            now - time::Duration::days(7),
+            EventKind::Started,
+            None,
+        )];
         let m = compute_metrics(&defs, &events, now);
         assert!(
             (m.availability_pct - 100.0).abs() < 0.1,
@@ -667,11 +785,30 @@ mod tests {
     fn availability_reflects_brief_outage() {
         // 24h window; 1h down → 23/24 = ~95.83%
         let now = datetime!(2026-05-23 12:00:00 UTC);
-        let defs = vec![ngsm("A", StartupType::Automatic, Some(ServiceState::Running))];
+        let defs = vec![ngsm(
+            "A",
+            StartupType::Automatic,
+            Some(ServiceState::Running),
+        )];
         let events = vec![
-            ev("A", now - time::Duration::hours(24), EventKind::Started, None),
-            ev("A", now - time::Duration::hours(5), EventKind::ChildExited, Some(1)),
-            ev("A", now - time::Duration::hours(4), EventKind::Restarted, None),
+            ev(
+                "A",
+                now - time::Duration::hours(24),
+                EventKind::Started,
+                None,
+            ),
+            ev(
+                "A",
+                now - time::Duration::hours(5),
+                EventKind::ChildExited,
+                Some(1),
+            ),
+            ev(
+                "A",
+                now - time::Duration::hours(4),
+                EventKind::Restarted,
+                None,
+            ),
         ];
         let m = compute_metrics(&defs, &events, now);
         assert!(
@@ -692,7 +829,12 @@ mod tests {
         let events = vec![
             ev("A", now - time::Duration::days(2), EventKind::Started, None),
             ev("B", now - time::Duration::days(2), EventKind::Started, None),
-            ev("B", now - time::Duration::days(1), EventKind::ChildExited, Some(0)),
+            ev(
+                "B",
+                now - time::Duration::days(1),
+                EventKind::ChildExited,
+                Some(0),
+            ),
         ];
         let m = compute_metrics(&defs, &events, now);
         // A=100, B=50 → mean 75
@@ -706,9 +848,18 @@ mod tests {
     #[test]
     fn window_days_clamps_to_actual_history() {
         let now = datetime!(2026-05-23 12:00:00 UTC);
-        let defs = vec![ngsm("A", StartupType::Automatic, Some(ServiceState::Running))];
+        let defs = vec![ngsm(
+            "A",
+            StartupType::Automatic,
+            Some(ServiceState::Running),
+        )];
         // Only 7d of history.
-        let events = vec![ev("A", now - time::Duration::days(7), EventKind::Started, None)];
+        let events = vec![ev(
+            "A",
+            now - time::Duration::days(7),
+            EventKind::Started,
+            None,
+        )];
         let m = compute_metrics(&defs, &events, now);
         assert!(m.availability_window_days >= 7 && m.availability_window_days <= 8);
     }
@@ -724,7 +875,11 @@ mod tests {
         // Service has a Started event 2h ago but no matching close event,
         // AND the SCM currently reports it as Stopped (perhaps the stop
         // event hasn't reached the log yet, or was lost).
-        let defs = vec![ngsm("A", StartupType::Automatic, Some(ServiceState::Stopped))];
+        let defs = vec![ngsm(
+            "A",
+            StartupType::Automatic,
+            Some(ServiceState::Stopped),
+        )];
         let events = vec![ev(
             "A",
             now - time::Duration::hours(2),
@@ -744,8 +899,17 @@ mod tests {
     #[test]
     fn daily_sparkline_has_30_entries() {
         let now = datetime!(2026-05-23 12:00:00 UTC);
-        let defs = vec![ngsm("A", StartupType::Automatic, Some(ServiceState::Running))];
-        let events = vec![ev("A", now - time::Duration::days(30), EventKind::Started, None)];
+        let defs = vec![ngsm(
+            "A",
+            StartupType::Automatic,
+            Some(ServiceState::Running),
+        )];
+        let events = vec![ev(
+            "A",
+            now - time::Duration::days(30),
+            EventKind::Started,
+            None,
+        )];
         let m = compute_metrics(&defs, &events, now);
         assert_eq!(m.availability_daily.len(), 30);
         for v in &m.availability_daily {
@@ -757,21 +921,47 @@ mod tests {
     fn daily_sparkline_reflects_one_full_outage_day() {
         // A is up for the whole window EXCEPT all of day -3 (24h down).
         let now = datetime!(2026-05-23 12:00:00 UTC);
-        let defs = vec![ngsm("A", StartupType::Automatic, Some(ServiceState::Running))];
+        let defs = vec![ngsm(
+            "A",
+            StartupType::Automatic,
+            Some(ServiceState::Running),
+        )];
         let events = vec![
-            ev("A", now - time::Duration::days(10), EventKind::Started, None),
-            ev("A", now - time::Duration::days(4), EventKind::ChildExited, Some(1)),
-            ev("A", now - time::Duration::days(3), EventKind::Restarted, None),
+            ev(
+                "A",
+                now - time::Duration::days(10),
+                EventKind::Started,
+                None,
+            ),
+            ev(
+                "A",
+                now - time::Duration::days(4),
+                EventKind::ChildExited,
+                Some(1),
+            ),
+            ev(
+                "A",
+                now - time::Duration::days(3),
+                EventKind::Restarted,
+                None,
+            ),
         ];
         let m = compute_metrics(&defs, &events, now);
         // The dip day is somewhere in the middle of the sparkline; check that
         // *some* entry is well below 50% (proves a real outage drove a bucket
         // down, not the placeholder constant).
-        let min = m.availability_daily.iter().cloned().fold(100.0f32, f32::min);
+        let min = m
+            .availability_daily
+            .iter()
+            .cloned()
+            .fold(100.0f32, f32::min);
         // The 24h outage (noon-to-noon) straddles two midnight-UTC calendar-day
         // buckets, each showing ~50%.  50% is well below 100% (the flat
         // placeholder) and proves the real per-bucket computation is working.
-        assert!(min <= 50.0, "sparkline did not record the outage; got {m:?}");
+        assert!(
+            min <= 50.0,
+            "sparkline did not record the outage; got {m:?}"
+        );
     }
 
     #[test]
@@ -783,7 +973,11 @@ mod tests {
         // intervals once and CLIP into each bucket — the 7-day-old "up"
         // interval covers all 7 buckets and should yield ~100% each.
         let now = datetime!(2026-05-23 12:00:00 UTC);
-        let defs = vec![ngsm("A", StartupType::Automatic, Some(ServiceState::Running))];
+        let defs = vec![ngsm(
+            "A",
+            StartupType::Automatic,
+            Some(ServiceState::Running),
+        )];
         let events = vec![ev(
             "A",
             now - time::Duration::days(7),

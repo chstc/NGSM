@@ -251,9 +251,7 @@ fn rotate_with_mutex(active: &PathBuf) -> std::io::Result<()> {
     let oldest = paths::events_log_backup_n(paths::BACKUP_RETENTION_COUNT)?;
     if let Err(e) = std::fs::remove_file(&oldest) {
         if e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!(
-                "[supervisor] event log rotation: cannot remove oldest backup: {e}"
-            );
+            eprintln!("[supervisor] event log rotation: cannot remove oldest backup: {e}");
             return Ok(());
         }
     }
@@ -264,9 +262,7 @@ fn rotate_with_mutex(active: &PathBuf) -> std::io::Result<()> {
             continue;
         }
         if let Err(e) = std::fs::rename(&from, &to) {
-            eprintln!(
-                "[supervisor] event log rotation: cannot shift {from:?} → {to:?}: {e}"
-            );
+            eprintln!("[supervisor] event log rotation: cannot shift {from:?} → {to:?}: {e}");
             return Ok(());
         }
     }

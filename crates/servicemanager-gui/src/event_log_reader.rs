@@ -380,11 +380,25 @@ mod tests {
     #[test]
     fn read_since_reads_all_four_backups_plus_active() {
         let (_g, _dir) = isolate();
-        write_backup_n(4, &[r#"{"ts":"2026-05-20T00:00:00Z","service":"B4","event":"started","pid":1}"#]);
-        write_backup_n(3, &[r#"{"ts":"2026-05-21T00:00:00Z","service":"B3","event":"started","pid":2}"#]);
-        write_backup_n(2, &[r#"{"ts":"2026-05-22T00:00:00Z","service":"B2","event":"started","pid":3}"#]);
-        write_backup_n(1, &[r#"{"ts":"2026-05-23T00:00:00Z","service":"B1","event":"started","pid":4}"#]);
-        write_active(&[r#"{"ts":"2026-05-23T12:00:00Z","service":"Active","event":"started","pid":5}"#]);
+        write_backup_n(
+            4,
+            &[r#"{"ts":"2026-05-20T00:00:00Z","service":"B4","event":"started","pid":1}"#],
+        );
+        write_backup_n(
+            3,
+            &[r#"{"ts":"2026-05-21T00:00:00Z","service":"B3","event":"started","pid":2}"#],
+        );
+        write_backup_n(
+            2,
+            &[r#"{"ts":"2026-05-22T00:00:00Z","service":"B2","event":"started","pid":3}"#],
+        );
+        write_backup_n(
+            1,
+            &[r#"{"ts":"2026-05-23T00:00:00Z","service":"B1","event":"started","pid":4}"#],
+        );
+        write_active(&[
+            r#"{"ts":"2026-05-23T12:00:00Z","service":"Active","event":"started","pid":5}"#,
+        ]);
         let since = datetime!(2026-05-19 00:00:00 UTC);
         let out = read_since(since).unwrap();
         assert_eq!(out.len(), 5);
@@ -451,7 +465,9 @@ mod tests {
             text.push_str(&pad_line);
             text.push('\n');
         }
-        text.push_str(r#"{"ts":"2026-05-23T12:00:00Z","service":"tail","event":"started","pid":99}"#);
+        text.push_str(
+            r#"{"ts":"2026-05-23T12:00:00Z","service":"tail","event":"started","pid":99}"#,
+        );
         text.push('\n');
         std::fs::write(&path, text).unwrap();
 
