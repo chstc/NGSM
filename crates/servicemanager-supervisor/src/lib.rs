@@ -90,7 +90,9 @@ pub struct StopSignal {
 
 impl StopSignal {
     pub fn stop(&self) {
-        let _ = self.tx.send(SupervisorMessage::Stop);
+        if let Err(e) = self.tx.send(SupervisorMessage::Stop) {
+            eprintln!("[supervisor:stop] signal channel closed: {e}");
+        }
     }
 }
 
@@ -117,7 +119,9 @@ pub struct RotateSignal {
 
 impl RotateSignal {
     pub fn rotate(&self) {
-        let _ = self.tx.send(SupervisorMessage::Rotate);
+        if let Err(e) = self.tx.send(SupervisorMessage::Rotate) {
+            eprintln!("[supervisor:rotate] signal channel closed: {e}");
+        }
     }
 }
 
@@ -180,7 +184,9 @@ pub struct PowerEventSignal {
 
 impl PowerEventSignal {
     pub fn power_event(&self, event_type: u32) {
-        let _ = self.tx.send(SupervisorMessage::PowerEvent(event_type));
+        if let Err(e) = self.tx.send(SupervisorMessage::PowerEvent(event_type)) {
+            eprintln!("[supervisor:power] signal channel closed: {e}");
+        }
     }
 }
 
