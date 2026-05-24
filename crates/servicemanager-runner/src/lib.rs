@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use servicemanager_core::{Error, Result};
 
+use servicemanager_supervisor::ExitReason;
 #[cfg(windows)]
-use servicemanager_supervisor::{ExitReason, Supervisor, SupervisorError};
+use servicemanager_supervisor::{Supervisor, SupervisorError};
 #[cfg(windows)]
 use servicemanager_win32::{
     ensure_console, run_service_dispatcher, ServiceContext, ServiceControl,
@@ -114,6 +115,50 @@ pub fn run(service_name: &str) -> Result<()> {
 #[cfg(not(windows))]
 pub fn run(_service_name: &str) -> Result<()> {
     Err(Error::other("service runner requires Windows"))
+}
+
+/// Fallback exit code reported to SCM when `ExitAction::Suicide` fires and
+/// the child's own exit code was zero. NSSM convention: any non-zero value
+/// will do — SCM only checks `!= 0` to decide whether to run recovery
+/// actions — and `1` is the canonical "deliberate failure" sentinel.
+pub const SUICIDE_FALLBACK_EXIT_CODE: u32 = 1;
+/// Generic non-zero code reported when the supervisor errored out or
+/// panicked (i.e. the runner never got a clean `ExitReason`). Kept distinct
+/// from the suicide fallback so log triage can tell them apart.
+pub const SUPERVISOR_ERROR_EXIT_CODE: u32 = 2;
+
+/// Translate the supervisor's exit reason into the service exit code we
+/// report to SCM via `SetServiceStatus(dwWin32ExitCode = …)`.
+///
+/// SCM treats a non-zero exit code as a failure and may run the configured
+/// recovery actions (`sc.exe failure …`); a zero code is a clean stop and
+/// suppresses recovery. The mapping therefore has to distinguish:
+///
+/// - `Stopped` / `ChildExited` → `0`. The supervisor was asked to stop, or
+///   `ExitAction::Exit` fired (NSSM-equivalent "give up cleanly"). SCM
+///   should not run recovery.
+/// - `SpawnFailed` → `SUPERVISOR_ERROR_EXIT_CODE`. The supervisor never
+///   produced a working child; matches the legacy behaviour of the
+///   `is_finished` poll path that flipped `exit_code` to `2`.
+/// - `Suicide { exit_code }` → child's code when non-zero, otherwise
+///   `SUICIDE_FALLBACK_EXIT_CODE`. This is the bug fix: previously Suicide
+///   reached the runner as `ChildExited` and reported `0`, which made SCM
+///   skip recovery for what was supposed to be a deliberate failure.
+pub fn service_exit_code_for(reason: ExitReason) -> u32 {
+    match reason {
+        ExitReason::Stopped | ExitReason::ChildExited => 0,
+        ExitReason::SpawnFailed => SUPERVISOR_ERROR_EXIT_CODE,
+        ExitReason::Suicide { exit_code } => {
+            // Preserve the child's own code where it is meaningful (non-
+            // zero and representable as u32); fall back to `1` for the
+            // zero-or-negative case so SCM still sees a failure.
+            if exit_code > 0 {
+                exit_code as u32
+            } else {
+                SUICIDE_FALLBACK_EXIT_CODE
+            }
+        }
+    }
 }
 
 /// Log (but do not abort on) a failed SCM status report. A dropped status
@@ -246,17 +291,19 @@ fn service_main(name: &str, ctx: &ServiceContext) -> Result<()> {
                     if let Some(h) = handle.take() {
                         match h.join() {
                             Ok(Ok(reason)) => {
-                                if matches!(reason, ExitReason::SpawnFailed) {
-                                    exit_code = 2;
-                                }
+                                // ExitAction::Suicide reaches us here too;
+                                // the helper picks the right SCM exit code
+                                // so SCM runs recovery for Suicide but not
+                                // for a clean ChildExited / Stopped.
+                                exit_code = service_exit_code_for(reason);
                             }
                             Ok(Err(e)) => {
                                 eprintln!("[runner:{name}] supervisor error: {e}");
-                                exit_code = 2;
+                                exit_code = SUPERVISOR_ERROR_EXIT_CODE;
                             }
                             Err(_) => {
                                 eprintln!("[runner:{name}] supervisor thread panicked");
-                                exit_code = 2;
+                                exit_code = SUPERVISOR_ERROR_EXIT_CODE;
                             }
                         }
                     }
@@ -308,6 +355,83 @@ fn await_supervisor_stop(
             name,
             "stop-pending",
             ctx.report_stop_pending(STOP_WAIT_HINT_MS),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stopped_reason_maps_to_zero_service_exit_code() {
+        // ExitReason::Stopped means SCM asked us to stop — a clean exit
+        // that must NOT trigger SCM recovery actions.
+        assert_eq!(service_exit_code_for(ExitReason::Stopped), 0);
+    }
+
+    #[test]
+    fn child_exited_reason_maps_to_zero_service_exit_code() {
+        // ExitAction::Exit ("give up cleanly, no recovery") reaches the
+        // runner as ChildExited and must report 0 — Suicide is the
+        // failure-style sibling, Exit is the clean one.
+        assert_eq!(service_exit_code_for(ExitReason::ChildExited), 0);
+    }
+
+    #[test]
+    fn spawn_failed_reason_maps_to_nonzero_service_exit_code() {
+        // SpawnFailed signals the supervisor never got a working child;
+        // a non-zero code is required so SCM treats it as a failed start.
+        assert_eq!(
+            service_exit_code_for(ExitReason::SpawnFailed),
+            SUPERVISOR_ERROR_EXIT_CODE
+        );
+        assert_ne!(service_exit_code_for(ExitReason::SpawnFailed), 0);
+    }
+
+    #[test]
+    fn suicide_reason_maps_to_nonzero_service_exit_code() {
+        // The bug this regression test pins: pre-fix, Suicide rode the
+        // same arm as Exit and reported 0 to SCM, silently suppressing
+        // recovery. Post-fix, every Suicide payload must yield a non-zero
+        // code — that's what makes SCM run the configured failure actions.
+        for code in [-1, 0, 1, 42, 200] {
+            let mapped = service_exit_code_for(ExitReason::Suicide { exit_code: code });
+            assert_ne!(
+                mapped, 0,
+                "Suicide{{exit_code: {code}}} mapped to 0 — SCM would skip recovery"
+            );
+        }
+    }
+
+    #[test]
+    fn suicide_preserves_meaningful_child_exit_code() {
+        // When the child's own exit code is a meaningful non-zero value,
+        // the runner forwards it as-is so monitoring tools see the same
+        // exit code in SCM that the child reported.
+        assert_eq!(
+            service_exit_code_for(ExitReason::Suicide { exit_code: 42 }),
+            42
+        );
+        assert_eq!(
+            service_exit_code_for(ExitReason::Suicide { exit_code: 1 }),
+            1
+        );
+    }
+
+    #[test]
+    fn suicide_falls_back_when_child_exit_code_is_not_positive() {
+        // A child that exited with code 0 (or with no resolvable code, i.e.
+        // exit_code_of returned -1) still gets Suicide reported as a
+        // failure to SCM — we substitute the fallback so the recovery
+        // policy fires regardless of the child's reported value.
+        assert_eq!(
+            service_exit_code_for(ExitReason::Suicide { exit_code: 0 }),
+            SUICIDE_FALLBACK_EXIT_CODE
+        );
+        assert_eq!(
+            service_exit_code_for(ExitReason::Suicide { exit_code: -1 }),
+            SUICIDE_FALLBACK_EXIT_CODE
         );
     }
 }

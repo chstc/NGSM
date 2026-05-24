@@ -102,6 +102,17 @@ pub enum ExitReason {
     Stopped,
     ChildExited,
     SpawnFailed,
+    /// The supervisor applied `ExitAction::Suicide` for the most recent
+    /// child generation. Per NSSM convention this is a *deliberate* failure
+    /// — the supervisor exits so SCM's recovery actions (restart-service,
+    /// reboot, run-command) fire. The runner MUST report a non-zero exit
+    /// code to SCM in this case; reporting zero would look like a clean
+    /// stop and silently suppress recovery. The carried `exit_code` is the
+    /// child's own exit code, preserved so the runner can pass through a
+    /// meaningful non-zero value when one is available.
+    Suicide {
+        exit_code: i32,
+    },
 }
 
 #[derive(Clone)]
@@ -530,8 +541,19 @@ impl Supervisor {
                             );
                             return self.wait_for_stop_quiesced();
                         }
-                        ExitAction::Exit | ExitAction::Suicide => {
+                        ExitAction::Exit => {
+                            // Clean stop: the supervisor gives up; SCM is
+                            // NOT expected to run recovery actions.
                             return Ok(ExitReason::ChildExited);
+                        }
+                        ExitAction::Suicide => {
+                            // Deliberate failure: the supervisor exits and
+                            // SCM's recovery actions are expected to fire.
+                            // Carry the child's exit code so the runner can
+                            // pass through a meaningful non-zero value
+                            // (falling back to 1 when the child's own code
+                            // was 0).
+                            return Ok(ExitReason::Suicide { exit_code });
                         }
                     }
                 }
