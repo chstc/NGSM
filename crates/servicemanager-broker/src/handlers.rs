@@ -119,6 +119,66 @@ fn parse_args<T: for<'de> Deserialize<'de>>(args: &Value) -> Result<T, String> {
     serde_json::from_value::<T>(args.clone()).map_err(|e| format!("invalid args: {e}"))
 }
 
+/// Result of a best-effort post-op `query_service` call. Distinguishing
+/// "known state" from "could not verify state" matters: the broker reports
+/// the control op succeeded, and a silently-empty `state` field would let a
+/// caller misread "we don't know" as "state is empty/unknown". Encoded into
+/// the response JSON by [`apply_post_op_state`].
+enum PostOpState {
+    /// `query_service` succeeded and returned a runtime state.
+    Known(String),
+    /// `query_service` succeeded but reported no runtime info
+    /// (`runtime == None`) — the SCM has no state to report.
+    NoRuntime,
+    /// `query_service` itself failed; the resulting state is unknown.
+    /// The caller must surface this in the response.
+    QueryFailed(String),
+}
+
+/// Best-effort post-op query of a service's runtime state. The control op
+/// itself has already succeeded by the time this is called; the only thing
+/// being reported here is the *follow-up* query's outcome.
+fn post_op_state(name: &str) -> PostOpState {
+    match query_service(name) {
+        Ok(snap) => match snap.runtime {
+            Some(r) => PostOpState::Known(format!("{:?}", r.state)),
+            None => PostOpState::NoRuntime,
+        },
+        Err(e) => PostOpState::QueryFailed(e.to_string()),
+    }
+}
+
+/// Merge a [`PostOpState`] into a successful-op response body, preserving the
+/// `state` field's existing wire shape (a string, or `null` when the post-op
+/// query failed) and adding a `warning` field when the state could not be
+/// verified. Without the warning, a caller cannot tell "post-op state is
+/// unknown" apart from "state is currently empty/unknown" — the latter being
+/// a legitimate value, the former being a broker-side failure that must be
+/// surfaced.
+fn apply_post_op_state(body: &mut Value, st: PostOpState) {
+    let obj = body
+        .as_object_mut()
+        .expect("post-op response bodies are always JSON objects");
+    match st {
+        PostOpState::Known(s) => {
+            obj.insert("state".into(), Value::String(s));
+        }
+        PostOpState::NoRuntime => {
+            // `query_service` succeeded with no runtime info — historically
+            // serialized as an empty string. Preserve that shape so callers
+            // that already special-case `""` keep working.
+            obj.insert("state".into(), Value::String(String::new()));
+        }
+        PostOpState::QueryFailed(err) => {
+            obj.insert("state".into(), Value::Null);
+            obj.insert(
+                "warning".into(),
+                Value::String(format!("post-op state query failed: {err}")),
+            );
+        }
+    }
+}
+
 fn parse_start_type(s: &str) -> Result<InstallStartType, String> {
     match s.to_ascii_lowercase().as_str() {
         "manual" => Ok(InstallStartType::Manual),
@@ -201,13 +261,12 @@ fn op_stop(args: &Value) -> Result<Value, String> {
     // ops::stop enforces the NGSM-managed check internally.
     servicemanager_ops::stop(&a.name)?;
     // Query post-op state to maintain the wire-level { "state": ... } field
-    // that broker clients depend on.
-    let state_str = query_service(&a.name)
-        .ok()
-        .and_then(|s| s.runtime)
-        .map(|r| format!("{:?}", r.state))
-        .unwrap_or_default();
-    Ok(json!({ "stopped": a.name, "state": state_str }))
+    // that broker clients depend on. A query failure here is surfaced as
+    // `state: null` + a `warning`, so the caller can tell "I don't know the
+    // post-op state" apart from a legitimate empty/unknown state value.
+    let mut body = json!({ "stopped": a.name });
+    apply_post_op_state(&mut body, post_op_state(&a.name));
+    Ok(body)
 }
 
 fn op_restart(args: &Value) -> Result<Value, String> {
@@ -321,13 +380,12 @@ fn op_rotate(args: &Value) -> Result<Value, String> {
     // ops::rotate validates online-rotation preflight and issues the control
     // signal, but does not return post-op state. Query after the fact to
     // maintain the wire-level { "state": ... } field that clients depend on.
+    // A query failure here is surfaced rather than hidden — see
+    // `apply_post_op_state` for the wire shape.
     servicemanager_ops::rotate(&a.name)?;
-    let state_str = query_service(&a.name)
-        .ok()
-        .and_then(|s| s.runtime)
-        .map(|r| format!("{:?}", r.state))
-        .unwrap_or_default();
-    Ok(json!({ "rotated": a.name, "state": state_str }))
+    let mut body = json!({ "rotated": a.name });
+    apply_post_op_state(&mut body, post_op_state(&a.name));
+    Ok(body)
 }
 
 fn op_pause(args: &Value) -> Result<Value, String> {
@@ -336,14 +394,11 @@ fn op_pause(args: &Value) -> Result<Value, String> {
         control_service(&a.name, ServiceControlSignal::Pause).map_err(|e| e.to_string())?
     } else {
         servicemanager_ops::pause(&a.name)?;
-        return Ok(json!({
-            "paused": a.name,
-            "state": query_service(&a.name)
-                .ok()
-                .and_then(|s| s.runtime)
-                .map(|r| format!("{:?}", r.state))
-                .unwrap_or_default()
-        }));
+        // Surface a post-op query failure as `state: null` + a `warning`
+        // rather than hiding it behind an empty state string.
+        let mut body = json!({ "paused": a.name });
+        apply_post_op_state(&mut body, post_op_state(&a.name));
+        return Ok(body);
     };
     Ok(json!({ "paused": a.name, "state": format!("{:?}", state.state) }))
 }
@@ -354,14 +409,11 @@ fn op_continue(args: &Value) -> Result<Value, String> {
         control_service(&a.name, ServiceControlSignal::Continue).map_err(|e| e.to_string())?
     } else {
         servicemanager_ops::continue_service(&a.name)?;
-        return Ok(json!({
-            "continued": a.name,
-            "state": query_service(&a.name)
-                .ok()
-                .and_then(|s| s.runtime)
-                .map(|r| format!("{:?}", r.state))
-                .unwrap_or_default()
-        }));
+        // Surface a post-op query failure as `state: null` + a `warning`
+        // rather than hiding it behind an empty state string.
+        let mut body = json!({ "continued": a.name });
+        apply_post_op_state(&mut body, post_op_state(&a.name));
+        return Ok(body);
     };
     Ok(json!({ "continued": a.name, "state": format!("{:?}", state.state) }))
 }
@@ -439,4 +491,82 @@ fn op_recovery_set(args: &Value) -> Result<Value, String> {
     };
     let msg = servicemanager_ops::save_recovery(spec)?;
     Ok(json!({ "saved": name, "message": msg }))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for the M-03 response-shaping helper. The full handler paths
+    //! call `servicemanager_win32::query_service`, which requires a real SCM
+    //! connection (and on many setups, admin) — so the tests here exercise
+    //! `apply_post_op_state` directly. That helper is what guarantees a
+    //! post-op `query_service` failure is surfaced rather than hidden, no
+    //! matter which control op produced the response body.
+    use super::*;
+
+    #[test]
+    fn op_stop_propagates_query_failure_as_warning() {
+        // Simulate the shape `op_stop` builds before invoking the helper.
+        let mut body = json!({ "stopped": "Spooler" });
+        apply_post_op_state(
+            &mut body,
+            PostOpState::QueryFailed("SCM unreachable".into()),
+        );
+        // `state` must exist and be JSON null — distinguishable from a
+        // legitimate empty/unknown state string.
+        assert_eq!(body["state"], Value::Null);
+        // A `warning` field carries the underlying error so the caller can
+        // tell post-op verification failed rather than silently succeeding.
+        let warning = body["warning"]
+            .as_str()
+            .expect("warning must be a JSON string");
+        assert!(
+            warning.contains("post-op state query failed"),
+            "warning text should name the failure mode, got {warning:?}"
+        );
+        assert!(
+            warning.contains("SCM unreachable"),
+            "warning text should include the underlying error, got {warning:?}"
+        );
+        // The pre-existing op-success marker must be preserved.
+        assert_eq!(body["stopped"], "Spooler");
+    }
+
+    #[test]
+    fn op_pause_propagates_query_failure_as_warning() {
+        // `op_pause` (and `op_continue`, `op_rotate`) all funnel through the
+        // same helper; verifying one additional op covers the shape since
+        // the only thing that differs is the success-marker key.
+        let mut body = json!({ "paused": "Spooler" });
+        apply_post_op_state(&mut body, PostOpState::QueryFailed("denied".into()));
+        assert_eq!(body["state"], Value::Null);
+        assert!(body["warning"]
+            .as_str()
+            .unwrap()
+            .contains("post-op state query failed"));
+        assert_eq!(body["paused"], "Spooler");
+    }
+
+    #[test]
+    fn apply_post_op_state_inserts_known_state_without_warning() {
+        // The successful path must not bolt on a warning field — that would
+        // train callers to ignore warnings.
+        let mut body = json!({ "stopped": "Spooler" });
+        apply_post_op_state(&mut body, PostOpState::Known("Stopped".into()));
+        assert_eq!(body["state"], "Stopped");
+        assert!(
+            body.get("warning").is_none(),
+            "successful queries must not emit a warning"
+        );
+    }
+
+    #[test]
+    fn apply_post_op_state_preserves_empty_string_for_no_runtime() {
+        // `query_service` succeeding with `runtime == None` is a real
+        // observation, not a broker failure. Preserve the historical empty
+        // string so callers that already special-case `""` keep working.
+        let mut body = json!({ "stopped": "Spooler" });
+        apply_post_op_state(&mut body, PostOpState::NoRuntime);
+        assert_eq!(body["state"], "");
+        assert!(body.get("warning").is_none());
+    }
 }
