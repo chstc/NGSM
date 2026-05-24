@@ -192,6 +192,16 @@ pub struct Supervisor {
     current_child: Arc<Mutex<Option<Child>>>,
     current_pid: Arc<Mutex<Option<u32>>>,
     last_exit_code: Arc<Mutex<Option<i32>>>,
+    /// Exit code of a child that exited but whose `ChildExited` message
+    /// has not yet been observed by the main supervisor loop. Written by
+    /// the exit watcher *before* it clears `current_pid`, so a Stop that
+    /// arrives in the racing window between "child died" and "main loop
+    /// processed ChildExited" can still find the result and run
+    /// `record_child_exit` (which fires the `Exit/Post` hook and updates
+    /// `last_exit_code`). Without this, a Stop that won the channel race
+    /// would see `current_pid == None`, return early from
+    /// `stop_child_gracefully`, and skip both bookkeeping steps.
+    pending_exit: Arc<Mutex<Option<i32>>>,
     /// Sinks that own the actual log files when online rotation is enabled.
     /// One per redirected stream, keyed by stream name ("stdout"/"stderr").
     sinks: Vec<Arc<RotationSink>>,
@@ -216,6 +226,7 @@ impl Supervisor {
             current_child: Arc::new(Mutex::new(None)),
             current_pid: Arc::new(Mutex::new(None)),
             last_exit_code: Arc::new(Mutex::new(None)),
+            pending_exit: Arc::new(Mutex::new(None)),
             sinks: Vec::new(),
             startup_tx,
             startup_rx: Some(startup_rx),
@@ -649,6 +660,7 @@ impl Supervisor {
     fn spawn_exit_watcher(&self) {
         let child_slot = Arc::clone(&self.current_child);
         let pid_slot = Arc::clone(&self.current_pid);
+        let pending_exit = Arc::clone(&self.pending_exit);
         let tx = self.tx.clone();
         thread::spawn(move || {
             let mut child = {
@@ -659,6 +671,17 @@ impl Supervisor {
                 }
             };
             let result = child.wait();
+            // Stash the resolved exit code *before* we clear `current_pid`.
+            // The PID clear is what makes a racing Stop see "no child" and
+            // skip the graceful-stop pipeline; without `pending_exit` first
+            // that Stop would never reach `record_child_exit`, dropping the
+            // `last_exit_code` update and the `Exit/Post` hook. With it,
+            // `stop_child_gracefully` can detect "the child already exited"
+            // and run the bookkeeping deterministically. The exit code is
+            // stored *before* the PID clear so the Stop handler that beats
+            // the `ChildExited` message in the channel can still see it.
+            let exit_code = exit_code_of(&result);
+            *pending_exit.lock().unwrap() = Some(exit_code);
             // Clear the PID *before* announcing the exit. Once the child is
             // dead the OS can recycle its PID, so any stop/pause/continue
             // path that snapshots `current_pid` after this point gets `None`
@@ -677,6 +700,16 @@ impl Supervisor {
     }
 
     fn stop_child_gracefully(&mut self) {
+        // If the exit watcher already saw the child die — but its
+        // `ChildExited` message has not yet been processed by the main loop
+        // — `pending_exit` holds the resolved code while `current_pid` has
+        // already been cleared. Process the exit here so `last_exit_code`
+        // gets updated and the `Exit/Post` hook fires; otherwise this code
+        // path returns early below and both bookkeeping steps are skipped.
+        if let Some(code) = self.pending_exit.lock().unwrap().take() {
+            self.record_child_exit(code);
+            return;
+        }
         let pid = *self.current_pid.lock().unwrap();
         let Some(pid) = pid else {
             return;
@@ -1078,8 +1111,14 @@ impl Supervisor {
     /// current-child state (reaping the handle), and fire the `Exit/Post`
     /// hook. Used by both the spontaneous-exit path and controlled stop, so
     /// the hook runs no matter how the child ended.
+    ///
+    /// Also clears `pending_exit` so the stop-race short-circuit in
+    /// [`Self::stop_child_gracefully`] cannot fire a second time for the
+    /// same child generation (e.g. once via the racing Stop path and again
+    /// via the normal `ChildExited` arm in the main loop).
     fn record_child_exit(&self, exit_code: i32) {
         *self.last_exit_code.lock().unwrap() = Some(exit_code);
+        *self.pending_exit.lock().unwrap() = None;
         self.set_current(None);
         self.fire_hook(HookPoint::ExitPost, None, Some(exit_code));
     }
@@ -1237,4 +1276,56 @@ mod tests {
         assert!(parse_env_entry("=value").is_err());
         assert!(parse_env_entry("BAD\0NAME=x").is_err());
     }
+
+    #[test]
+    fn pending_exit_starts_empty_and_is_take_consumable() {
+        // The supervisor's stop/child-exit race fix relies on the
+        // `pending_exit` slot being empty until the exit watcher populates
+        // it, and being `take()`-consumable so the stop path can run
+        // `record_child_exit` for it at most once. Pin both invariants so
+        // a future refactor that switches storage strategy keeps the same
+        // contract.
+        let sup = Supervisor::new("Test", ManagedApplicationConfig::default());
+        assert!(
+            sup.pending_exit.lock().unwrap().is_none(),
+            "pending_exit must start empty"
+        );
+        // Simulate the exit watcher storing a code.
+        *sup.pending_exit.lock().unwrap() = Some(42);
+        // The stop path uses `take()` to read-and-clear in one shot, so a
+        // second concurrent stop cannot fire `record_child_exit` again for
+        // the same exit.
+        let taken = sup.pending_exit.lock().unwrap().take();
+        assert_eq!(taken, Some(42));
+        assert!(sup.pending_exit.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn record_child_exit_clears_pending_exit_to_avoid_double_fire() {
+        // The race fix has two paths that could record the exit: the racing
+        // Stop path (which `take`s pending_exit) and the main loop's normal
+        // ChildExited arm (which calls `record_child_exit` directly with
+        // the exit code from the channel message). `record_child_exit`
+        // therefore unconditionally clears pending_exit so the Stop path's
+        // short-circuit cannot fire after a normal ChildExited has already
+        // been handled.
+        let sup = Supervisor::new("Test", ManagedApplicationConfig::default());
+        *sup.pending_exit.lock().unwrap() = Some(7);
+        sup.record_child_exit(7);
+        assert!(
+            sup.pending_exit.lock().unwrap().is_none(),
+            "record_child_exit must clear pending_exit"
+        );
+        assert_eq!(*sup.last_exit_code.lock().unwrap(), Some(7));
+    }
+
+    // NOTE: A genuine end-to-end regression test for the stop/child-exit
+    // race would need a test harness that lets us spawn a real child, then
+    // interpose between "child has exited" and "supervisor processes
+    // ChildExited" to inject a Stop. No such harness exists today (the
+    // supervisor owns its channel privately, and there is no
+    // dependency-injection seam on the child handle), and standing one up
+    // is a non-trivial restructure. The unit tests above pin the shared-
+    // state contract the fix relies on; a follow-up integration test
+    // should be added once that harness lands.
 }
