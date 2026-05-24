@@ -72,7 +72,14 @@ export component ServicesView inherits Rectangle {
     in property <int> sort-column;
     in property <bool> sort-ascending;
 
-    property <ServiceRow> current: root.rows.length > 0 ? root.rows[root.selected] : {};
+    // Bounds-guard: read `rows[selected]` only when `selected` is a valid
+    // index into the current model. During refresh/filter/search/sort the
+    // Rust side rebuilds `rows` and may update `selected` a frame later;
+    // without the explicit `selected < rows.length` check, Slint can
+    // either panic or silently read stale data for the just-shorter model.
+    property <ServiceRow> current: root.selected >= 0 && root.selected < root.rows.length
+        ? root.rows[root.selected]
+        : {};
 
     HorizontalLayout {
         spacing: Theme.gap;

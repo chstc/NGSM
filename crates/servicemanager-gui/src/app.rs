@@ -922,6 +922,12 @@ fn refresh_service_model(win: &MainWindow, st: &mut AppState) {
     adapter::sort_service_rows(&mut rows, st.sort_column, st.sort_ascending);
     st.visible_names = rows.iter().map(|r| r.name.to_string()).collect();
     let selected = adapter::remap_selection(selected_name.as_deref(), &st.visible_names);
+    // Clear the selected index BEFORE swapping the model so the Slint
+    // detail-pane binding cannot observe an out-of-range index against
+    // the just-replaced (possibly shorter) `services` model — even with
+    // the slint-side bounds guard in place, narrowing the window of stale
+    // state keeps behavior predictable across binding orderings.
+    win.set_selected_service(-1);
     win.set_services(slint::ModelRc::new(slint::VecModel::from(rows)));
     win.set_selected_service(selected);
 }

@@ -459,4 +459,25 @@ mod tests {
         // Empty list -> 0 (callers must guard indexing an empty model).
         assert_eq!(remap_selection(Some("alpha"), &[]), 0);
     }
+
+    #[test]
+    fn remap_selection_returns_in_range_index_when_list_shrinks() {
+        // Regression for #12: after a filter narrows the model, the previously
+        // selected service may be absent. The returned index must always be
+        // a valid index into `names` (or 0 when `names` is empty — that case
+        // is the caller's responsibility to guard).
+        let shorter = vec!["alpha".to_string(), "bravo".to_string()];
+        // Service is gone — fall back to 0, which is in range for `shorter`.
+        let idx = remap_selection(Some("charlie"), &shorter);
+        assert_eq!(idx, 0);
+        assert!(
+            (idx as usize) < shorter.len(),
+            "remap_selection returned out-of-range index {idx} for list of len {}",
+            shorter.len()
+        );
+        // Service moved — index reflects new position, still in range.
+        let idx2 = remap_selection(Some("bravo"), &shorter);
+        assert_eq!(idx2, 1);
+        assert!((idx2 as usize) < shorter.len());
+    }
 }
