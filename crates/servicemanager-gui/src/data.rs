@@ -22,8 +22,18 @@ pub use servicemanager_ops::{EditSpec, InstallSpec, RecoverySpec};
 /// A unit of work the UI hands to the worker thread.
 pub enum Job {
     Refresh,
-    Install(InstallSpec),
-    Edit(EditSpec),
+    /// `token` identifies the modal operation that submitted this install so
+    /// the UI can drop a stale result whose modal was cancelled or replaced.
+    Install {
+        spec: InstallSpec,
+        token: u64,
+    },
+    /// `token` identifies the modal operation that submitted this edit so the
+    /// UI can drop a stale result whose modal was cancelled or replaced.
+    Edit {
+        spec: EditSpec,
+        token: u64,
+    },
     Start(String),
     Stop(String),
     Restart(String),
@@ -32,7 +42,10 @@ pub enum Job {
     Rotate(String),
     Remove(String),
     Processes(String),
-    ReadLog { service: String, stderr: bool },
+    ReadLog {
+        service: String,
+        stderr: bool,
+    },
     SaveRecovery(RecoverySpec),
 }
 
@@ -67,10 +80,20 @@ pub enum JobResult {
     /// Outcome of a `SaveRecovery` job — routed to the Recovery view's own
     /// status line. `Ok` carries the success message, `Err` the failure.
     RecoverySaved(Result<String, String>),
-    /// Outcome of an `Install` job — routed back to the Install dialog.
-    Installed(Result<String, String>),
-    /// Outcome of an `Edit` job — routed back to the Edit dialog.
-    Edited(Result<String, String>),
+    /// Outcome of an `Install` job — routed back to the Install dialog. The
+    /// `token` echoes the submitting modal's operation id so a stale result
+    /// (cancelled / replaced before the worker finished) can be dropped.
+    Installed {
+        token: u64,
+        result: Result<String, String>,
+    },
+    /// Outcome of an `Edit` job — routed back to the Edit dialog. The
+    /// `token` echoes the submitting modal's operation id so a stale result
+    /// (cancelled / replaced before the worker finished) can be dropped.
+    Edited {
+        token: u64,
+        result: Result<String, String>,
+    },
     Error(String),
 }
 
@@ -264,8 +287,14 @@ fn execute(job: Job) -> JobResult {
             }
             Err(e) => JobResult::Error(format!("enumerate: {e}")),
         },
-        Job::Install(spec) => JobResult::Installed(servicemanager_ops::install(spec)),
-        Job::Edit(spec) => JobResult::Edited(servicemanager_ops::edit(spec)),
+        Job::Install { spec, token } => JobResult::Installed {
+            token,
+            result: servicemanager_ops::install(spec),
+        },
+        Job::Edit { spec, token } => JobResult::Edited {
+            token,
+            result: servicemanager_ops::edit(spec),
+        },
         Job::Start(n) => match servicemanager_ops::start(&n) {
             Ok(msg) => JobResult::Acted(msg),
             Err(e) => JobResult::Error(format!("{n}: {e}")),

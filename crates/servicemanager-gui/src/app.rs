@@ -62,6 +62,25 @@ struct AppState {
     config: config::Config,
     /// Auto-refresh ticker; held so it keeps running and can be restarted.
     timer: slint::Timer,
+    /// Token of the modal install/edit operation currently in-flight, or
+    /// `None` when no modal job is awaiting a result. The worker echoes the
+    /// token back; `drain_results` drops install/edit results whose token
+    /// does not match — preventing a stale completion from closing or
+    /// corrupting a later modal.
+    active_modal_op: Option<u64>,
+    /// Monotonically-increasing source of modal operation tokens. Bumped on
+    /// every install/edit submit so each operation has a unique id.
+    next_modal_op: u64,
+}
+
+/// Pure helper: should an install/edit result with `result_token` be applied
+/// to the UI given the currently-active modal operation `active`?
+///
+/// A result is applied only when its token matches the active op. When no
+/// modal op is active (`active == None`) every result is dropped — the modal
+/// was cancelled or already resolved.
+fn should_apply_modal_result(active: Option<u64>, result_token: u64) -> bool {
+    active == Some(result_token)
 }
 
 thread_local! {
@@ -153,6 +172,8 @@ pub fn build_ui() -> Result<MainWindow, slint::PlatformError> {
             recovery_form: None,
             config,
             timer: auto_timer,
+            active_modal_op: None,
+            next_modal_op: 0,
         });
     });
 
@@ -339,6 +360,10 @@ fn wire_callbacks(window: &MainWindow) {
             let mut guard = s.borrow_mut();
             let Some(st) = guard.as_mut() else { return };
             st.edit_form = None;
+            // Clear the active modal op so any in-flight install/edit job's
+            // result is silently dropped when it arrives, rather than
+            // applying to a stale or replaced modal.
+            st.active_modal_op = None;
             if let Some(win) = st.window.upgrade() {
                 win.set_active_modal(0);
                 win.set_modal_busy(false);
@@ -364,8 +389,8 @@ fn wire_callbacks(window: &MainWindow) {
     });
     window.on_modal_install_submit(|| {
         STATE.with(|s| {
-            let guard = s.borrow();
-            let Some(st) = guard.as_ref() else { return };
+            let mut guard = s.borrow_mut();
+            let Some(st) = guard.as_mut() else { return };
             let Some(win) = st.window.upgrade() else {
                 return;
             };
@@ -381,10 +406,13 @@ fn wire_callbacks(window: &MainWindow) {
             };
             match form.to_spec() {
                 Ok(spec) => {
+                    let token = st.next_modal_op.wrapping_add(1);
+                    st.next_modal_op = token;
+                    st.active_modal_op = Some(token);
                     win.set_status_text(format!("Installing '{}'…", spec.name).into());
                     win.set_modal_error("".into());
                     win.set_modal_busy(true);
-                    try_send_job(st, &win, Job::Install(spec));
+                    try_send_job(st, &win, Job::Install { spec, token });
                 }
                 Err(e) => win.set_modal_error(e.into()),
             }
@@ -409,10 +437,13 @@ fn wire_callbacks(window: &MainWindow) {
             form.start_type = int_to_start_type(win.get_modal_start_type());
             match form.to_spec() {
                 Ok(spec) => {
+                    let token = st.next_modal_op.wrapping_add(1);
+                    st.next_modal_op = token;
+                    st.active_modal_op = Some(token);
                     win.set_status_text(format!("Editing '{}'…", spec.name).into());
                     win.set_modal_error("".into());
                     win.set_modal_busy(true);
-                    try_send_job(st, &win, Job::Edit(spec));
+                    try_send_job(st, &win, Job::Edit { spec, token });
                 }
                 Err(e) => win.set_modal_error(e.into()),
             }
@@ -757,31 +788,51 @@ fn drain_results() {
                         win.set_recovery_status(format!("Error: {e}").into());
                     }
                 },
-                JobResult::Installed(result) => match result {
-                    Ok(msg) => {
-                        win.set_modal_busy(false);
-                        win.set_active_modal(0);
-                        win.set_status_text(msg.into());
-                        try_send_job(st, &win, Job::Refresh);
+                JobResult::Installed { token, result } => {
+                    // Drop stale results — the modal was cancelled or
+                    // replaced before the worker finished. Without this
+                    // guard, a stale success can close the current modal
+                    // and a stale error can appear in the wrong one.
+                    if !should_apply_modal_result(st.active_modal_op, token) {
+                        continue;
                     }
-                    Err(e) => {
-                        win.set_modal_busy(false);
-                        win.set_modal_error(e.into());
+                    match result {
+                        Ok(msg) => {
+                            st.active_modal_op = None;
+                            win.set_modal_busy(false);
+                            win.set_active_modal(0);
+                            win.set_status_text(msg.into());
+                            try_send_job(st, &win, Job::Refresh);
+                        }
+                        Err(e) => {
+                            // Operation finished — clear the token so a
+                            // subsequent modal isn't matched against it.
+                            st.active_modal_op = None;
+                            win.set_modal_busy(false);
+                            win.set_modal_error(e.into());
+                        }
                     }
-                },
-                JobResult::Edited(result) => match result {
-                    Ok(msg) => {
-                        win.set_modal_busy(false);
-                        st.edit_form = None;
-                        win.set_active_modal(0);
-                        win.set_status_text(msg.into());
-                        try_send_job(st, &win, Job::Refresh);
+                }
+                JobResult::Edited { token, result } => {
+                    if !should_apply_modal_result(st.active_modal_op, token) {
+                        continue;
                     }
-                    Err(e) => {
-                        win.set_modal_busy(false);
-                        win.set_modal_error(e.into());
+                    match result {
+                        Ok(msg) => {
+                            st.active_modal_op = None;
+                            win.set_modal_busy(false);
+                            st.edit_form = None;
+                            win.set_active_modal(0);
+                            win.set_status_text(msg.into());
+                            try_send_job(st, &win, Job::Refresh);
+                        }
+                        Err(e) => {
+                            st.active_modal_op = None;
+                            win.set_modal_busy(false);
+                            win.set_modal_error(e.into());
+                        }
                     }
-                },
+                }
                 JobResult::Error(e) => {
                     win.set_status_text(format!("Error: {e}").into());
                 }
@@ -977,6 +1028,7 @@ fn persist_config(st: &AppState, win: &MainWindow) {
 
 #[cfg(test)]
 mod tests {
+    use super::should_apply_modal_result;
     use crate::event_log_reader::format_local_hms;
 
     #[test]
@@ -986,5 +1038,26 @@ mod tests {
         let s = format_local_hms("2026-05-22T14:15:32Z");
         assert_eq!(s.len(), 8);
         assert!(s.chars().nth(2) == Some(':'));
+    }
+
+    #[test]
+    fn modal_result_with_matching_token_is_applied() {
+        assert!(should_apply_modal_result(Some(7), 7));
+    }
+
+    #[test]
+    fn modal_result_with_stale_token_is_dropped() {
+        // Active op moved on (or a different submit happened) — old
+        // worker result must not affect the current modal.
+        assert!(!should_apply_modal_result(Some(8), 7));
+        assert!(!should_apply_modal_result(Some(1), 0));
+    }
+
+    #[test]
+    fn modal_result_with_no_active_op_is_dropped() {
+        // The modal was cancelled or already resolved — any result
+        // arriving now is stale by definition.
+        assert!(!should_apply_modal_result(None, 0));
+        assert!(!should_apply_modal_result(None, 42));
     }
 }
