@@ -29,11 +29,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Pin to the workspace's `rust-version = "1.88"` so CI matches the
+      # Pin to the workspace's `rust-version = "1.90"` so CI matches the
       # MSRV — drift here is exactly the regression class that lets fmt
       # noise from a newer rustc slip past local validation.
-      - name: Install Rust 1.88 (rustfmt, clippy)
-        uses: dtolnay/rust-toolchain@1.88.0
+      - name: Install Rust 1.90 (rustfmt, clippy)
+        uses: dtolnay/rust-toolchain@1.90.0
         with:
           components: rustfmt, clippy
 

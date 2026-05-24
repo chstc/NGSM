@@ -15,10 +15,11 @@ members = [
 [workspace.package]
 version = "0.3.2"
 edition = "2021"
-# Real minimum: the resolved dependency graph (image 1.88, clap 1.85,
-# slint/embed-resource) needs 1.88. Declaring less would make a
-# build on the stated toolchain fail despite this metadata claiming support.
-rust-version = "1.88"
+# Real minimum: the resolved dependency graph requires 1.90 as of 2026-05
+# (smol_str 0.3.6 needs 1.89; typed-index-collections 3.5.0 needs 1.90 —
+# both pulled in transitively by Slint). Declaring less would make CI
+# fail despite this metadata claiming support.
+rust-version = "1.90"
 # BSD Zero Clause License — a permissive, OSI-approved license that requires
 # no attribution, preserving the no-strings spirit of the public-domain NSSM
 # project this descends from. Full text in the LICENSE file alongside this
