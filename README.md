@@ -63,7 +63,7 @@ here with the equally permissive **0BSD** license.
 
 ## Install
 
-NGSM is **Windows-only** (x64).
+NGSM is **Windows-only** (x64 primary; aarch64 and i686 builds are configured but untested).
 
 1. Download `ngsm.exe` from the
    [Releases](https://github.com/chstc/NGSM/releases) page.
