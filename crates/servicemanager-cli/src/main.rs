@@ -677,6 +677,14 @@ fn cmd_install_extended(args: &InstallArgs, json: bool) -> Result<()> {
         managed.hooks.push(parse_hook_spec(raw)?);
     }
 
+    // Pre-validate the full config *before* creating the SCM service. A
+    // doomed config (e.g. relative AppDirectory, non-numeric exit-action
+    // key) would otherwise create the SCM service first and then fail at
+    // registry-write time, leaving an orphan if rollback also failed.
+    // Mirrors what `servicemanager_ops::install` does for the simple path.
+    servicemanager_ops::validate_managed_config(&managed)
+        .map_err(servicemanager_core::Error::InvalidConfig)?;
+
     let binary_path = build_run_service_command(&args.name)?;
     let display = args.display.clone().unwrap_or_else(|| args.name.clone());
 

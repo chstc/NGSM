@@ -32,6 +32,7 @@ pub mod recovery;
 pub mod remove;
 pub mod rotate;
 pub mod specs;
+pub mod validate;
 
 // Flat re-exports so callers can write `servicemanager_ops::install(spec)`.
 pub use error::OpResult;
@@ -44,3 +45,4 @@ pub use list::list_services;
 pub use recovery::{read_recovery, save_recovery, validate_exit_action_key};
 pub use remove::remove;
 pub use rotate::rotate;
+pub use validate::validate_managed_config;
