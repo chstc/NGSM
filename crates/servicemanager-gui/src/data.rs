@@ -119,17 +119,26 @@ impl JobSender {
     /// pending — the in-flight refresh will pick up the latest state when it
     /// runs.
     pub fn send(&self, job: Job) -> Result<(), JobSendError> {
-        if matches!(job, Job::Refresh) {
+        let is_refresh = matches!(job, Job::Refresh);
+        if is_refresh && self.pending_refresh.swap(true, Ordering::AcqRel) {
             // swap returns the previous value; if it was already true there is
             // already a pending Refresh — discard this duplicate.
-            if self.pending_refresh.swap(true, Ordering::AcqRel) {
-                return Ok(());
+            return Ok(());
+        }
+        match self.inner.try_send(job) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if is_refresh {
+                    // try_send failed — un-mark the pending flag so a future
+                    // Refresh attempt isn't silently coalesced into oblivion.
+                    self.pending_refresh.store(false, Ordering::Release);
+                }
+                Err(match e {
+                    std::sync::mpsc::TrySendError::Full(_) => JobSendError::Full,
+                    std::sync::mpsc::TrySendError::Disconnected(_) => JobSendError::Disconnected,
+                })
             }
         }
-        self.inner.try_send(job).map_err(|e| match e {
-            std::sync::mpsc::TrySendError::Full(_) => JobSendError::Full,
-            std::sync::mpsc::TrySendError::Disconnected(_) => JobSendError::Disconnected,
-        })
     }
 }
 
@@ -195,6 +204,36 @@ mod job_sender_tests {
         // Now a third Refresh should be accepted again.
         sender.send(Job::Refresh).unwrap();
         assert!(pending.load(Ordering::Acquire), "flag should be set again");
+    }
+
+    #[test]
+    fn refresh_send_failure_clears_pending_flag_so_future_refresh_can_retry() {
+        // Bound channel of size 1, fill it with a non-Refresh job, then try
+        // Refresh — try_send must fail with Full. After that failure, the
+        // pending_refresh flag MUST be back to false so the next Refresh
+        // attempt is not silently coalesced into oblivion.
+        let (tx, rx) = mpsc::sync_channel::<Job>(1);
+        let pending = Arc::new(AtomicBool::new(false));
+        let sender = JobSender {
+            inner: tx,
+            pending_refresh: Arc::clone(&pending),
+        };
+
+        // Fill the channel with one non-Refresh job.
+        sender.send(Job::Start("svc".into())).unwrap();
+
+        // Refresh should fail Full and leave pending=false.
+        let err = sender.send(Job::Refresh).unwrap_err();
+        assert_eq!(err, JobSendError::Full);
+        assert!(
+            !pending.load(Ordering::Acquire),
+            "pending_refresh must be cleared after a failed Refresh send"
+        );
+
+        // Drain the channel and confirm a second Refresh attempt now succeeds.
+        let _ = rx.recv().unwrap();
+        sender.send(Job::Refresh).unwrap();
+        assert!(pending.load(Ordering::Acquire));
     }
 }
 
