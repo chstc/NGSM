@@ -1,5 +1,5 @@
 //! Read recent supervisor-recorded events from
-//! `%ProgramData%\NGSM\events.log` (+ rotated `events.log.1`).
+//! `%ProgramData%\NGSM\events.log` (+ rotated `events.log.N`).
 //!
 //! Records are returned **newest first**. Malformed lines are skipped
 //! silently. The reader is best-effort: missing files, parse errors, and
@@ -9,21 +9,31 @@
 use servicemanager_core::events::EventRecord;
 use servicemanager_core::paths;
 
-/// Read up to `max` most-recent records across both log files.
+/// Build the full list of log paths to scan, oldest-first: rotated
+/// backups `.N` down through `.1`, then the active log. Shared by
+/// `read_recent` and `read_since` so a future change to the retention
+/// scheme (or backup-naming) updates both readers at once and the panel
+/// can never silently drop retained records again (see #13).
+fn iter_log_paths() -> Vec<std::path::PathBuf> {
+    (1..=paths::BACKUP_RETENTION_COUNT)
+        .rev()
+        .filter_map(|n| paths::events_log_backup_n(n).ok())
+        .chain(paths::events_log().ok())
+        .collect()
+}
+
+/// Read up to `max` most-recent records across every retained log file
+/// (active + all rotated backups).
+///
 /// Reads only the trailing TAIL_BYTES from each file (rather than the
 /// whole thing), so cost is bounded regardless of file size. Sorts by
 /// the RFC 3339 ts field descending — newest first — to tolerate
 /// out-of-order writes from clock skew between concurrent supervisors.
 /// Caller is on the worker thread; this is allowed to do file I/O.
 pub fn read_recent(max: usize) -> Vec<EventRecord> {
-    let active = paths::events_log().ok();
-    let backup = paths::events_log_backup().ok();
     let mut all: Vec<EventRecord> = Vec::new();
-    if let Some(b) = backup {
-        parse_tail_into(&b, &mut all);
-    }
-    if let Some(a) = active {
-        parse_tail_into(&a, &mut all);
+    for path in iter_log_paths() {
+        parse_tail_into(&path, &mut all);
     }
     // ts is RFC 3339 UTC — lexicographic order matches time order.
     all.sort_by(|a, b| b.ts.cmp(&a.ts));
@@ -89,15 +99,12 @@ pub fn read_since(since: time::OffsetDateTime) -> std::io::Result<Vec<EventRecor
 
     let mut parsed: Vec<(time::OffsetDateTime, EventRecord)> = Vec::new();
 
-    // Scan oldest backup first (.4) through active. The final sort makes
+    // Scan oldest backup first (.N) through active. The final sort makes
     // file order irrelevant for correctness, but oldest-first keeps the
     // intermediate vector roughly time-ordered, which the sort handles
-    // efficiently.
-    let paths: Vec<std::path::PathBuf> = (1..=servicemanager_core::paths::BACKUP_RETENTION_COUNT)
-        .rev()
-        .filter_map(|n| servicemanager_core::paths::events_log_backup_n(n).ok())
-        .chain(servicemanager_core::paths::events_log().ok())
-        .collect();
+    // efficiently. Share the path list with `read_recent` so a retention
+    // bump cannot regress one reader without the other (#13).
+    let paths = iter_log_paths();
 
     for path in &paths {
         let mut file = match std::fs::File::open(path) {
@@ -451,6 +458,59 @@ mod tests {
         // True instant order: first (08:00 UTC) before second (08:30 UTC).
         assert_eq!(out[0].service, "first");
         assert_eq!(out[1].service, "second");
+    }
+
+    #[test]
+    fn read_recent_includes_records_from_backup_2() {
+        // #13 regression: prior to the fix, `read_recent` only scanned
+        // the active log + `.1`, so a record retained in `.2` (or
+        // later) would silently vanish from the Recent Events panel.
+        let (_g, _dir) = isolate();
+        write_backup_n(
+            2,
+            &[r#"{"ts":"2026-05-20T00:00:00Z","service":"FromBackup2","event":"started","pid":1}"#],
+        );
+        // Active and `.1` deliberately left absent.
+        let out = read_recent(50);
+        assert!(
+            out.iter().any(|r| r.service == "FromBackup2"),
+            "read_recent must surface records retained in .2 (got {out:?})"
+        );
+    }
+
+    #[test]
+    fn read_recent_returns_newest_first_across_all_backups() {
+        // Each retained backup contributes one record at a distinct
+        // timestamp; `read_recent` must merge them and sort newest-first
+        // across the full retention chain.
+        let (_g, _dir) = isolate();
+        write_backup_n(
+            4,
+            &[r#"{"ts":"2026-05-20T00:00:00Z","service":"B4","event":"started","pid":1}"#],
+        );
+        write_backup_n(
+            3,
+            &[r#"{"ts":"2026-05-21T00:00:00Z","service":"B3","event":"started","pid":2}"#],
+        );
+        write_backup_n(
+            2,
+            &[r#"{"ts":"2026-05-22T00:00:00Z","service":"B2","event":"started","pid":3}"#],
+        );
+        write_backup_n(
+            1,
+            &[r#"{"ts":"2026-05-23T00:00:00Z","service":"B1","event":"started","pid":4}"#],
+        );
+        write_active(&[
+            r#"{"ts":"2026-05-23T12:00:00Z","service":"Active","event":"started","pid":5}"#,
+        ]);
+        let out = read_recent(50);
+        assert_eq!(out.len(), 5);
+        // Newest first across all five files:
+        assert_eq!(out[0].service, "Active");
+        assert_eq!(out[1].service, "B1");
+        assert_eq!(out[2].service, "B2");
+        assert_eq!(out[3].service, "B3");
+        assert_eq!(out[4].service, "B4");
     }
 
     #[test]
