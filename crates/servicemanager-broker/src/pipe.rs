@@ -27,7 +27,8 @@ use std::time::Duration;
 use servicemanager_core::{Error, Result};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    GetLastError, LocalFree, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, WIN32_ERROR,
+    CloseHandle, DuplicateHandle, GetLastError, LocalFree, DUPLICATE_SAME_ACCESS,
+    ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, WIN32_ERROR,
 };
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
@@ -38,6 +39,7 @@ use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
     PIPE_WAIT,
 };
+use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::System::IO::CancelIoEx;
 
 use crate::handlers;
@@ -278,6 +280,38 @@ impl AsRawHandlePtr for OwnedHandle {
     }
 }
 
+/// Duplicate a pipe handle so the watchdog owns its own kernel reference to
+/// the pipe instance. Without this, the watchdog would only carry the raw
+/// handle *value* — and Windows reuses handle values within a process, so if
+/// the worker closed its `OwnedHandle` between the watchdog reading `done`
+/// and issuing `CancelIoEx`/`DisconnectNamedPipe`, those calls would land on
+/// an unrelated object that happened to inherit the recycled value.
+///
+/// With a duplicate, the watchdog's handle keeps the original pipe instance
+/// alive (and identifiable) for as long as the watchdog holds it, regardless
+/// of when the worker drops its own. The watchdog must `CloseHandle` its
+/// duplicate when it exits.
+fn duplicate_pipe_handle(source: *mut core::ffi::c_void) -> Result<HANDLE> {
+    let mut dup = HANDLE::default();
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle that is always
+    // valid; `source` is a live pipe handle the worker currently owns;
+    // `dup` is a stack slot that receives the duplicated handle.
+    unsafe {
+        let proc = GetCurrentProcess();
+        DuplicateHandle(
+            proc,
+            HANDLE(source),
+            proc,
+            &mut dup,
+            0,
+            false,
+            DUPLICATE_SAME_ACCESS,
+        )
+        .map_err(|e| Error::other(format!("DuplicateHandle: {e}")))?;
+    }
+    Ok(dup)
+}
+
 /// Spawn the per-connection watchdog. It cancels the worker's pipe I/O once
 /// the worker has been blocked in a single read or write for longer than
 /// [`CONN_IDLE_LIMIT_MS`], or once the connection exceeds
@@ -286,36 +320,57 @@ impl AsRawHandlePtr for OwnedHandle {
 /// (but bounded) handler neither trips the idle timeout nor disarms the
 /// watchdog. The watchdog keeps looping rather than exiting after one shot,
 /// so coverage never lapses; `done` stops it when the connection tears down.
+///
+/// `watchdog_handle` is an *independent* duplicate of the pipe handle (see
+/// [`duplicate_pipe_handle`]). The worker owns the original `OwnedHandle`;
+/// the watchdog owns this duplicate. Both refer to the same kernel pipe
+/// instance, but each thread closes its own handle on teardown — so there
+/// is no race where one thread frees a handle value the other is about to
+/// use. The watchdog closes its duplicate before returning.
 fn spawn_connection_watchdog(
-    raw_handle: *mut core::ffi::c_void,
+    watchdog_handle: HANDLE,
     done: Arc<AtomicBool>,
     io_waiting_since: Arc<AtomicU64>,
 ) {
-    // `*mut c_void` is not `Send`; pass the handle value as a `usize`.
-    let raw = raw_handle as usize;
+    // `HANDLE` wraps `*mut c_void`, which is not `Send`; pass the handle
+    // value as a `usize` and rebuild it inside the worker thread.
+    let raw = watchdog_handle.0 as usize;
     let started = now_epoch_ms();
-    thread::spawn(move || loop {
-        thread::sleep(WATCHDOG_TICK);
-        if done.load(Ordering::Relaxed) {
-            return;
-        }
-        let now = now_epoch_ms();
-        let waiting = io_waiting_since.load(Ordering::Relaxed);
-        let io_stalled = waiting != 0 && now.saturating_sub(waiting) >= CONN_IDLE_LIMIT_MS;
-        let lifetime_exceeded = now.saturating_sub(started) >= CONN_MAX_LIFETIME_MS;
-        if io_stalled || lifetime_exceeded {
-            // `done` is still false, so the worker is still on this handle,
-            // which is therefore still open. `CancelIoEx` cancels the
-            // in-flight blocking read/write; `DisconnectNamedPipe` is the
-            // forceful, reliable backstop — it severs the connection so any
-            // synchronous I/O on this instance returns an error even if the
-            // cancel did not interrupt the blocking call as expected.
-            // SAFETY: operating on a live pipe handle the worker still owns.
-            unsafe {
-                let h = HANDLE(raw as *mut core::ffi::c_void);
-                let _ = CancelIoEx(h, None);
-                let _ = DisconnectNamedPipe(h);
+    thread::spawn(move || {
+        // SAFETY: `raw` came from `DuplicateHandle` above and is owned by
+        // this thread for the rest of its lifetime; no other thread closes
+        // or otherwise invalidates it.
+        let h = HANDLE(raw as *mut core::ffi::c_void);
+        loop {
+            thread::sleep(WATCHDOG_TICK);
+            if done.load(Ordering::Relaxed) {
+                break;
             }
+            let now = now_epoch_ms();
+            let waiting = io_waiting_since.load(Ordering::Relaxed);
+            let io_stalled = waiting != 0 && now.saturating_sub(waiting) >= CONN_IDLE_LIMIT_MS;
+            let lifetime_exceeded = now.saturating_sub(started) >= CONN_MAX_LIFETIME_MS;
+            if io_stalled || lifetime_exceeded {
+                // The watchdog's duplicate keeps the pipe instance alive
+                // and unambiguously identifies it, even if the worker has
+                // since closed its own handle. `CancelIoEx` cancels any
+                // in-flight blocking read/write on the instance;
+                // `DisconnectNamedPipe` is the forceful, reliable backstop
+                // — it severs the connection so synchronous I/O on this
+                // instance returns an error even if the cancel did not
+                // interrupt the blocking call as expected.
+                // SAFETY: `h` is our duplicate, still owned by this thread.
+                unsafe {
+                    let _ = CancelIoEx(h, None);
+                    let _ = DisconnectNamedPipe(h);
+                }
+            }
+        }
+        // Release our duplicate. The original is owned by the worker.
+        // SAFETY: `h` is the duplicated handle we have owned exclusively
+        // for the lifetime of this thread; it has not been closed.
+        unsafe {
+            let _ = CloseHandle(h);
         }
     });
 }
@@ -323,13 +378,32 @@ fn spawn_connection_watchdog(
 fn handle_connection(pipe: OwnedHandle, state: &ServerState) {
     let raw = pipe.as_raw_handle();
     // `done` disarms the watchdog once the connection ends, so it never
-    // touches a handle that is about to close. `io_waiting_since` is the
-    // epoch-ms the worker began its current pipe read/write, or 0 while a
-    // request handler runs — the watchdog times out *I/O* stalls only,
-    // never (bounded) handler execution.
+    // operates on a stale duplicate. `io_waiting_since` is the epoch-ms the
+    // worker began its current pipe read/write, or 0 while a request handler
+    // runs — the watchdog times out *I/O* stalls only, never (bounded)
+    // handler execution.
     let done = Arc::new(AtomicBool::new(false));
     let io_waiting_since = Arc::new(AtomicU64::new(now_epoch_ms()));
-    spawn_connection_watchdog(raw, Arc::clone(&done), Arc::clone(&io_waiting_since));
+    // Hand the watchdog its own kernel reference to the pipe so it cannot
+    // wind up operating on a recycled handle value after the worker has
+    // closed its `OwnedHandle`. If the duplication fails we drop the
+    // connection rather than serve it without a watchdog.
+    let watchdog_handle = match duplicate_pipe_handle(raw) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("[broker] failed to duplicate pipe handle for watchdog: {e}");
+            // SAFETY: `raw` still backs `pipe`, which we then drop to close.
+            unsafe {
+                let _ = DisconnectNamedPipe(HANDLE(raw));
+            }
+            return;
+        }
+    };
+    spawn_connection_watchdog(
+        watchdog_handle,
+        Arc::clone(&done),
+        Arc::clone(&io_waiting_since),
+    );
 
     let mut io = std::fs::File::from(pipe);
     loop {
@@ -681,5 +755,64 @@ mod tests {
         // Path separators / metacharacters are rejected.
         assert!(validate_pipe_nonce("bad\\nonce\\injection").is_err());
         assert!(validate_pipe_nonce("has space in it!").is_err());
+    }
+
+    /// Regression test for H-03: the watchdog must hold its *own* kernel
+    /// handle to the pipe instance, not just a copy of the worker's raw
+    /// handle value. Closing one handle must not invalidate the other,
+    /// and the two raw values must be distinct (a duplicate gets a fresh
+    /// handle-table slot, not the source's slot back).
+    #[test]
+    fn duplicate_pipe_handle_is_independent_of_source() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use windows::Win32::Security::SECURITY_ATTRIBUTES;
+
+        // A unique pipe name so concurrent test runs do not collide.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let nonce = now_epoch_ms()
+            .wrapping_add(SEQ.fetch_add(1, Ordering::Relaxed))
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let name = format!("\\\\.\\pipe\\NGSM-broker-test-h03-{nonce:x}");
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+
+        // Create a pipe instance — no SDDL needed for a same-process test.
+        // SAFETY: `wide` outlives the call; passing `None` for the security
+        // attributes uses the default DACL, which is fine for a handle that
+        // never leaves this process.
+        let server = unsafe {
+            CreateNamedPipeW(
+                PCWSTR::from_raw(wide.as_ptr()),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                1,
+                4096,
+                4096,
+                0,
+                None::<*const SECURITY_ATTRIBUTES>,
+            )
+        };
+        assert!(!server.is_invalid(), "CreateNamedPipeW failed");
+
+        let dup = duplicate_pipe_handle(server.0).expect("duplicate succeeds");
+
+        // The duplicated handle must occupy a *distinct* handle-table slot,
+        // not the same value the source already owns. This is the core
+        // property the H-03 fix relies on: each thread cancels/disconnects
+        // through its own kernel reference, so neither can land on a
+        // recycled-but-unrelated object after the other closes.
+        assert_ne!(
+            server.0 as usize, dup.0 as usize,
+            "duplicate must have a distinct raw value from the source"
+        );
+
+        // Closing the source must not invalidate the duplicate. If
+        // `CloseHandle(dup)` errors after the source close, the duplicate
+        // never really held an independent reference.
+        // SAFETY: both handles were created/duplicated above and are owned
+        // exclusively by this test thread.
+        unsafe {
+            CloseHandle(server).expect("close source");
+            CloseHandle(dup).expect("close duplicate after source was closed");
+        }
     }
 }
