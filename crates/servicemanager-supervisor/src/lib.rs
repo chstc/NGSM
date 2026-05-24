@@ -40,7 +40,7 @@ pub mod hooks;
 pub mod rotation;
 
 use hooks::{find_hook, is_resume_event, run_hook, HookPoint};
-use rotation::{maybe_rotate, pipe_reader_loop, RotationSink};
+use rotation::{dedup_sinks, maybe_rotate, pipe_reader_loop, RotationSink};
 
 pub const DEFAULT_RESTART_DELAY_MS: u32 = 0;
 pub const DEFAULT_THROTTLE_DELAY_MS: u32 = 1500;
@@ -651,17 +651,33 @@ impl Supervisor {
         let stdin_stream = self.config.io.stdin.clone();
         let rotation = self.config.rotation.clone();
 
-        if let Some(stream) = &stdout_stream {
-            if online {
-                cmd.stdout(self.attach_pipe_sink("stdout", stream)?);
-            } else {
+        if online {
+            // Online rotation: stdout and stderr may target the same file.
+            // Build at most one `RotationSink` per unique path and share it
+            // between both streams so a rotation triggered by one writer is
+            // visible to the other (single mutex, single file handle, single
+            // byte counter). Two independent sinks would race on every
+            // rotation — see finding #11.
+            let (stdout_sink, stderr_sink, unique) =
+                dedup_sinks(stdout_stream.as_ref(), stderr_stream.as_ref(), &rotation)?;
+            // Keep the deduplicated sinks alive for the lifetime of this
+            // child. `rotate_sinks_now` iterates `self.sinks`, so storing
+            // only the unique set ensures an on-demand `Rotate` doesn't
+            // rotate the same underlying file twice.
+            for sink in unique {
+                self.sinks.push(sink);
+            }
+            if let Some(sink) = stdout_sink {
+                cmd.stdout(self.attach_pipe_sink("stdout", sink)?);
+            }
+            if let Some(sink) = stderr_sink {
+                cmd.stderr(self.attach_pipe_sink("stderr", sink)?);
+            }
+        } else {
+            if let Some(stream) = &stdout_stream {
                 cmd.stdout(open_log_file(stream, &rotation)?);
             }
-        }
-        if let Some(stream) = &stderr_stream {
-            if online {
-                cmd.stderr(self.attach_pipe_sink("stderr", stream)?);
-            } else {
+            if let Some(stream) = &stderr_stream {
                 cmd.stderr(open_log_file(stream, &rotation)?);
             }
         }
@@ -932,23 +948,22 @@ impl Supervisor {
         None
     }
 
-    /// Build a write-end pipe handed to the child as its stdio, attach the
-    /// matching read-end to a [`RotationSink`], and spawn a reader thread
-    /// that funnels the child's output into the rotating log file.
+    /// Build a write-end pipe handed to the child as its stdio and spawn a
+    /// reader thread that funnels the child's output into the provided
+    /// [`RotationSink`]. The sink is supplied by [`dedup_sinks`] so that
+    /// stdout and stderr targeting the same path share a single mutex,
+    /// file handle, and rotation state (see finding #11).
     fn attach_pipe_sink(
         &mut self,
         label: &str,
-        stream: &IoStream,
+        sink: Arc<RotationSink>,
     ) -> Result<Stdio, SupervisorError> {
-        let sink = Arc::new(RotationSink::open(stream, self.config.rotation.clone())?);
         let (reader, writer) = os_pipe::pipe().map_err(SupervisorError::Io)?;
 
-        let sink_clone = Arc::clone(&sink);
         let name = self.name.clone();
         let label = label.to_string();
-        thread::spawn(move || pipe_reader_loop(name, label, reader, sink_clone));
+        thread::spawn(move || pipe_reader_loop(name, label, reader, sink));
 
-        self.sinks.push(sink);
         Ok(Stdio::from(writer))
     }
 
