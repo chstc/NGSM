@@ -279,8 +279,10 @@ enum RecoveryAction {
 #[derive(Args, Debug)]
 struct RecoverySetArgs {
     /// Default action when a process exit code has no explicit mapping.
+    /// Optional: when omitted, the existing default_action on the service is
+    /// preserved so other fields (delays, exit_actions) can be updated alone.
     #[arg(long, value_enum)]
-    default_action: ExitActionArg,
+    default_action: Option<ExitActionArg>,
 
     /// Milliseconds to delay before restarting the service.
     #[arg(long)]
@@ -1083,7 +1085,31 @@ fn cmd_recovery_set(name: &str, args: &RecoverySetArgs, json: bool) -> Result<()
     // is not set.
     let current =
         servicemanager_ops::read_recovery(name).map_err(servicemanager_core::Error::other)?;
+    let spec = merge_recovery_args(name, &current, args)?;
+    let msg = servicemanager_ops::save_recovery(spec).map_err(servicemanager_core::Error::other)?;
+    if json {
+        println!("{}", serde_json::json!({ "saved": name }));
+    } else {
+        println!("{msg}");
+    }
+    Ok(())
+}
 
+/// Merge a `RecoverySetArgs` payload onto the currently-persisted recovery
+/// spec for `name`, returning the spec that should be written back.
+///
+/// Every field on `RecoverySetArgs` is optional — when a CLI flag is absent,
+/// the matching field on `current` is preserved. This lets users update one
+/// knob at a time (e.g. `recovery set foo --restart-delay-ms 5000`) without
+/// restating the others.
+///
+/// Extracted as a free function so it can be unit-tested without touching the
+/// registry (which `read_recovery`/`save_recovery` would require).
+fn merge_recovery_args(
+    name: &str,
+    current: &RecoverySpec,
+    args: &RecoverySetArgs,
+) -> Result<RecoverySpec> {
     let restart_delay_ms = if args.no_restart_delay {
         None
     } else {
@@ -1099,7 +1125,7 @@ fn cmd_recovery_set(name: &str, args: &RecoverySetArgs, json: bool) -> Result<()
     let mut exit_actions: BTreeMap<String, ExitAction> = if args.clear_exit_actions {
         BTreeMap::new()
     } else {
-        current.exit_actions
+        current.exit_actions.clone()
     };
 
     // Parse and apply --exit-action CODE=ACTION entries.
@@ -1122,20 +1148,21 @@ fn cmd_recovery_set(name: &str, args: &RecoverySetArgs, json: bool) -> Result<()
         exit_actions.insert(code, action);
     }
 
-    let spec = RecoverySpec {
+    // default_action is optional on the CLI — preserve the existing value
+    // when the flag is absent so partial updates do not force the operator
+    // to restate it.
+    let default_action = match args.default_action {
+        Some(arg) => arg.into(),
+        None => current.default_action,
+    };
+
+    Ok(RecoverySpec {
         name: name.to_string(),
         restart_delay_ms,
         throttle_delay_ms,
-        default_action: args.default_action.into(),
+        default_action,
         exit_actions,
-    };
-    let msg = servicemanager_ops::save_recovery(spec).map_err(servicemanager_core::Error::other)?;
-    if json {
-        println!("{}", serde_json::json!({ "saved": name }));
-    } else {
-        println!("{msg}");
-    }
-    Ok(())
+    })
 }
 
 /// Parse an exit-action string (case-insensitive).
@@ -1471,5 +1498,67 @@ mod tests {
         // passing — the validator only fires when rotation is requested.
         let args = install_args_defaults();
         validate_install_args(&args).expect("plain install with no rotation must pass");
+    }
+
+    /// Build a `RecoverySetArgs` with everything off — tests then flip just
+    /// the field they care about.
+    fn recovery_set_args_defaults() -> RecoverySetArgs {
+        RecoverySetArgs {
+            default_action: None,
+            restart_delay_ms: None,
+            no_restart_delay: false,
+            throttle_delay_ms: None,
+            no_throttle_delay: false,
+            exit_actions: Vec::new(),
+            clear_exit_actions: false,
+        }
+    }
+
+    /// A baseline persisted recovery spec to merge against in unit tests.
+    fn recovery_spec_baseline() -> RecoverySpec {
+        let mut exit_actions = BTreeMap::new();
+        exit_actions.insert("0".into(), ExitAction::Ignore);
+        RecoverySpec {
+            name: "TestSvc".into(),
+            restart_delay_ms: Some(1_000),
+            throttle_delay_ms: Some(2_000),
+            default_action: ExitAction::Restart,
+            exit_actions,
+        }
+    }
+
+    #[test]
+    fn recovery_set_with_only_restart_delay_preserves_default_action() {
+        // Regression for finding #9: a partial update that only changes
+        // restart_delay_ms must keep the existing default_action — it should
+        // not silently flip to a clap-supplied default.
+        let current = recovery_spec_baseline();
+        let mut args = recovery_set_args_defaults();
+        args.restart_delay_ms = Some(5_000);
+
+        let merged = merge_recovery_args("TestSvc", &current, &args).expect("merge succeeds");
+
+        assert_eq!(merged.restart_delay_ms, Some(5_000));
+        assert_eq!(
+            merged.default_action, current.default_action,
+            "default_action must be preserved when --default-action is absent"
+        );
+        // Untouched fields are still preserved.
+        assert_eq!(merged.throttle_delay_ms, current.throttle_delay_ms);
+        assert_eq!(merged.exit_actions, current.exit_actions);
+    }
+
+    #[test]
+    fn recovery_set_with_explicit_default_action_overrides() {
+        // When the operator does pass --default-action, the new value wins.
+        let current = recovery_spec_baseline();
+        let mut args = recovery_set_args_defaults();
+        args.default_action = Some(ExitActionArg::Exit);
+        args.restart_delay_ms = Some(5_000);
+
+        let merged = merge_recovery_args("TestSvc", &current, &args).expect("merge succeeds");
+
+        assert_eq!(merged.default_action, ExitAction::Exit);
+        assert_eq!(merged.restart_delay_ms, Some(5_000));
     }
 }
