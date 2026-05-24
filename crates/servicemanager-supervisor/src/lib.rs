@@ -52,9 +52,30 @@ pub const DEFAULT_WINDOW_GRACE_MS: u32 = 1500;
 /// Matches NSSM's default grace period for the WM_QUIT (thread-message) step.
 pub const DEFAULT_THREADS_GRACE_MS: u32 = 1500;
 
-/// Bits in `AppStopMethodSkip`. We currently implement the console + terminate
-/// steps; window/thread message bits are recognized for compatibility but
-/// have no effect because we never attempt those steps.
+/// Bits in `AppStopMethodSkip` (mirrors NSSM's `AppStopMethodSkip`). Each bit
+/// suppresses one phase of the graceful-stop pipeline implemented by
+/// [`Supervisor::stop_child_gracefully`]. The phases run in order; each one
+/// is skipped if the corresponding bit is set in
+/// `ManagedApplicationConfig::shutdown::stop_method_skip`, otherwise it runs
+/// and waits up to its configured grace period for the child to exit before
+/// the next phase is attempted:
+///
+/// 1. **Console** (`0x1`) — send `CTRL+BREAK` to the child's process group
+///    (`GenerateConsoleCtrlEvent`). Honoured by console apps that install a
+///    handler with `SetConsoleCtrlHandler`. Grace: `kill_console_grace_ms`.
+/// 2. **Window** (`0x2`) — walk every visible top-level window owned by any
+///    process in the job and `PostMessage(WM_CLOSE)`. Honoured by
+///    well-behaved GUI apps. Grace: `kill_window_grace_ms`.
+/// 3. **Threads** (`0x4`) — `PostThreadMessage(WM_QUIT)` to every thread in
+///    every process in the job. Catches UI threads whose message loops pump
+///    thread messages but never dispatch a `WindowProc`. Grace:
+///    `kill_threads_grace_ms`.
+/// 4. **Terminate** (`0x8`) — last-resort kill. If `kill_process_tree` is
+///    set (the default), this calls `TerminateJobObject(1)` so the entire
+///    descendant tree dies promptly; otherwise the single managed child is
+///    killed via `TerminateProcess` and the rest of the tree only dies a
+///    moment later when the job handle is dropped (the job is always
+///    `KILL_ON_JOB_CLOSE`).
 pub const STOP_METHOD_SKIP_CONSOLE: u32 = 0x1;
 pub const STOP_METHOD_SKIP_WINDOW: u32 = 0x2;
 pub const STOP_METHOD_SKIP_THREADS: u32 = 0x4;
