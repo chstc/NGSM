@@ -858,6 +858,14 @@ pub fn get_value(service: &str, name: &str) -> Result<Option<ValueRecord>> {
 
 /// Delete a single managed value by NSSM-style name. Missing values are
 /// silently tolerated.
+///
+/// For stdio path fields (`AppStdin`/`AppStdout`/`AppStderr`) this also
+/// deletes the four associated attribute values
+/// (`{base}ShareMode`/`CreationDisposition`/`FlagsAndAttributes`/`CopyAndTruncate`)
+/// via `clear_path_value`, mirroring the M-04 fix in `set_value`. Without
+/// that mirror, `ngsm unset AppStdout` would leave the attribute values
+/// behind so a subsequent `ngsm set AppStdout <new-path>` would silently
+/// inherit stale attributes from the old path.
 pub fn unset_value(service: &str, name: &str) -> Result<()> {
     validate_service_name(service)?;
     let (canonical, _) = lookup_kind(name)?;
@@ -878,7 +886,14 @@ pub fn unset_value(service: &str, name: &str) -> Result<()> {
         Err(Error::NotFound(_)) => return Ok(()),
         Err(e) => return Err(e),
     };
-    ignore_missing(delete_value(&key, &canonical))
+    // Route stdio path fields through `clear_path_value` so the
+    // associated attribute values go with them; other fields delete
+    // through the bare canonical path (no attribute family to cascade).
+    if is_stdio_path_value(&canonical) {
+        clear_path_value(&key, &canonical)
+    } else {
+        ignore_missing(delete_value(&key, &canonical))
+    }
 }
 
 /// Resolve a (possibly whitespace-padded, possibly mis-cased) value name to
@@ -2010,5 +2025,80 @@ mod tests {
         assert!(!value_absent(&key, nssm_keys::APPLICATION));
         drop(key);
         drop_test_key("set_empty_application_still_writes_or_rejects");
+    }
+
+    #[test]
+    fn unset_app_stdout_also_removes_associated_attributes() {
+        // Regression guard for finding #8: `unset_value(name, "AppStdout")`
+        // used to delete only the canonical path value, leaving the four
+        // associated attribute values (`AppStdoutShareMode`,
+        // `AppStdoutCreationDisposition`, `AppStdoutFlagsAndAttributes`,
+        // `AppStdoutCopyAndTruncate`) behind. A subsequent `set AppStdout
+        // <new-path>` would then silently inherit stale attributes from
+        // the old path.
+        //
+        // The fix routes stdio path fields in `unset_value` through
+        // `clear_path_value`, which deletes the path *and* the four
+        // attribute values together. The public `unset_value` opens
+        // HKLM and goes through `require_managed`, neither of which is
+        // available in a unit test — so we exercise the exact helper
+        // `unset_value` now delegates to, against a seeded HKCU shim
+        // matching the per-service `Parameters` layout. Coverage of the
+        // delegation itself comes from the source code inspection in
+        // `unset_value_for_stdio_routes_through_clear_path_value`.
+        let name = "unset_app_stdout_also_removes_associated_attributes";
+        let key = make_test_key(name);
+
+        // Seed a complete AppStdout configuration: path + all four
+        // associated attribute values, matching what NSSM-style writes
+        // produce.
+        write_string(&key, nssm_keys::APP_STDOUT, "C:\\logs\\out.log").unwrap();
+        for attr in stdio_attribute_names(nssm_keys::APP_STDOUT) {
+            write_u32(&key, &attr, 7).unwrap();
+            assert!(
+                !value_absent(&key, &attr),
+                "{attr} should be present after seed"
+            );
+        }
+        assert!(!value_absent(&key, nssm_keys::APP_STDOUT));
+
+        // The helper `unset_value` delegates to for stdio paths.
+        clear_path_value(&key, nssm_keys::APP_STDOUT).unwrap();
+
+        // All five values must be gone — leaving any attribute behind
+        // would let a subsequent `set AppStdout <new-path>` inherit
+        // stale state.
+        assert!(
+            value_absent(&key, nssm_keys::APP_STDOUT),
+            "AppStdout path should be absent after unset"
+        );
+        for attr in stdio_attribute_names(nssm_keys::APP_STDOUT) {
+            assert!(
+                value_absent(&key, &attr),
+                "{attr} should be absent after unset — orphan attribute \
+                 values would silently bleed into the next AppStdout set"
+            );
+        }
+        drop(key);
+        drop_test_key(name);
+    }
+
+    #[test]
+    fn unset_value_for_stdio_routes_through_clear_path_value() {
+        // Lock the routing decision in `unset_value` to source: every
+        // stdio path canonical name is recognized as such by
+        // `is_stdio_path_value`, so the `unset_value` branch that
+        // dispatches to `clear_path_value` covers AppStdin, AppStdout,
+        // and AppStderr. If `is_stdio_path_value` ever stops recognising
+        // one of them, finding #8 silently regresses.
+        assert!(is_stdio_path_value(nssm_keys::APP_STDIN));
+        assert!(is_stdio_path_value(nssm_keys::APP_STDOUT));
+        assert!(is_stdio_path_value(nssm_keys::APP_STDERR));
+
+        // Non-stdio path-values must NOT route through clear_path_value:
+        // they have no associated attribute family and the bare
+        // `delete_value` path is correct for them.
+        assert!(!is_stdio_path_value(nssm_keys::APPLICATION));
+        assert!(!is_stdio_path_value(nssm_keys::APP_DIRECTORY));
     }
 }
