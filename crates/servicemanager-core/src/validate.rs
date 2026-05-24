@@ -19,16 +19,21 @@ pub const MAX_SERVICE_NAME_LEN: usize = 256;
 /// (which would let a name escape its `Services\<name>` subtree or confuse
 /// `RegCreateKeyEx`), and NUL or other control characters (which can
 /// truncate or corrupt the name as it crosses the Rust/Win32 boundary).
+///
+/// The length check counts UTF-16 code units, not Rust `char`s, because the
+/// SCM limit is enforced on the wide-string the Win32 API receives. A non-BMP
+/// character (e.g. an emoji) is one `char` but two UTF-16 code units, so a
+/// char-count check would accept names the SCM will reject.
 pub fn validate_service_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(Error::InvalidConfig(
             "service name must not be empty".into(),
         ));
     }
-    let len = name.chars().count();
+    let len = name.encode_utf16().count();
     if len > MAX_SERVICE_NAME_LEN {
         return Err(Error::InvalidConfig(format!(
-            "service name is {len} characters; the limit is {MAX_SERVICE_NAME_LEN}"
+            "service name is {len} UTF-16 code units; the limit is {MAX_SERVICE_NAME_LEN}"
         )));
     }
     for ch in name.chars() {
@@ -60,9 +65,10 @@ pub fn validate_hook_component(name: &str, kind: &str) -> Result<()> {
             "hook {kind} name must not be empty"
         )));
     }
-    if name.chars().count() > 255 {
+    let len = name.encode_utf16().count();
+    if len > 255 {
         return Err(Error::InvalidConfig(format!(
-            "hook {kind} name '{name}' exceeds 255 characters"
+            "hook {kind} name '{name}' is {len} UTF-16 code units; the limit is 255"
         )));
     }
     for ch in name.chars() {
@@ -233,6 +239,68 @@ mod tests {
         assert!(validate_service_name(&long).is_err());
         let ok = "x".repeat(MAX_SERVICE_NAME_LEN);
         assert!(validate_service_name(&ok).is_ok());
+    }
+
+    #[test]
+    fn service_name_emoji_is_counted_as_two_utf16_units() {
+        // A non-BMP emoji (U+1F600) is one Rust `char` but two UTF-16 code
+        // units. Build a name that lands exactly at MAX_SERVICE_NAME_LEN
+        // UTF-16 units using 127 emoji (= 254 UTF-16 units) plus 2 ASCII
+        // characters: total = 256 UTF-16 units, accepted.
+        let emoji = "\u{1F600}";
+        let at_limit: String = emoji.repeat(127) + "xx";
+        assert_eq!(at_limit.encode_utf16().count(), MAX_SERVICE_NAME_LEN);
+        assert!(
+            validate_service_name(&at_limit).is_ok(),
+            "name with {} UTF-16 units must be accepted",
+            MAX_SERVICE_NAME_LEN
+        );
+
+        // Add one more emoji: now 256 + 2 = 258 UTF-16 units, must be
+        // rejected. A char-count check (the previous buggy behaviour) would
+        // see only 130 chars and incorrectly accept this.
+        let over_limit: String = emoji.repeat(128) + "xx";
+        assert_eq!(over_limit.encode_utf16().count(), MAX_SERVICE_NAME_LEN + 2);
+        assert!(
+            over_limit.chars().count() <= MAX_SERVICE_NAME_LEN,
+            "test premise: char-count must be under the limit so we know we \
+             caught a bug a char-count check would have missed"
+        );
+        let err = validate_service_name(&over_limit).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("UTF-16"),
+            "error message should mention UTF-16 code units, got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn hook_component_emoji_is_counted_as_two_utf16_units() {
+        // hook component limit is 255 UTF-16 code units. 126 emoji
+        // (= 252 units) + 3 ASCII = 255 units: accepted.
+        let emoji = "\u{1F600}";
+        let at_limit: String = emoji.repeat(126) + "xxx";
+        assert_eq!(at_limit.encode_utf16().count(), 255);
+        assert!(validate_hook_component(&at_limit, "event").is_ok());
+
+        // One more emoji => 257 UTF-16 units: rejected, with a clear message.
+        let over_limit: String = emoji.repeat(127) + "xxx";
+        assert_eq!(over_limit.encode_utf16().count(), 257);
+        assert!(
+            over_limit.chars().count() <= 255,
+            "test premise: char-count is under 255 so a char-count check \
+             would have wrongly accepted this name"
+        );
+        let err = validate_hook_component(&over_limit, "event").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("UTF-16"),
+            "error should mention UTF-16 code units, got {msg:?}"
+        );
+        assert!(
+            msg.contains("255"),
+            "error should mention the 255 limit, got {msg:?}"
+        );
     }
 
     #[test]
