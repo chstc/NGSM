@@ -490,7 +490,7 @@ impl Supervisor {
                         .unwrap_or(default_action);
 
                     match action {
-                        ExitAction::Ignore | ExitAction::Restart => {
+                        ExitAction::Restart => {
                             let delay = if lived.as_millis() < THROTTLE_THRESHOLD_MS {
                                 throttle_delay
                             } else {
@@ -505,6 +505,30 @@ impl Supervisor {
                                 }
                             }
                             continue;
+                        }
+                        ExitAction::Ignore => {
+                            // `Ignore` means "the child exited; don't respawn,
+                            // but the *service* (i.e. the supervisor itself)
+                            // stays running so SCM can stop it cleanly later".
+                            // Collapsing this into the `Restart` arm — as the
+                            // pre-fix code did — defeats the recovery policy
+                            // by silently restarting the child anyway.
+                            //
+                            // The supervisor therefore enters a quiesced wait:
+                            // no child is spawned, but the message loop keeps
+                            // draining control signals so a later Stop /
+                            // Shutdown from SCM still ends the service
+                            // cleanly. Rotate / Pause / Continue / Power are
+                            // also handled so the channel cannot fill up and
+                            // strand the runner.
+                            eprintln!(
+                                "[supervisor:{}] child exited with code {exit_code}; \
+                                 AppExit action is `Ignore` — supervisor remains \
+                                 running and will NOT respawn the child until \
+                                 SCM stops the service",
+                                self.name
+                            );
+                            return self.wait_for_stop_quiesced();
                         }
                         ExitAction::Exit | ExitAction::Suicide => {
                             return Ok(ExitReason::ChildExited);
@@ -1150,6 +1174,50 @@ impl Supervisor {
         self.fire_hook(HookPoint::ExitPost, None, Some(exit_code));
     }
 
+    /// Block forever draining the control channel until a Stop / Shutdown
+    /// arrives. Used by the `ExitAction::Ignore` quiesce path: the child has
+    /// exited and we've decided not to respawn it, but the service stays
+    /// alive so SCM can still stop it cleanly. Rotate / Pause / Continue /
+    /// Power are handled normally (the pause/continue ones report a vacuous
+    /// success because there is no child tree to act on); a disconnected
+    /// channel is treated like Stop so the supervisor cannot get stuck.
+    fn wait_for_stop_quiesced(&self) -> Result<ExitReason, SupervisorError> {
+        let writer = event_log::EventWriter::for_service(self.name.clone());
+        loop {
+            match self.rx.recv() {
+                Ok(SupervisorMessage::Stop) => {
+                    // No child to gracefully stop, but fire the pre-stop hook
+                    // (mirrors the spawn-loop's Stop arm) and emit the
+                    // stopped event so the dashboard sees a clean shutdown.
+                    self.fire_hook(HookPoint::StopPre, None, None);
+                    writer.stopped(servicemanager_core::events::StopReason::ScmStop);
+                    return Ok(ExitReason::Stopped);
+                }
+                Ok(SupervisorMessage::Rotate) => self.rotate_sinks_now(),
+                Ok(SupervisorMessage::Pause(ack)) => {
+                    // No tree to suspend — `suspend_tree` already returns
+                    // `true` when `current_pid` is `None`, so the runner
+                    // sees the pause as vacuously satisfied.
+                    let _ = ack.send(self.suspend_tree());
+                }
+                Ok(SupervisorMessage::Continue(ack)) => {
+                    let _ = ack.send(self.resume_tree());
+                }
+                Ok(SupervisorMessage::PowerEvent(ev)) => self.handle_power_event(ev),
+                // A stray ChildExited cannot reach here in practice (the exit
+                // watcher fired before we entered quiesce, and no new child
+                // was spawned), but if it did arrive late we just drop it.
+                Ok(SupervisorMessage::ChildExited(_)) => {}
+                // Sender side gone — treat as an implicit stop so the
+                // runner's join returns instead of blocking forever.
+                Err(_) => {
+                    writer.stopped(servicemanager_core::events::StopReason::ScmStop);
+                    return Ok(ExitReason::Stopped);
+                }
+            }
+        }
+    }
+
     fn sleep_or_stop(&self, delay: Duration) -> Result<bool, SupervisorError> {
         let deadline = Instant::now() + delay;
         loop {
@@ -1346,6 +1414,83 @@ mod tests {
             "record_child_exit must clear pending_exit"
         );
         assert_eq!(*sup.last_exit_code.lock().unwrap(), Some(7));
+    }
+
+    #[test]
+    fn ignore_quiesce_returns_stopped_when_stop_message_arrives() {
+        // `ExitAction::Ignore` parks the supervisor in `wait_for_stop_quiesced`
+        // instead of respawning the child. Pin the contract: the quiesce
+        // loop must NOT exit on its own, and a Stop message must end it
+        // cleanly with `ExitReason::Stopped` (so the runner reports a clean
+        // service stop to SCM rather than treating Ignore as a failure).
+        let sup = Supervisor::new("IgnoreQuiesce", ManagedApplicationConfig::default());
+        let stop = sup.stop_signal();
+        // Send Stop *before* entering the quiesce loop. Because Stop is in
+        // the channel, the very first `recv()` returns it and we exit
+        // immediately — no race, no hang risk in CI.
+        stop.stop();
+        let result = sup
+            .wait_for_stop_quiesced()
+            .expect("quiesce should not error");
+        assert_eq!(result, ExitReason::Stopped);
+    }
+
+    #[test]
+    fn ignore_quiesce_drains_non_terminal_signals_until_stop() {
+        // Rotate must NOT terminate the quiesce loop — only Stop (or a
+        // disconnected channel) does. Queue a Rotate, then a Stop on the
+        // same thread (mpsc preserves single-thread FIFO order across
+        // cloned senders), and assert the loop drains the Rotate and only
+        // returns once Stop is processed.
+        let sup = Supervisor::new("IgnoreDrain", ManagedApplicationConfig::default());
+        let rotate = sup.rotate_signal();
+        let stop = sup.stop_signal();
+
+        rotate.rotate();
+        stop.stop();
+        let result = sup
+            .wait_for_stop_quiesced()
+            .expect("quiesce should not error");
+        assert_eq!(result, ExitReason::Stopped);
+    }
+
+    #[test]
+    fn ignore_quiesce_returns_stopped_when_channel_disconnects() {
+        // A disconnected channel must be treated as an implicit Stop so the
+        // runner's join can return. Drop the supervisor's external signal
+        // handles before entering the quiesce loop — the internal `tx`
+        // belongs to the Supervisor itself, so we have to consume it by
+        // taking it out. Easiest equivalent: send Stop *after* dropping
+        // every external sender; alternatively, drop the only remaining
+        // external sender and rely on the internal one to keep the channel
+        // alive. To exercise the disconnect path, we replace the receiver
+        // with a fresh, sender-less one and rebuild a stand-in Supervisor.
+        // Here we exercise the simpler invariant: with no senders left, the
+        // quiesce loop must not block forever.
+        let (tx, rx) = mpsc::channel::<SupervisorMessage>();
+        drop(tx); // all senders gone
+        let sup = Supervisor {
+            name: "IgnoreDisconnect".into(),
+            config: ManagedApplicationConfig::default(),
+            rx,
+            // The remaining fields are unused by the quiesce path, but must
+            // be valid. Use a throwaway `tx` so the struct constructs; the
+            // quiesce loop only reads `self.rx`.
+            tx: mpsc::channel().0,
+            current_child: Arc::new(Mutex::new(None)),
+            current_pid: Arc::new(Mutex::new(None)),
+            last_exit_code: Arc::new(Mutex::new(None)),
+            pending_exit: Arc::new(Mutex::new(None)),
+            sinks: Vec::new(),
+            startup_tx: mpsc::channel().0,
+            startup_rx: None,
+            #[cfg(windows)]
+            job: None,
+        };
+        let result = sup
+            .wait_for_stop_quiesced()
+            .expect("quiesce should not error");
+        assert_eq!(result, ExitReason::Stopped);
     }
 
     // NOTE: A genuine end-to-end regression test for the stop/child-exit
