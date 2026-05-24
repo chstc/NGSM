@@ -948,7 +948,38 @@ fn cmd_unset(name: &str, param: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Reject `ngsm edit <name>` invocations that supply no editable fields.
+///
+/// All of `EditArgs`'s value-bearing fields are `Option`, so it is parseable
+/// with only the service name — but then `ops::edit` reads the config, has
+/// nothing to change, and the CLI prints `Edited '<name>'.` That is
+/// indistinguishable from a real edit and misleads operators in scripts.
+///
+/// `force_native` is intentionally excluded: on its own it changes nothing
+/// (it only relaxes a guard on the other flags).
+fn validate_edit_args(args: &EditArgs) -> Result<()> {
+    let nothing_to_change = args.application.is_none()
+        && args.app_parameters.is_none()
+        && args.app_directory.is_none()
+        && args.display.is_none()
+        && args.start.is_none()
+        && args.stdout.is_none()
+        && args.stderr.is_none();
+    if nothing_to_change {
+        return Err(servicemanager_core::Error::InvalidConfig(
+            "no edit fields specified; try `ngsm edit --help` to see editable fields".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn cmd_edit(args: &EditArgs, json: bool) -> Result<()> {
+    // A bare `ngsm edit <service>` with no field flags would otherwise
+    // succeed silently and print "Edited '<name>'." — surface that the
+    // operator gave us nothing to do instead of pretending we changed
+    // something.
+    validate_edit_args(args)?;
+
     let want_native = args.display.is_some() || args.start.is_some();
 
     // Refuse to mix --force-native (which targets only native SCM metadata)
@@ -1546,6 +1577,66 @@ mod tests {
         // Untouched fields are still preserved.
         assert_eq!(merged.throttle_delay_ms, current.throttle_delay_ms);
         assert_eq!(merged.exit_actions, current.exit_actions);
+    }
+
+    /// Build an `EditArgs` with only the service name — every editable
+    /// field at None — so tests can flip one flag at a time.
+    fn edit_args_defaults() -> EditArgs {
+        EditArgs {
+            name: "TestSvc".into(),
+            application: None,
+            app_parameters: None,
+            app_directory: None,
+            display: None,
+            start: None,
+            stdout: None,
+            stderr: None,
+            force_native: false,
+        }
+    }
+
+    #[test]
+    fn bare_edit_returns_error_about_no_fields() {
+        // Regression for finding #16: a bare `ngsm edit <name>` with no
+        // editable flags must be rejected at the CLI boundary instead of
+        // silently reporting success.
+        let args = edit_args_defaults();
+        let err = validate_edit_args(&args).expect_err("bare edit must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no edit fields"),
+            "error should explain no fields were specified, got {msg:?}"
+        );
+        assert!(
+            msg.contains("--help"),
+            "error should point to --help for the field list, got {msg:?}"
+        );
+
+        // --force-native on its own is also nothing-to-change: the flag only
+        // relaxes a guard, it carries no new value.
+        let mut args = edit_args_defaults();
+        args.force_native = true;
+        assert!(
+            validate_edit_args(&args).is_err(),
+            "--force-native without any value-bearing flag must also be rejected"
+        );
+    }
+
+    #[test]
+    fn edit_with_one_field_passes_validation() {
+        // The complementary positive case: any single editable flag is
+        // enough to make the invocation meaningful.
+        let mut args = edit_args_defaults();
+        args.display = Some("New Display".into());
+        validate_edit_args(&args).expect("--display alone is valid");
+
+        let mut args = edit_args_defaults();
+        args.application = Some("C:\\app\\new.exe".into());
+        validate_edit_args(&args).expect("--application alone is valid");
+
+        let mut args = edit_args_defaults();
+        args.start = Some(StartTypeArg::Automatic);
+        validate_edit_args(&args).expect("--start alone is valid");
     }
 
     #[test]
