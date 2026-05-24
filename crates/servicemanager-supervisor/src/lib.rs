@@ -900,6 +900,22 @@ impl Supervisor {
                 }
             }
             // Fall back to killing the immediate child where there is no job.
+            //
+            // KNOWN LIMITATION (finding #15): while the exit watcher is
+            // blocked in `Child::wait()` it has already `take()`n the
+            // `Child` out of `self.current_child` (see `spawn_exit_watcher`).
+            // The slot we re-acquire here is therefore `None` for the
+            // common case of "child still running", and this fallback
+            // becomes a no-op — leaving the managed child running while the
+            // supervisor reports `Stopped`. A robust fix would require a
+            // shared kill handle (e.g. cache the PID separately and signal
+            // via `libc::kill(pid, SIGTERM)` / `nix::sys::signal::kill`),
+            // but neither `libc` nor `nix` is a workspace dependency today
+            // and NGSM is a Windows-only product (the Windows path above
+            // covers the same scenario via Job Objects + `TerminateProcess`).
+            // Accepting the limitation rather than pulling in a new
+            // dependency for a CI-only code path. If the project ever
+            // ships a non-Windows release, revisit and add `libc`/`nix`.
             #[cfg(not(windows))]
             if let Some(mut child) = self.current_child.lock().unwrap().take() {
                 let _ = child.kill();
