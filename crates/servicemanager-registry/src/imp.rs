@@ -1083,6 +1083,88 @@ fn exit_action_str(action: ExitAction) -> &'static str {
     }
 }
 
+/// Walk every string in `cfg` that would be written as a `REG_SZ` value,
+/// `REG_MULTI_SZ` entry, value name, or subkey name, and reject the
+/// config up front if any contains an embedded NUL. Returns an error
+/// naming the first offending field.
+///
+/// `write_string` and `write_multi_string` already refuse NUL-bearing
+/// values, but they fire mid-write — after earlier fields have already
+/// been persisted. Without this precheck a NUL in (say) `AppParameters`
+/// would leave the registry in a half-mutated state: `Application` and
+/// other earlier-written values updated, later values stale, exit and
+/// hooks subtrees unreconciled.
+///
+/// Field coverage mirrors `write_into_key` exactly. If a new string
+/// field is added there, it must also be added here.
+fn precheck_no_embedded_nuls(cfg: &ManagedApplicationConfig) -> Result<()> {
+    fn check(field: &str, value: &str) -> Result<()> {
+        if value.contains('\0') {
+            return Err(Error::InvalidConfig(format!(
+                "{field} contains an embedded NUL — registry strings cannot \
+                 carry NULs (the value would be silently truncated or split)"
+            )));
+        }
+        Ok(())
+    }
+
+    // Single REG_SZ values.
+    if let Some(v) = &cfg.application {
+        check("Application", v)?;
+    }
+    if let Some(v) = &cfg.app_parameters {
+        check("AppParameters", v)?;
+    }
+    if let Some(v) = &cfg.app_directory {
+        check("AppDirectory", v)?;
+    }
+    if let Some(v) = &cfg.affinity {
+        check("AppAffinity", v)?;
+    }
+
+    // REG_MULTI_SZ entries.
+    for (i, v) in cfg.environment.iter().enumerate() {
+        check(&format!("AppEnvironment[{i}]"), v)?;
+    }
+    for (i, v) in cfg.environment_extra.iter().enumerate() {
+        check(&format!("AppEnvironmentExtra[{i}]"), v)?;
+    }
+
+    // Stdio paths.
+    if let Some(s) = &cfg.io.stdin {
+        check("AppStdin", &s.path)?;
+    }
+    if let Some(s) = &cfg.io.stdout {
+        check("AppStdout", &s.path)?;
+    }
+    if let Some(s) = &cfg.io.stderr {
+        check("AppStderr", &s.path)?;
+    }
+
+    // Exit-action map: keys become registry value names; values become
+    // REG_SZ data ("Restart"/"Ignore"/... — fixed strings, but the
+    // key itself is user input).
+    for name in cfg.exit_actions.keys() {
+        check(&format!("AppExit\\{name}"), name)?;
+    }
+
+    // Hooks: event becomes a subkey name; action becomes a value name;
+    // command becomes the REG_SZ data.
+    for hook in &cfg.hooks {
+        check(&format!("AppEvents\\{}", hook.event), &hook.event)?;
+        check(
+            &format!("AppEvents\\{}\\{}", hook.event, hook.action),
+            &hook.action,
+        )?;
+        check(
+            &format!("AppEvents\\{}\\{} (command)", hook.event, hook.action),
+            &hook.command,
+        )?;
+    }
+
+    Ok(())
+}
+
 /// Write `cfg` into an open `Parameters` key, reconciling away any stale
 /// managed data left by a previous config.
 ///
@@ -1091,6 +1173,11 @@ fn exit_action_str(action: ExitAction) -> &'static str {
 /// a few stale values behind, but it can never erase the previous working
 /// `Application`/IO/restart config — which a delete-then-write order would.
 fn write_into_key(key: &RegKey, cfg: &ManagedApplicationConfig) -> Result<()> {
+    // Reject any embedded NUL up front, before any registry mutation —
+    // otherwise a NUL in (say) `AppParameters` would only be caught
+    // after `Application` and earlier fields have already been written,
+    // leaving the registry half-mutated.
+    precheck_no_embedded_nuls(cfg)?;
     // Validate hook names up front, before mutating the registry at all.
     for hook in &cfg.hooks {
         validate_hook_component(&hook.event, "event")?;
@@ -1797,6 +1884,99 @@ mod tests {
         }
         drop(key);
         drop_test_key(name);
+    }
+
+    #[test]
+    fn precheck_rejects_nul_in_app_parameters_without_writing_application() {
+        let name = "precheck_rejects_nul_in_app_parameters_without_writing_application";
+        let key = make_test_key(name);
+
+        // Clean Application (an absolute path so it would otherwise pass
+        // the absolute-path check), NUL-bearing AppParameters.
+        let cfg = ManagedApplicationConfig {
+            application: Some("C:\\app\\svc.exe".to_string()),
+            app_parameters: Some("--ok\0--evil".to_string()),
+            ..Default::default()
+        };
+
+        // The whole write must error out before *any* mutation, so
+        // Application is not written.
+        let err = write_into_key(&key, &cfg).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfig(ref m) if m.contains("AppParameters")),
+            "expected InvalidConfig naming AppParameters, got {err:?}"
+        );
+        assert!(
+            value_absent(&key, nssm_keys::APPLICATION),
+            "Application was written despite a later field failing — the \
+             precheck did not stop the write up front"
+        );
+        drop(key);
+        drop_test_key(name);
+    }
+
+    #[test]
+    fn precheck_rejects_nul_in_environment_entry() {
+        let name = "precheck_rejects_nul_in_environment_entry";
+        let key = make_test_key(name);
+
+        let cfg = ManagedApplicationConfig {
+            application: Some("C:\\app\\svc.exe".to_string()),
+            environment: vec!["GOOD=1".to_string(), "BAD=value\0sneak".to_string()],
+            ..Default::default()
+        };
+
+        let err = write_into_key(&key, &cfg).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfig(ref m) if m.contains("AppEnvironment")),
+            "expected InvalidConfig naming AppEnvironment, got {err:?}"
+        );
+        assert!(
+            value_absent(&key, nssm_keys::APPLICATION),
+            "Application was written despite environment NUL — precheck \
+             did not stop the write up front"
+        );
+        assert!(value_absent(&key, nssm_keys::APP_ENVIRONMENT));
+        drop(key);
+        drop_test_key(name);
+    }
+
+    #[test]
+    fn precheck_passes_for_clean_config() {
+        // A config with no NULs anywhere round-trips through the precheck.
+        let mut exit_actions = BTreeMap::new();
+        exit_actions.insert(
+            "1".to_string(),
+            ExitActionPolicy {
+                action: ExitAction::Restart,
+            },
+        );
+        let cfg = ManagedApplicationConfig {
+            application: Some("C:\\app\\svc.exe".to_string()),
+            app_parameters: Some("--ok".to_string()),
+            app_directory: Some("C:\\app".to_string()),
+            affinity: Some("0x3".to_string()),
+            environment: vec!["A=1".to_string()],
+            environment_extra: vec!["B=2".to_string()],
+            io: IoRedirectionConfig {
+                stdin: Some(IoStream {
+                    path: "C:\\in".to_string(),
+                    share_mode: None,
+                    creation_disposition: None,
+                    flags_and_attributes: None,
+                    copy_and_truncate: None,
+                }),
+                ..Default::default()
+            },
+            exit_actions,
+            hooks: vec![HookConfig {
+                event: "Start".to_string(),
+                action: "Pre".to_string(),
+                command: "C:\\hooks\\start.exe".to_string(),
+            }],
+            ..Default::default()
+        };
+        assert!(precheck_no_embedded_nuls(&cfg).is_ok());
     }
 
     #[test]
