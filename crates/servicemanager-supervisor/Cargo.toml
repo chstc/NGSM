@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Runtime supervision of managed child processes (Phase 2)."
+description = "NGSM child-process supervisor: lifecycle, restart/throttle/exit-action policies, online log rotation, pause/continue, power events, and hooks."
 publish = false
 
 [dependencies]
