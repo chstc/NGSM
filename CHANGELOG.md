@@ -2,6 +2,79 @@
 
 All notable changes to NGSM. Versions follow `vMAJOR.MINOR.PATCH`; categories follow [Keep a Changelog](https://keepachangelog.com).
 
+## [v0.3.2] — 2026-05-23
+
+Second code-review remediation cycle on top of v0.3.1. 15 findings addressed
+across 4 HIGH (recovery semantics + force-native scrub + stale modal results),
+10 MEDIUM (validation, registry hygiene, GUI bounds, sink dedup, UX), and
+1 LOW (no-op edit detection). No new features; no public API breakage.
+
+### Fixed
+
+- **(#2)** `ExitAction::Ignore` now quiesces the supervisor instead of
+  treating it as `Restart`. A service configured to ignore an exit no
+  longer respawns — the supervisor enters a wait-for-stop state and lets
+  SCM stop the service cleanly.
+- **(#3)** `ExitAction::Suicide` is now reported to SCM with a non-zero
+  exit code (preserves the child's positive code, or falls back to `1`),
+  so SCM recovery actions actually trigger. Previously it was
+  indistinguishable from a clean stop.
+- **(#4)** Forced native removal (`ngsm remove --force-native`) now
+  requires a confirmed managed marker before scrubbing the
+  `Parameters` subtree. A native service that happens to use registry
+  values like `Application` / `AppExit` / `AppStdout` will no longer
+  lose its own configuration.
+- **(#5)** GUI install/edit results now carry a per-operation token so
+  stale worker results from a cancelled-and-reopened modal can no longer
+  close or corrupt a later modal.
+- **(#6)** Service-name and hook-component length validation now counts
+  UTF-16 code units (matching the Windows API limit), not Rust `chars`.
+  Names with non-BMP characters (e.g. emoji) no longer pass local
+  validation while exceeding the Windows limit.
+- **(#7)** Unquoted SCM image paths containing spaces
+  (`C:\Program Files\NGSM\ngsm.exe ...`) are now correctly classified as
+  managed via a token-boundary fallback. Previously they could be
+  misclassified as native when the managed registry config was
+  unreadable.
+- **(#8)** `unset_value(AppStdout|AppStderr|AppStdin)` now mirrors
+  `clear_path_value`: deletes the canonical path AND the associated
+  `ShareMode` / `CreationDisposition` / `FlagsAndAttributes` /
+  `CopyAndTruncate` attributes. Prevents stale attributes inheriting
+  into a later `set`.
+- **(#9)** `ngsm recovery set --default-action` is now optional. Users
+  can update `--restart-delay-ms`, `--throttle-delay-ms`, or
+  `--exit-action` in isolation without restating the default action.
+- **(#10)** Install now rejects `--rotate-*` flags when no `--stdout`
+  or `--stderr` is configured. Previously the install would succeed with
+  rotation settings that could never operate.
+- **(#11)** Online rotation deduplicates sinks when stdout and stderr
+  target the same log path. A single `Arc<RotationSink>` is shared across
+  both streams, eliminating the race where two sinks competed on the
+  same file with separate handles, byte counters, and rotation state.
+- **(#12)** Slint dashboard's selected-service binding now bounds-checks
+  before indexing, and the Rust side resets the selection before
+  replacing the services model — eliminating the stale-index window
+  during refresh / filter / search / sort.
+- **(#13)** GUI `read_recent` (Recent Events panel) now scans all
+  retained backups (`events.log.4` → `events.log.1` → active) matching
+  v0.3.0's `read_since`. Previously it only read the active log +
+  `events.log.1`, omitting recent records that lived in `.2`–`.4`.
+  (Regression introduced in v0.3.0.)
+- **(#14)** GUI Recovery editor now rejects duplicate exit-code rows
+  with a visible error instead of silently overwriting (BTreeMap
+  last-write-wins).
+
+### Changed
+
+- **(#15)** Non-Windows supervisor stop fallback's "child orphaned"
+  limitation is now documented in code. The proper fix (shared kill
+  handle via `libc::kill` or `nix::sys::signal::kill`) is deferred —
+  NGSM is Windows-only and the cost of adding a Unix-signal dep for a
+  CI-only path exceeds the benefit.
+- **(#16)** `ngsm edit <service>` with no edit fields now reports an
+  explicit error ("no edit fields specified") instead of completing
+  successfully without changes.
+
 ## [v0.3.1] — 2026-05-23
 
 Code-review remediation cycle on top of v0.3.0. 20 findings addressed across
@@ -197,6 +270,7 @@ Initial public release.
 - Optional named-pipe broker for headless automation (feature-gated, off by default).
 - Statically-linked C runtime — no DLLs to ship.
 
+[v0.3.2]: https://github.com/chstc/NGSM/releases/tag/v0.3.2
 [v0.3.1]: https://github.com/chstc/NGSM/releases/tag/v0.3.1
 [v0.3.0]: https://github.com/chstc/NGSM/releases/tag/v0.3.0
 [v0.2.3]: https://github.com/chstc/NGSM/releases/tag/v0.2.3
