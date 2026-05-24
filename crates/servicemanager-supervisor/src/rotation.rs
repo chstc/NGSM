@@ -124,7 +124,9 @@ impl RotationSink {
         let path = PathBuf::from(&stream.path);
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                let _ = std::fs::create_dir_all(parent);
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    eprintln!("[supervisor] cannot create log dir {parent:?}: {e}");
+                }
             }
         }
         let file = OpenOptions::new()
