@@ -41,6 +41,6 @@ pub use edit::edit;
 pub use install::install;
 pub use lifecycle::{continue_service, pause, restart, start, stop};
 pub use list::list_services;
-pub use recovery::{read_recovery, save_recovery};
+pub use recovery::{read_recovery, save_recovery, validate_exit_action_key};
 pub use remove::remove;
 pub use rotate::rotate;

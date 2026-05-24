@@ -1374,6 +1374,18 @@ fn write_into_key(key: &RegKey, cfg: &ManagedApplicationConfig) -> Result<()> {
             // prunes a stale named `Default`), so a config never carries
             // both shapes of the same action.
             let registry_name = if name == "default" { "" } else { name.as_str() };
+            // Defense-in-depth: every non-"default" key must parse as i32
+            // (the supervisor matches numeric child exit codes). Callers
+            // already validate via `servicemanager_ops::validate_exit_action_key`,
+            // but a typed write path that never accepts a non-numeric key
+            // means a future caller cannot regress the invariant by
+            // skipping the ops layer.
+            if !registry_name.is_empty() && registry_name.parse::<i32>().is_err() {
+                return Err(Error::InvalidConfig(format!(
+                    "AppExit key '{name}' is not a valid i32 exit code — \
+                     the supervisor would never match it at runtime"
+                )));
+            }
             write_string(&exit_key, registry_name, exit_action_str(policy.action))?;
             wanted.insert(registry_name.to_string());
         }

@@ -1074,7 +1074,14 @@ fn cmd_recovery_set(name: &str, args: &RecoverySetArgs, json: bool) -> Result<()
         let action = parse_exit_action(action_str).map_err(|e| {
             servicemanager_core::Error::InvalidConfig(format!("exit-action '{raw}': {e}"))
         })?;
-        exit_actions.insert(code_str.trim().to_string(), action);
+        let code = code_str.trim().to_string();
+        // Reject keys the supervisor would never match (non-numeric, the
+        // reserved "default", embedded whitespace/NUL, ...) up front, so
+        // a bad value cannot be silently persisted in the registry.
+        servicemanager_ops::validate_exit_action_key(&code).map_err(|e| {
+            servicemanager_core::Error::InvalidConfig(format!("exit-action '{raw}': {e}"))
+        })?;
+        exit_actions.insert(code, action);
     }
 
     let spec = RecoverySpec {

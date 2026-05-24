@@ -421,12 +421,21 @@ fn op_recovery_set(args: &Value) -> Result<Value, String> {
         default_action,
         exit_actions,
     } = parse_args(args)?;
+    let exit_actions = exit_actions.unwrap_or_default();
+    // Reject malformed per-exit-code keys up front. `save_recovery` runs
+    // the same check, but the broker validates here too so an out-of-spec
+    // key produces a clear "exit-action code ..." error before any
+    // registry read happens.
+    for code in exit_actions.keys() {
+        servicemanager_ops::validate_exit_action_key(code)
+            .map_err(|e| format!("exit-action code '{code}': {e}"))?;
+    }
     let spec = servicemanager_ops::RecoverySpec {
         name: name.clone(),
         restart_delay_ms,
         throttle_delay_ms,
         default_action,
-        exit_actions: exit_actions.unwrap_or_default(),
+        exit_actions,
     };
     let msg = servicemanager_ops::save_recovery(spec)?;
     Ok(json!({ "saved": name, "message": msg }))
