@@ -29,6 +29,9 @@ pub fn matches_filter(
 }
 
 /// Counts shown on the Dashboard stat cards. Only managed services count.
+// Kept for reference; superseded by `metrics::DashboardMetrics` in Task 8.
+// Removal is out of scope for this task.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DashboardStats {
     pub total: usize,
@@ -39,6 +42,7 @@ pub struct DashboardStats {
 }
 
 /// Tally the Dashboard stat-card counts across the managed services.
+#[allow(dead_code)]
 pub fn dashboard_stats(defs: &[ServiceDefinition]) -> DashboardStats {
     let mut s = DashboardStats::default();
     for d in defs.iter().filter(|d| d.is_managed()) {
@@ -454,5 +458,26 @@ mod tests {
         assert_eq!(remap_selection(None, &names), 0);
         // Empty list -> 0 (callers must guard indexing an empty model).
         assert_eq!(remap_selection(Some("alpha"), &[]), 0);
+    }
+
+    #[test]
+    fn remap_selection_returns_in_range_index_when_list_shrinks() {
+        // Regression for #12: after a filter narrows the model, the previously
+        // selected service may be absent. The returned index must always be
+        // a valid index into `names` (or 0 when `names` is empty — that case
+        // is the caller's responsibility to guard).
+        let shorter = vec!["alpha".to_string(), "bravo".to_string()];
+        // Service is gone — fall back to 0, which is in range for `shorter`.
+        let idx = remap_selection(Some("charlie"), &shorter);
+        assert_eq!(idx, 0);
+        assert!(
+            (idx as usize) < shorter.len(),
+            "remap_selection returned out-of-range index {idx} for list of len {}",
+            shorter.len()
+        );
+        // Service moved — index reflects new position, still in range.
+        let idx2 = remap_selection(Some("bravo"), &shorter);
+        assert_eq!(idx2, 1);
+        assert!((idx2 as usize) < shorter.len());
     }
 }

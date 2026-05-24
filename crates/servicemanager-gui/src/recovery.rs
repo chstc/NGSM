@@ -74,6 +74,10 @@ impl RecoveryForm {
     /// Parse and validate the form into a `RecoverySpec` for the worker. An
     /// unfilled (blank exit-code) row is skipped; a non-numeric exit code or
     /// delay is rejected with a message for the Recovery view's status line.
+    ///
+    /// Duplicate exit-code rows are rejected (#14): silently collapsing them
+    /// into a BTreeMap meant the saved policy could differ from what the
+    /// user typed (last-write-wins), with no visible feedback.
     pub fn to_spec(&self) -> Result<RecoverySpec, String> {
         let restart_delay_ms = parse_opt_u32(&self.restart_delay, "Restart delay")?;
         let throttle_delay_ms = parse_opt_u32(&self.throttle, "Throttle window")?;
@@ -85,6 +89,11 @@ impl RecoveryForm {
             }
             if code.parse::<u32>().is_err() {
                 return Err(format!("Exit code '{code}' is not a valid number."));
+            }
+            if exit_actions.contains_key(code) {
+                return Err(format!(
+                    "Duplicate exit code '{code}' — each exit code may appear only once."
+                ));
             }
             exit_actions.insert(code.to_string(), int_to_exit_action(row.action));
         }
@@ -250,7 +259,12 @@ mod tests {
     }
 
     #[test]
-    fn to_spec_last_write_wins_for_duplicate_exit_codes() {
+    fn to_spec_rejects_duplicate_exit_code_rows() {
+        // Regression for #14: previously, two rows with the same exit code
+        // silently collapsed (last-write-wins via BTreeMap). The user got
+        // no visible signal that one of their two intended policies had
+        // been overwritten. Now `to_spec` must return an error pointing at
+        // the duplicate code, surfaced via the Recovery view's status line.
         let form = RecoveryForm {
             service: "DemoA".into(),
             rows: vec![
@@ -265,8 +279,59 @@ mod tests {
             ],
             ..Default::default()
         };
-        let spec = form.to_spec().expect("should validate");
-        assert_eq!(spec.exit_actions.len(), 1);
-        assert_eq!(spec.exit_actions.get("1"), Some(&ExitAction::Exit));
+        let err = form.to_spec().expect_err("duplicate code must be rejected");
+        assert!(
+            err.contains("Duplicate") && err.contains("'1'"),
+            "error message should call out the duplicate exit code; got: {err}"
+        );
+    }
+
+    #[test]
+    fn to_spec_accepts_distinct_exit_code_rows() {
+        // Companion test: two distinct codes still both survive — the
+        // duplicate rejection above must not over-reach.
+        let form = RecoveryForm {
+            service: "DemoA".into(),
+            rows: vec![
+                RecoveryExitRow {
+                    exit_code: "1".into(),
+                    action: 0, // Restart
+                },
+                RecoveryExitRow {
+                    exit_code: "2".into(),
+                    action: 2, // Exit
+                },
+            ],
+            ..Default::default()
+        };
+        let spec = form.to_spec().expect("two distinct codes should validate");
+        assert_eq!(spec.exit_actions.len(), 2);
+        assert_eq!(spec.exit_actions.get("1"), Some(&ExitAction::Restart));
+        assert_eq!(spec.exit_actions.get("2"), Some(&ExitAction::Exit));
+    }
+
+    #[test]
+    fn to_spec_treats_whitespace_variants_as_the_same_code() {
+        // Trimming is applied before the duplicate check, so "  1  " and "1"
+        // are the same code (and must be flagged as a duplicate). Otherwise
+        // a stray space would silently bypass the new guard.
+        let form = RecoveryForm {
+            service: "DemoA".into(),
+            rows: vec![
+                RecoveryExitRow {
+                    exit_code: "1".into(),
+                    action: 0,
+                },
+                RecoveryExitRow {
+                    exit_code: "  1  ".into(),
+                    action: 2,
+                },
+            ],
+            ..Default::default()
+        };
+        let err = form
+            .to_spec()
+            .expect_err("trimmed duplicate must be rejected");
+        assert!(err.contains("Duplicate"), "got: {err}");
     }
 }

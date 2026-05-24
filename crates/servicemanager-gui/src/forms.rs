@@ -121,19 +121,29 @@ impl EditForm {
     /// Edit is only offered for managed services, so a cleared `Application`
     /// would make the service unreadable — that is rejected here. An empty
     /// log path *is* allowed: it means "clear this redirection".
+    ///
+    /// Path-like fields (`application`, `app_directory`, `stdout`, `stderr`)
+    /// are trimmed before diffing so accidental leading/trailing whitespace
+    /// from focus-loss or copy/paste doesn't silently break service startup or
+    /// log handling. `app_parameters` is left as-is because it carries
+    /// command-line arguments where spacing may be intentional.
     pub fn to_spec(&self) -> Result<EditSpec, String> {
         if self.application.trim().is_empty() {
             return Err("Application path must not be empty.".into());
         }
         let diff = |new: &str, orig: &str| (new != orig).then(|| new.to_string());
+        let diff_trim = |new: &str, orig: &str| {
+            let t = new.trim();
+            (t != orig).then(|| t.to_string())
+        };
         Ok(EditSpec {
             name: self.name.clone(),
             display_name: diff(&self.display_name, &self.orig_display_name),
-            application: diff(&self.application, &self.orig_application),
+            application: diff_trim(&self.application, &self.orig_application),
             app_parameters: diff(&self.app_parameters, &self.orig_app_parameters),
-            app_directory: diff(&self.app_directory, &self.orig_app_directory),
-            stdout: diff(&self.stdout, &self.orig_stdout),
-            stderr: diff(&self.stderr, &self.orig_stderr),
+            app_directory: diff_trim(&self.app_directory, &self.orig_app_directory),
+            stdout: diff_trim(&self.stdout, &self.orig_stdout),
+            stderr: diff_trim(&self.stderr, &self.orig_stderr),
             start_type: (self.start_type != self.orig_start_type).then_some(self.start_type),
         })
     }
@@ -197,5 +207,50 @@ mod tests {
         let spec = f.to_spec().unwrap();
         assert_eq!(spec.display_name.as_deref(), Some("New name"));
         assert!(spec.application.is_none()); // unchanged
+    }
+
+    #[test]
+    fn edit_form_trims_path_like_fields_before_diff() {
+        let mut f = EditForm::default();
+        f.name = "SmA".into();
+        // Same logical value as the original, just with stray whitespace.
+        f.application = "  C:\\app.exe  ".into();
+        f.orig_application = "C:\\app.exe".into();
+        // display_name unchanged from original so we don't drag it into the diff.
+        f.display_name = "svc".into();
+        f.orig_display_name = "svc".into();
+        let spec = f.to_spec().unwrap();
+        // Whitespace-only "change" must be a no-op — application is not in diff.
+        assert!(
+            spec.application.is_none(),
+            "trimmed application equals original; should not be in diff (got {:?})",
+            spec.application
+        );
+
+        // And when application *does* differ, the value in the diff is trimmed.
+        let mut f2 = EditForm::default();
+        f2.name = "SmA".into();
+        f2.application = "  C:\\new.exe  ".into();
+        f2.orig_application = "C:\\app.exe".into();
+        f2.display_name = "svc".into();
+        f2.orig_display_name = "svc".into();
+        let spec2 = f2.to_spec().unwrap();
+        assert_eq!(spec2.application.as_deref(), Some("C:\\new.exe"));
+    }
+
+    #[test]
+    fn edit_form_preserves_app_parameters_whitespace() {
+        let mut f = EditForm::default();
+        f.name = "SmA".into();
+        f.application = "C:\\app.exe".into();
+        f.orig_application = "C:\\app.exe".into();
+        f.app_parameters = "  --flag value  ".into();
+        f.orig_app_parameters = "".into();
+        let spec = f.to_spec().unwrap();
+        assert_eq!(
+            spec.app_parameters.as_deref(),
+            Some("  --flag value  "),
+            "app_parameters whitespace must be sent verbatim"
+        );
     }
 }

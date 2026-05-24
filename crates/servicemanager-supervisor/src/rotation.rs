@@ -1,6 +1,7 @@
 //! Log rotation: offline rotation helper, online [`RotationSink`], and the
 //! pipe-reader thread that feeds the sink.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -124,7 +125,9 @@ impl RotationSink {
         let path = PathBuf::from(&stream.path);
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                let _ = std::fs::create_dir_all(parent);
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    eprintln!("[supervisor] cannot create log dir {parent:?}: {e}");
+                }
             }
         }
         let file = OpenOptions::new()
@@ -164,6 +167,70 @@ impl RotationSink {
         let mut state = self.state.lock().unwrap();
         state.rotate()
     }
+}
+
+/// Normalize a configured log path into a stable dedup key.
+///
+/// The two configured streams may target *the same* underlying file written
+/// with two different but equivalent path strings (different case on Windows,
+/// mixed `/` vs `\`, a trailing dot, etc.). If the file has not yet been
+/// created we cannot `canonicalize` it, so this falls back to a string-level
+/// normalization that is safe to compute pre-creation:
+///
+/// * On Windows: lowercase the path and convert `/` to `\`. NTFS / FAT are
+///   case-insensitive, so equivalent paths fold to the same key.
+/// * Elsewhere: return the path unchanged (POSIX is case-sensitive).
+fn dedup_key(path: &str) -> String {
+    if cfg!(windows) {
+        path.replace('/', "\\").to_ascii_lowercase()
+    } else {
+        path.to_string()
+    }
+}
+
+/// Output of [`dedup_sinks`]: per-stream sink handle plus the deduplicated
+/// `Vec` of unique underlying sinks.
+pub(crate) type DedupSinks = (
+    Option<Arc<RotationSink>>,
+    Option<Arc<RotationSink>>,
+    Vec<Arc<RotationSink>>,
+);
+
+/// Build at most one [`RotationSink`] per unique log path, sharing the
+/// resulting `Arc` between `stdout` and `stderr` when they target the same
+/// file. Two independent sinks would each own a separate file handle, byte
+/// counter, and rotation state; if both streams write to the same path the
+/// second sink would silently race the first on every rotation
+/// (misplaced records, failed renames, inaccurate byte thresholds).
+///
+/// Returns `(stdout_sink, stderr_sink, unique_sinks)`. `unique_sinks` is the
+/// deduplicated list the caller must keep alive (pushed into
+/// `Supervisor::sinks`) so on-demand `Rotate` operates on each underlying
+/// sink exactly once.
+pub(crate) fn dedup_sinks(
+    stdout: Option<&IoStream>,
+    stderr: Option<&IoStream>,
+    config: &LogRotationConfig,
+) -> Result<DedupSinks, SupervisorError> {
+    let mut by_key: HashMap<String, Arc<RotationSink>> = HashMap::new();
+    let mut unique: Vec<Arc<RotationSink>> = Vec::new();
+
+    let mut resolve =
+        |maybe: Option<&IoStream>| -> Result<Option<Arc<RotationSink>>, SupervisorError> {
+            let Some(stream) = maybe else { return Ok(None) };
+            let key = dedup_key(&stream.path);
+            if let Some(existing) = by_key.get(&key) {
+                return Ok(Some(Arc::clone(existing)));
+            }
+            let sink = Arc::new(RotationSink::open(stream, config.clone())?);
+            by_key.insert(key, Arc::clone(&sink));
+            unique.push(Arc::clone(&sink));
+            Ok(Some(sink))
+        };
+
+    let out = resolve(stdout)?;
+    let err = resolve(stderr)?;
+    Ok((out, err, unique))
 }
 
 impl RotationState {
@@ -245,5 +312,175 @@ pub(crate) fn pipe_reader_loop(
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn stream(path: &Path) -> IoStream {
+        IoStream {
+            path: path.to_string_lossy().into_owned(),
+            share_mode: None,
+            creation_disposition: None,
+            flags_and_attributes: None,
+            copy_and_truncate: None,
+        }
+    }
+
+    fn rotation_at(bytes: u64) -> LogRotationConfig {
+        LogRotationConfig {
+            enabled: Some(true),
+            online: Some(1),
+            bytes: Some(bytes),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn dedup_returns_distinct_sinks_for_distinct_paths() {
+        let dir = tempdir().unwrap();
+        let out_path = dir.path().join("out.log");
+        let err_path = dir.path().join("err.log");
+        let cfg = LogRotationConfig::default();
+
+        let (out, err, unique) =
+            dedup_sinks(Some(&stream(&out_path)), Some(&stream(&err_path)), &cfg).unwrap();
+
+        let out = out.expect("stdout sink");
+        let err = err.expect("stderr sink");
+        assert!(
+            !Arc::ptr_eq(&out, &err),
+            "distinct paths must not share a sink"
+        );
+        assert_eq!(unique.len(), 2, "two unique sinks expected");
+    }
+
+    #[test]
+    fn dedup_shares_sink_when_stdout_and_stderr_match() {
+        let dir = tempdir().unwrap();
+        let shared = dir.path().join("combined.log");
+        let cfg = LogRotationConfig::default();
+
+        let (out, err, unique) =
+            dedup_sinks(Some(&stream(&shared)), Some(&stream(&shared)), &cfg).unwrap();
+
+        let out = out.expect("stdout sink");
+        let err = err.expect("stderr sink");
+        assert!(
+            Arc::ptr_eq(&out, &err),
+            "identical paths must share the same Arc<RotationSink>"
+        );
+        assert_eq!(
+            unique.len(),
+            1,
+            "only one underlying sink should be tracked for rotation"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn dedup_folds_windows_case_and_separator_variants() {
+        let dir = tempdir().unwrap();
+        let canonical = dir.path().join("combined.log");
+        // Force a string-level mismatch that is path-equivalent on Windows:
+        // lowercase the parent and swap one separator. Both must dedup.
+        let raw = canonical.to_string_lossy().into_owned();
+        let twisted = raw.replace('\\', "/").to_uppercase();
+        let cfg = LogRotationConfig::default();
+
+        let a = IoStream {
+            path: raw,
+            share_mode: None,
+            creation_disposition: None,
+            flags_and_attributes: None,
+            copy_and_truncate: None,
+        };
+        let b = IoStream {
+            path: twisted,
+            share_mode: None,
+            creation_disposition: None,
+            flags_and_attributes: None,
+            copy_and_truncate: None,
+        };
+        let (out, err, unique) = dedup_sinks(Some(&a), Some(&b), &cfg).unwrap();
+        let out = out.unwrap();
+        let err = err.unwrap();
+        assert!(Arc::ptr_eq(&out, &err));
+        assert_eq!(unique.len(), 1);
+    }
+
+    #[test]
+    fn same_path_stdout_stderr_share_sink_state() {
+        // Regression for finding #11: when stdout and stderr point at the
+        // same log file, the second writer must observe rotations performed
+        // by the first writer (same handle, same byte counter, same state).
+        // Two independent sinks would each keep an old handle, so the second
+        // writer would race the first and silently lose records.
+        let dir = tempdir().unwrap();
+        let shared = dir.path().join("shared.log");
+
+        // Threshold at 8 bytes so a single 16-byte write triggers rotation.
+        let cfg = rotation_at(8);
+        let (out, err, unique) =
+            dedup_sinks(Some(&stream(&shared)), Some(&stream(&shared)), &cfg).unwrap();
+        let out = out.unwrap();
+        let err = err.unwrap();
+        assert!(Arc::ptr_eq(&out, &err), "must share the same sink");
+        assert_eq!(unique.len(), 1);
+
+        // First writer crosses the threshold and triggers a rotation. After
+        // this, `shared.log` exists fresh and the rotated file sits alongside.
+        out.write(b"AAAAAAAAAAAAAAAA").unwrap();
+
+        // List rotated siblings *before* the second writer runs so the count
+        // is unambiguous.
+        let rotated_before: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.starts_with("shared.") && n != "shared.log"
+            })
+            .collect();
+        assert_eq!(
+            rotated_before.len(),
+            1,
+            "first write should have produced exactly one rotated file"
+        );
+
+        // Second writer reuses the SAME sink (shared Arc), so its write goes
+        // to the post-rotation `shared.log`, not to a stale handle pointing
+        // at the rotated file.
+        err.write(b"BB").unwrap();
+
+        let post_rotation = std::fs::read(&shared).unwrap();
+        assert_eq!(
+            post_rotation, b"BB",
+            "second writer's bytes must land in the post-rotation file"
+        );
+
+        // The rotated file must still hold *only* the first writer's bytes.
+        let rotated_path = rotated_before[0].path();
+        let rotated = std::fs::read(&rotated_path).unwrap();
+        assert_eq!(
+            rotated, b"AAAAAAAAAAAAAAAA",
+            "rotated file should contain the pre-rotation bytes only"
+        );
+
+        // And no new rotation should have been triggered by the 2-byte write.
+        let rotated_after: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.starts_with("shared.") && n != "shared.log"
+            })
+            .collect();
+        assert_eq!(rotated_after.len(), 1);
     }
 }

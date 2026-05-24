@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "NGSM command-line interface (Phase 1: list / dump)."
+description = "NGSM command-line and GUI entry point: service install/edit/remove, lifecycle (start/stop/restart/pause/continue), recovery, log rotation, broker, and process listing."
 publish = false
 
 [[bin]]

@@ -33,9 +33,11 @@ here with the equally permissive **0BSD** license.
 
 - **One self-contained binary.** `ngsm.exe` is the GUI, the CLI, and the
   service runner. It statically links the C runtime — no DLLs to ship.
-- **Desktop GUI** — double-click `ngsm.exe` for a dashboard with live
-  service stats, install / edit / remove, a recovery-policy editor, a
-  Recent Events feed, and a settings view (auto-refresh, managed-only
+- **Desktop GUI** — double-click `ngsm.exe` for a dashboard with four
+  classification tiles (Managed services, Stopped, Failed, Availability 30d)
+  with sub-captions, a 30-day availability sparkline, a Recent Events feed
+  sourced from the persistent supervisor log, install / edit / remove, a
+  recovery-policy editor, and a settings view (auto-refresh, managed-only
   filter persistence).
 - **Full CLI** — `install`, `remove`, `edit`, `list`, `status`,
   `start` / `stop` / `restart` / `pause` / `continue`, `rotate`,
@@ -61,7 +63,7 @@ here with the equally permissive **0BSD** license.
 
 ## Install
 
-NGSM is **Windows-only** (x64).
+NGSM is **Windows-only** (x64 primary; aarch64 and i686 builds are configured but untested).
 
 1. Download `ngsm.exe` from the
    [Releases](https://github.com/chstc/NGSM/releases) page.

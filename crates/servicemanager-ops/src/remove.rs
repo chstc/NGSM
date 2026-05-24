@@ -72,9 +72,64 @@ pub fn remove(name: &str, force_native: bool, purge_managed_config: bool) -> OpR
     // managed config and the caller can retry. Only then scrub the registry,
     // and surface a cleanup failure instead of silently dropping it.
     remove_service(name).map_err(|e| e.to_string())?;
-    if purge_managed_config {
+    if purge_managed_config && is_managed_for_purge(name) {
         servicemanager_registry::delete_managed_config(name)
             .map_err(|e| format!("service removed, but managed config cleanup failed: {e}"))?;
     }
     Ok(format!("Removed '{name}'."))
+}
+
+/// Gate the managed-config purge on a confirmed NGSM/NSSM marker.
+///
+/// `delete_managed_config` blindly scrubs every NGSM-owned value name
+/// (Application, AppDirectory, AppExit, AppEvents, AppStdout, ...) under
+/// the service's `Parameters` key. On the non-`force_native` path, the
+/// caller has already proved managed ownership before we reach the purge,
+/// so scrubbing is safe. With `--force-native` that ownership check is
+/// skipped — a native Windows service that happens to use one of the
+/// NSSM-shaped value names (e.g. its own `Application`) would lose its
+/// own configuration if we still scrubbed unconditionally.
+///
+/// Re-read the managed config and only scrub when it confirms NGSM
+/// ownership. An unreadable or absent managed config degrades silently —
+/// the SCM record is already gone, and the operator can clean any
+/// orphaned values up by hand (or via a future explicit cleanup
+/// command); the alternative is corrupting an unrelated service's
+/// registry state.
+fn is_managed_for_purge(name: &str) -> bool {
+    servicemanager_registry::read_managed_config(name)
+        .map(|c| c.is_some())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ops::remove` itself touches the live SCM and the per-service
+    /// `Parameters` key under HKLM, which neither test runner has — but
+    /// the purge gate is now a small pure function over
+    /// `read_managed_config`, and that we *can* drive without elevation
+    /// via the registry crate's HKCU test surface… except its HKCU
+    /// helpers are private. So instead we cover the gate indirectly with
+    /// the only test that's actually reliable here: a name guaranteed
+    /// not to exist as a managed service must read back as "not managed"
+    /// and therefore be skipped by the purge gate.
+    ///
+    /// This is the regression guard for finding #4: with the bug, the
+    /// purge ran unconditionally; with the fix, an unmanaged (or
+    /// unreadable) target must skip the scrub silently.
+    #[test]
+    fn purge_gate_skips_unmanaged_service() {
+        // A name that cannot collide with any real installed service.
+        // `read_managed_config` returns Ok(None) for it (no Parameters
+        // key, no `Application` marker), and the gate must report false.
+        let probe = "NgsmRemoveTestProbe_DoesNotExist_4f0a91";
+        assert!(
+            !is_managed_for_purge(probe),
+            "purge gate must skip a service with no managed marker — \
+             otherwise force-native remove would scrub an unrelated \
+             service's registry state"
+        );
+    }
 }

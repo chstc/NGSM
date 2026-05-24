@@ -22,8 +22,18 @@ pub use servicemanager_ops::{EditSpec, InstallSpec, RecoverySpec};
 /// A unit of work the UI hands to the worker thread.
 pub enum Job {
     Refresh,
-    Install(InstallSpec),
-    Edit(EditSpec),
+    /// `token` identifies the modal operation that submitted this install so
+    /// the UI can drop a stale result whose modal was cancelled or replaced.
+    Install {
+        spec: InstallSpec,
+        token: u64,
+    },
+    /// `token` identifies the modal operation that submitted this edit so the
+    /// UI can drop a stale result whose modal was cancelled or replaced.
+    Edit {
+        spec: EditSpec,
+        token: u64,
+    },
     Start(String),
     Stop(String),
     Restart(String),
@@ -32,7 +42,10 @@ pub enum Job {
     Rotate(String),
     Remove(String),
     Processes(String),
-    ReadLog { service: String, stderr: bool },
+    ReadLog {
+        service: String,
+        stderr: bool,
+    },
     SaveRecovery(RecoverySpec),
 }
 
@@ -47,6 +60,8 @@ pub enum JobResult {
         /// Most-recent supervisor-recorded events, newest first. Populated
         /// every Refresh tick from the on-disk event log.
         events: Vec<servicemanager_core::EventRecord>,
+        /// Dashboard metrics computed against the last 30 days of events.
+        metrics: crate::metrics::DashboardMetrics,
     },
     Processes {
         service: String,
@@ -65,10 +80,20 @@ pub enum JobResult {
     /// Outcome of a `SaveRecovery` job — routed to the Recovery view's own
     /// status line. `Ok` carries the success message, `Err` the failure.
     RecoverySaved(Result<String, String>),
-    /// Outcome of an `Install` job — routed back to the Install dialog.
-    Installed(Result<String, String>),
-    /// Outcome of an `Edit` job — routed back to the Edit dialog.
-    Edited(Result<String, String>),
+    /// Outcome of an `Install` job — routed back to the Install dialog. The
+    /// `token` echoes the submitting modal's operation id so a stale result
+    /// (cancelled / replaced before the worker finished) can be dropped.
+    Installed {
+        token: u64,
+        result: Result<String, String>,
+    },
+    /// Outcome of an `Edit` job — routed back to the Edit dialog. The
+    /// `token` echoes the submitting modal's operation id so a stale result
+    /// (cancelled / replaced before the worker finished) can be dropped.
+    Edited {
+        token: u64,
+        result: Result<String, String>,
+    },
     Error(String),
 }
 
@@ -117,17 +142,26 @@ impl JobSender {
     /// pending — the in-flight refresh will pick up the latest state when it
     /// runs.
     pub fn send(&self, job: Job) -> Result<(), JobSendError> {
-        if matches!(job, Job::Refresh) {
+        let is_refresh = matches!(job, Job::Refresh);
+        if is_refresh && self.pending_refresh.swap(true, Ordering::AcqRel) {
             // swap returns the previous value; if it was already true there is
             // already a pending Refresh — discard this duplicate.
-            if self.pending_refresh.swap(true, Ordering::AcqRel) {
-                return Ok(());
+            return Ok(());
+        }
+        match self.inner.try_send(job) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if is_refresh {
+                    // try_send failed — un-mark the pending flag so a future
+                    // Refresh attempt isn't silently coalesced into oblivion.
+                    self.pending_refresh.store(false, Ordering::Release);
+                }
+                Err(match e {
+                    std::sync::mpsc::TrySendError::Full(_) => JobSendError::Full,
+                    std::sync::mpsc::TrySendError::Disconnected(_) => JobSendError::Disconnected,
+                })
             }
         }
-        self.inner.try_send(job).map_err(|e| match e {
-            std::sync::mpsc::TrySendError::Full(_) => JobSendError::Full,
-            std::sync::mpsc::TrySendError::Disconnected(_) => JobSendError::Disconnected,
-        })
     }
 }
 
@@ -194,20 +228,73 @@ mod job_sender_tests {
         sender.send(Job::Refresh).unwrap();
         assert!(pending.load(Ordering::Acquire), "flag should be set again");
     }
+
+    #[test]
+    fn refresh_send_failure_clears_pending_flag_so_future_refresh_can_retry() {
+        // Bound channel of size 1, fill it with a non-Refresh job, then try
+        // Refresh — try_send must fail with Full. After that failure, the
+        // pending_refresh flag MUST be back to false so the next Refresh
+        // attempt is not silently coalesced into oblivion.
+        let (tx, rx) = mpsc::sync_channel::<Job>(1);
+        let pending = Arc::new(AtomicBool::new(false));
+        let sender = JobSender {
+            inner: tx,
+            pending_refresh: Arc::clone(&pending),
+        };
+
+        // Fill the channel with one non-Refresh job.
+        sender.send(Job::Start("svc".into())).unwrap();
+
+        // Refresh should fail Full and leave pending=false.
+        let err = sender.send(Job::Refresh).unwrap_err();
+        assert_eq!(err, JobSendError::Full);
+        assert!(
+            !pending.load(Ordering::Acquire),
+            "pending_refresh must be cleared after a failed Refresh send"
+        );
+
+        // Drain the channel and confirm a second Refresh attempt now succeeds.
+        let _ = rx.recv().unwrap();
+        sender.send(Job::Refresh).unwrap();
+        assert!(pending.load(Ordering::Acquire));
+    }
 }
 
 fn execute(job: Job) -> JobResult {
     match job {
         Job::Refresh => match servicemanager_ops::list_services() {
-            Ok((defs, warnings)) => JobResult::Services {
-                defs,
-                warnings,
-                events: crate::event_log_reader::read_recent(50),
-            },
+            Ok((defs, mut warnings)) => {
+                let now = time::OffsetDateTime::now_utc();
+                let since = now - time::Duration::days(30);
+                let (events_window, read_failed) = match crate::event_log_reader::read_since(since)
+                {
+                    Ok(v) => (v, false),
+                    Err(e) => {
+                        warnings.push(format!("event log unreadable: {e} — availability unknown"));
+                        (Vec::new(), true)
+                    }
+                };
+                let mut metrics = crate::metrics::compute_metrics(&defs, &events_window, now);
+                if read_failed {
+                    metrics.availability_unknown = true;
+                }
+                JobResult::Services {
+                    defs,
+                    warnings,
+                    events: crate::event_log_reader::read_recent(50),
+                    metrics,
+                }
+            }
             Err(e) => JobResult::Error(format!("enumerate: {e}")),
         },
-        Job::Install(spec) => JobResult::Installed(servicemanager_ops::install(spec)),
-        Job::Edit(spec) => JobResult::Edited(servicemanager_ops::edit(spec)),
+        Job::Install { spec, token } => JobResult::Installed {
+            token,
+            result: servicemanager_ops::install(spec),
+        },
+        Job::Edit { spec, token } => JobResult::Edited {
+            token,
+            result: servicemanager_ops::edit(spec),
+        },
         Job::Start(n) => match servicemanager_ops::start(&n) {
             Ok(msg) => JobResult::Acted(msg),
             Err(e) => JobResult::Error(format!("{n}: {e}")),

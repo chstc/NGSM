@@ -2,6 +2,213 @@
 
 All notable changes to NGSM. Versions follow `vMAJOR.MINOR.PATCH`; categories follow [Keep a Changelog](https://keepachangelog.com).
 
+## [v0.3.2] — 2026-05-23
+
+Second code-review remediation cycle on top of v0.3.1. 15 findings addressed
+across 4 HIGH (recovery semantics + force-native scrub + stale modal results),
+10 MEDIUM (validation, registry hygiene, GUI bounds, sink dedup, UX), and
+1 LOW (no-op edit detection). No new features; no public API breakage.
+
+### Fixed
+
+- **(#2)** `ExitAction::Ignore` now quiesces the supervisor instead of
+  treating it as `Restart`. A service configured to ignore an exit no
+  longer respawns — the supervisor enters a wait-for-stop state and lets
+  SCM stop the service cleanly.
+- **(#3)** `ExitAction::Suicide` is now reported to SCM with a non-zero
+  exit code (preserves the child's positive code, or falls back to `1`),
+  so SCM recovery actions actually trigger. Previously it was
+  indistinguishable from a clean stop.
+- **(#4)** Forced native removal (`ngsm remove --force-native`) now
+  requires a confirmed managed marker before scrubbing the
+  `Parameters` subtree. A native service that happens to use registry
+  values like `Application` / `AppExit` / `AppStdout` will no longer
+  lose its own configuration.
+- **(#5)** GUI install/edit results now carry a per-operation token so
+  stale worker results from a cancelled-and-reopened modal can no longer
+  close or corrupt a later modal.
+- **(#6)** Service-name and hook-component length validation now counts
+  UTF-16 code units (matching the Windows API limit), not Rust `chars`.
+  Names with non-BMP characters (e.g. emoji) no longer pass local
+  validation while exceeding the Windows limit.
+- **(#7)** Unquoted SCM image paths containing spaces
+  (`C:\Program Files\NGSM\ngsm.exe ...`) are now correctly classified as
+  managed via a token-boundary fallback. Previously they could be
+  misclassified as native when the managed registry config was
+  unreadable.
+- **(#8)** `unset_value(AppStdout|AppStderr|AppStdin)` now mirrors
+  `clear_path_value`: deletes the canonical path AND the associated
+  `ShareMode` / `CreationDisposition` / `FlagsAndAttributes` /
+  `CopyAndTruncate` attributes. Prevents stale attributes inheriting
+  into a later `set`.
+- **(#9)** `ngsm recovery set --default-action` is now optional. Users
+  can update `--restart-delay-ms`, `--throttle-delay-ms`, or
+  `--exit-action` in isolation without restating the default action.
+- **(#10)** Install now rejects `--rotate-*` flags when no `--stdout`
+  or `--stderr` is configured. Previously the install would succeed with
+  rotation settings that could never operate.
+- **(#11)** Online rotation deduplicates sinks when stdout and stderr
+  target the same log path. A single `Arc<RotationSink>` is shared across
+  both streams, eliminating the race where two sinks competed on the
+  same file with separate handles, byte counters, and rotation state.
+- **(#12)** Slint dashboard's selected-service binding now bounds-checks
+  before indexing, and the Rust side resets the selection before
+  replacing the services model — eliminating the stale-index window
+  during refresh / filter / search / sort.
+- **(#13)** GUI `read_recent` (Recent Events panel) now scans all
+  retained backups (`events.log.4` → `events.log.1` → active) matching
+  v0.3.0's `read_since`. Previously it only read the active log +
+  `events.log.1`, omitting recent records that lived in `.2`–`.4`.
+  (Regression introduced in v0.3.0.)
+- **(#14)** GUI Recovery editor now rejects duplicate exit-code rows
+  with a visible error instead of silently overwriting (BTreeMap
+  last-write-wins).
+
+### Changed
+
+- **(#15)** Non-Windows supervisor stop fallback's "child orphaned"
+  limitation is now documented in code. The proper fix (shared kill
+  handle via `libc::kill` or `nix::sys::signal::kill`) is deferred —
+  NGSM is Windows-only and the cost of adding a Unix-signal dep for a
+  CI-only path exceeds the benefit.
+- **(#16)** `ngsm edit <service>` with no edit fields now reports an
+  explicit error ("no edit fields specified") instead of completing
+  successfully without changes.
+
+## [v0.3.1] — 2026-05-23
+
+Code-review remediation cycle on top of v0.3.0. 20 findings addressed across
+3 HIGH (security and correctness), 10 MEDIUM (validation, race, registry
+hygiene, doc accuracy), and 7 LOW (cosmetic, error reporting). No new
+features; no public API breakage.
+
+### Fixed
+
+- **(H-01)** `validate_absolute_path` now rejects embedded NUL and control
+  characters, closing a latent path-truncation hazard at the registry/Win32
+  boundary.
+- **(H-02)** GUI's `JobSender` no longer leaves `pending_refresh` stuck on
+  `true` when a Refresh `try_send` fails — previously, a single transient
+  queue-full / disconnected error would silently disable all future
+  refreshes until restart.
+- **(H-03)** Broker connection watchdog now operates on a duplicated handle
+  it owns, eliminating a TOCTOU race where the watchdog could cancel or
+  disconnect a reused handle value belonging to an unrelated object.
+- **(M-01)** Install now validates the full managed config before touching
+  SCM. Invalid `Application` paths, exit-action keys, or hooks are rejected
+  up front; rollback remains as defense-in-depth.
+- **(M-02)** Supervisor records the child-exit result before clearing
+  `current_pid`, so a Stop arriving after the exit but before the
+  ChildExited message no longer skips `record_child_exit` (Exit/Post hook
+  + `last_exit_code` update).
+- **(M-03)** Broker post-op state-query failures are now reported as
+  `state: null` + a `warning` field, instead of being collapsed to an empty
+  string that looks like success.
+- **(M-04)** Registry path-valued fields cleared via the GUI now delete the
+  value instead of writing `""`. For stdio paths, the associated
+  sharing/disposition/flags/copy-and-truncate attributes are also deleted
+  so no orphan settings linger.
+- **(M-05)** Registry writer pre-validates every string for embedded NUL
+  before any mutation, so a later invalid field can no longer leave earlier
+  fields partially written.
+- **(M-06)** Recovery exit-action map keys are now validated at the ops
+  boundary: only numeric `i32` strings are accepted; `"default"`, empty
+  strings, and embedded controls/whitespace/`=` are rejected.
+- **(M-07)** CLI hook parser now rejects unsupported `event/action` pairs
+  and empty hook commands, so a hook that would never run can no longer
+  install successfully.
+- **(M-08)** Event-schema doc-comments corrected: unknown variants are
+  serde rejections (the GUI reader catches and skips), not silent passes.
+  Tests pin the current behavior so adding `#[serde(other)]` later is a
+  deliberate, test-breaking change.
+- **(M-09)** GUI edit-form trims leading/trailing whitespace in path-like
+  fields (`application`, `app_directory`, `stdout`, `stderr`) before
+  diffing, so accidental whitespace no longer reaches the registry.
+  `app_parameters` whitespace is preserved (CLI args may carry intentional
+  spacing).
+- **(M-10)** GUI config loader clamps `auto_refresh_secs` into `1..=3600`
+  on disk, with a startup warning when correction is needed. Previously
+  a hand-edited `0` would display `0` while ticking every second.
+- **(L-01)** `cargo fmt` applied across v0.3.0-introduced files
+  (paths.rs, data.rs, event_log_reader.rs, metrics.rs, event_log.rs).
+- **(L-02)** Supervisor stop/rotate/power signal send failures are now
+  logged with the specific signal name instead of being silently dropped.
+- **(L-03)** `create_dir_all` failures before log open are now logged with
+  the parent path, giving clearer diagnostics than the downstream open
+  error alone.
+
+### Changed
+
+- **(L-04)** Supervisor stop-method comment now describes the four
+  implemented phases (console, window, thread, terminate) accurately,
+  matching the current `AppStopMethodSkip` behavior.
+- **(L-05)** CLI package description updated to reflect the full v0.3
+  command surface.
+- **(L-06)** Runner and supervisor package descriptions dropped historical
+  "Phase 2" labels.
+- **(L-07)** README architecture statement clarified: NGSM targets all
+  Windows architectures, with x64 as the only one routinely built and
+  tested.
+
+### Notes
+
+This is a code-review remediation release. The new validation surfaces
+(M-01, M-06, M-07, H-01, M-05) reject configurations that v0.3.0 (and
+earlier) accepted but the runtime then quietly mishandled. Upgrading from
+v0.3.0 will surface those as install/edit errors at the boundary instead
+of broken services at runtime.
+
+## [v0.3.0] — 2026-05-23
+
+Dashboard v0.3 — availability metric + tile classification breakdowns. The
+mockup's CPU/Memory live charts are deferred to v0.4.
+
+### Added
+
+- **Availability (30d) tile** on the Dashboard, computed from the supervisor
+  event log. Per-service availability = fraction of the 30-day window the
+  service was up (started/restarted → child_exited/stopped/throttled). The
+  aggregate is the unweighted mean across services with any event history.
+- **30-day availability sparkline** rendered into the Availability tile,
+  one bucket per UTC calendar day. Days with no data carry forward from
+  the previous bucket.
+- **Tile sub-captions:** "Running N" under Managed services, "Manual start N"
+  under Stopped, "Auto-recovering N" under Failed.
+- **`Failed` tile** — managed service currently Stopped, last event
+  `child_exited` with non-zero exit code within the last 24 h. Future-dated
+  events excluded (clock-skew safety).
+- **`Auto-recovering` sub-count** — managed service whose last event is
+  `throttled` (or a `restarted` following a `child_exited`) within the last
+  5 minutes. Future-dated events excluded.
+- **"Availability unknown" handling** — when the event log can't be read,
+  the tile renders "—" instead of falsely showing 100 %, and a warning
+  surfaces in the scan-warnings dialog.
+- **`metrics` module** in `servicemanager-gui` (pure, ~30 unit tests
+  including cross-bucket carry-over and future-ts regressions).
+- **`event_log_reader::read_since`** — windowed scan across all retained
+  log files, returns `Result<Vec<EventRecord>>` sorted by parsed
+  `OffsetDateTime` (not raw string), with a per-file 16 MiB cap.
+
+### Changed
+
+- **Supervisor event-log retention** widened from 1 MiB / 1 backup to
+  8 MiB / 4 backups — 32 MiB in backups, ~40 MiB including the active
+  log. Existing v0.2.3 deployments grow their retained history naturally
+  on the next rotation; no migration is needed.
+- Dashboard "Needs attention" tile replaced by "Failed" + Availability —
+  the underlying signal (managed + Automatic + Stopped) is now expressed
+  more precisely as "Failed" + the per-tile sub-captions.
+
+### Notes
+
+- Stopped-via-SCM (intentional shutdowns) currently count as downtime in
+  the availability metric and sparkline. Planned vs. unplanned distinction
+  will follow once event categorisation is richer.
+- Daily buckets use UTC calendar days for stability (no DST midnight
+  surprises; the supervisor log is also UTC). Drift relative to a user's
+  local clock is at most a few hours — well within the precision of a
+  30-bucket sparkline.
+
 ## [v0.2.3] — 2026-05-23
 
 Two days of intensive iteration since v0.1.0 — three feature increments, two end-to-end code reviews, and substantial remediation. 114 commits.
@@ -63,5 +270,8 @@ Initial public release.
 - Optional named-pipe broker for headless automation (feature-gated, off by default).
 - Statically-linked C runtime — no DLLs to ship.
 
+[v0.3.2]: https://github.com/chstc/NGSM/releases/tag/v0.3.2
+[v0.3.1]: https://github.com/chstc/NGSM/releases/tag/v0.3.1
+[v0.3.0]: https://github.com/chstc/NGSM/releases/tag/v0.3.0
 [v0.2.3]: https://github.com/chstc/NGSM/releases/tag/v0.2.3
 [v0.1.0]: https://github.com/chstc/NGSM/releases/tag/v0.1.0

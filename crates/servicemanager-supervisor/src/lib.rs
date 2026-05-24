@@ -40,7 +40,7 @@ pub mod hooks;
 pub mod rotation;
 
 use hooks::{find_hook, is_resume_event, run_hook, HookPoint};
-use rotation::{maybe_rotate, pipe_reader_loop, RotationSink};
+use rotation::{dedup_sinks, maybe_rotate, pipe_reader_loop, RotationSink};
 
 pub const DEFAULT_RESTART_DELAY_MS: u32 = 0;
 pub const DEFAULT_THROTTLE_DELAY_MS: u32 = 1500;
@@ -52,9 +52,30 @@ pub const DEFAULT_WINDOW_GRACE_MS: u32 = 1500;
 /// Matches NSSM's default grace period for the WM_QUIT (thread-message) step.
 pub const DEFAULT_THREADS_GRACE_MS: u32 = 1500;
 
-/// Bits in `AppStopMethodSkip`. We currently implement the console + terminate
-/// steps; window/thread message bits are recognized for compatibility but
-/// have no effect because we never attempt those steps.
+/// Bits in `AppStopMethodSkip` (mirrors NSSM's `AppStopMethodSkip`). Each bit
+/// suppresses one phase of the graceful-stop pipeline implemented by
+/// [`Supervisor::stop_child_gracefully`]. The phases run in order; each one
+/// is skipped if the corresponding bit is set in
+/// `ManagedApplicationConfig::shutdown::stop_method_skip`, otherwise it runs
+/// and waits up to its configured grace period for the child to exit before
+/// the next phase is attempted:
+///
+/// 1. **Console** (`0x1`) — send `CTRL+BREAK` to the child's process group
+///    (`GenerateConsoleCtrlEvent`). Honoured by console apps that install a
+///    handler with `SetConsoleCtrlHandler`. Grace: `kill_console_grace_ms`.
+/// 2. **Window** (`0x2`) — walk every visible top-level window owned by any
+///    process in the job and `PostMessage(WM_CLOSE)`. Honoured by
+///    well-behaved GUI apps. Grace: `kill_window_grace_ms`.
+/// 3. **Threads** (`0x4`) — `PostThreadMessage(WM_QUIT)` to every thread in
+///    every process in the job. Catches UI threads whose message loops pump
+///    thread messages but never dispatch a `WindowProc`. Grace:
+///    `kill_threads_grace_ms`.
+/// 4. **Terminate** (`0x8`) — last-resort kill. If `kill_process_tree` is
+///    set (the default), this calls `TerminateJobObject(1)` so the entire
+///    descendant tree dies promptly; otherwise the single managed child is
+///    killed via `TerminateProcess` and the rest of the tree only dies a
+///    moment later when the job handle is dropped (the job is always
+///    `KILL_ON_JOB_CLOSE`).
 pub const STOP_METHOD_SKIP_CONSOLE: u32 = 0x1;
 pub const STOP_METHOD_SKIP_WINDOW: u32 = 0x2;
 pub const STOP_METHOD_SKIP_THREADS: u32 = 0x4;
@@ -81,6 +102,17 @@ pub enum ExitReason {
     Stopped,
     ChildExited,
     SpawnFailed,
+    /// The supervisor applied `ExitAction::Suicide` for the most recent
+    /// child generation. Per NSSM convention this is a *deliberate* failure
+    /// — the supervisor exits so SCM's recovery actions (restart-service,
+    /// reboot, run-command) fire. The runner MUST report a non-zero exit
+    /// code to SCM in this case; reporting zero would look like a clean
+    /// stop and silently suppress recovery. The carried `exit_code` is the
+    /// child's own exit code, preserved so the runner can pass through a
+    /// meaningful non-zero value when one is available.
+    Suicide {
+        exit_code: i32,
+    },
 }
 
 #[derive(Clone)]
@@ -90,7 +122,9 @@ pub struct StopSignal {
 
 impl StopSignal {
     pub fn stop(&self) {
-        let _ = self.tx.send(SupervisorMessage::Stop);
+        if let Err(e) = self.tx.send(SupervisorMessage::Stop) {
+            eprintln!("[supervisor:stop] signal channel closed: {e}");
+        }
     }
 }
 
@@ -117,7 +151,9 @@ pub struct RotateSignal {
 
 impl RotateSignal {
     pub fn rotate(&self) {
-        let _ = self.tx.send(SupervisorMessage::Rotate);
+        if let Err(e) = self.tx.send(SupervisorMessage::Rotate) {
+            eprintln!("[supervisor:rotate] signal channel closed: {e}");
+        }
     }
 }
 
@@ -180,7 +216,9 @@ pub struct PowerEventSignal {
 
 impl PowerEventSignal {
     pub fn power_event(&self, event_type: u32) {
-        let _ = self.tx.send(SupervisorMessage::PowerEvent(event_type));
+        if let Err(e) = self.tx.send(SupervisorMessage::PowerEvent(event_type)) {
+            eprintln!("[supervisor:power] signal channel closed: {e}");
+        }
     }
 }
 
@@ -192,6 +230,16 @@ pub struct Supervisor {
     current_child: Arc<Mutex<Option<Child>>>,
     current_pid: Arc<Mutex<Option<u32>>>,
     last_exit_code: Arc<Mutex<Option<i32>>>,
+    /// Exit code of a child that exited but whose `ChildExited` message
+    /// has not yet been observed by the main supervisor loop. Written by
+    /// the exit watcher *before* it clears `current_pid`, so a Stop that
+    /// arrives in the racing window between "child died" and "main loop
+    /// processed ChildExited" can still find the result and run
+    /// `record_child_exit` (which fires the `Exit/Post` hook and updates
+    /// `last_exit_code`). Without this, a Stop that won the channel race
+    /// would see `current_pid == None`, return early from
+    /// `stop_child_gracefully`, and skip both bookkeeping steps.
+    pending_exit: Arc<Mutex<Option<i32>>>,
     /// Sinks that own the actual log files when online rotation is enabled.
     /// One per redirected stream, keyed by stream name ("stdout"/"stderr").
     sinks: Vec<Arc<RotationSink>>,
@@ -216,6 +264,7 @@ impl Supervisor {
             current_child: Arc::new(Mutex::new(None)),
             current_pid: Arc::new(Mutex::new(None)),
             last_exit_code: Arc::new(Mutex::new(None)),
+            pending_exit: Arc::new(Mutex::new(None)),
             sinks: Vec::new(),
             startup_tx,
             startup_rx: Some(startup_rx),
@@ -452,7 +501,7 @@ impl Supervisor {
                         .unwrap_or(default_action);
 
                     match action {
-                        ExitAction::Ignore | ExitAction::Restart => {
+                        ExitAction::Restart => {
                             let delay = if lived.as_millis() < THROTTLE_THRESHOLD_MS {
                                 throttle_delay
                             } else {
@@ -468,8 +517,43 @@ impl Supervisor {
                             }
                             continue;
                         }
-                        ExitAction::Exit | ExitAction::Suicide => {
+                        ExitAction::Ignore => {
+                            // `Ignore` means "the child exited; don't respawn,
+                            // but the *service* (i.e. the supervisor itself)
+                            // stays running so SCM can stop it cleanly later".
+                            // Collapsing this into the `Restart` arm — as the
+                            // pre-fix code did — defeats the recovery policy
+                            // by silently restarting the child anyway.
+                            //
+                            // The supervisor therefore enters a quiesced wait:
+                            // no child is spawned, but the message loop keeps
+                            // draining control signals so a later Stop /
+                            // Shutdown from SCM still ends the service
+                            // cleanly. Rotate / Pause / Continue / Power are
+                            // also handled so the channel cannot fill up and
+                            // strand the runner.
+                            eprintln!(
+                                "[supervisor:{}] child exited with code {exit_code}; \
+                                 AppExit action is `Ignore` — supervisor remains \
+                                 running and will NOT respawn the child until \
+                                 SCM stops the service",
+                                self.name
+                            );
+                            return self.wait_for_stop_quiesced();
+                        }
+                        ExitAction::Exit => {
+                            // Clean stop: the supervisor gives up; SCM is
+                            // NOT expected to run recovery actions.
                             return Ok(ExitReason::ChildExited);
+                        }
+                        ExitAction::Suicide => {
+                            // Deliberate failure: the supervisor exits and
+                            // SCM's recovery actions are expected to fire.
+                            // Carry the child's exit code so the runner can
+                            // pass through a meaningful non-zero value
+                            // (falling back to 1 when the child's own code
+                            // was 0).
+                            return Ok(ExitReason::Suicide { exit_code });
                         }
                     }
                 }
@@ -567,17 +651,33 @@ impl Supervisor {
         let stdin_stream = self.config.io.stdin.clone();
         let rotation = self.config.rotation.clone();
 
-        if let Some(stream) = &stdout_stream {
-            if online {
-                cmd.stdout(self.attach_pipe_sink("stdout", stream)?);
-            } else {
+        if online {
+            // Online rotation: stdout and stderr may target the same file.
+            // Build at most one `RotationSink` per unique path and share it
+            // between both streams so a rotation triggered by one writer is
+            // visible to the other (single mutex, single file handle, single
+            // byte counter). Two independent sinks would race on every
+            // rotation — see finding #11.
+            let (stdout_sink, stderr_sink, unique) =
+                dedup_sinks(stdout_stream.as_ref(), stderr_stream.as_ref(), &rotation)?;
+            // Keep the deduplicated sinks alive for the lifetime of this
+            // child. `rotate_sinks_now` iterates `self.sinks`, so storing
+            // only the unique set ensures an on-demand `Rotate` doesn't
+            // rotate the same underlying file twice.
+            for sink in unique {
+                self.sinks.push(sink);
+            }
+            if let Some(sink) = stdout_sink {
+                cmd.stdout(self.attach_pipe_sink("stdout", sink)?);
+            }
+            if let Some(sink) = stderr_sink {
+                cmd.stderr(self.attach_pipe_sink("stderr", sink)?);
+            }
+        } else {
+            if let Some(stream) = &stdout_stream {
                 cmd.stdout(open_log_file(stream, &rotation)?);
             }
-        }
-        if let Some(stream) = &stderr_stream {
-            if online {
-                cmd.stderr(self.attach_pipe_sink("stderr", stream)?);
-            } else {
+            if let Some(stream) = &stderr_stream {
                 cmd.stderr(open_log_file(stream, &rotation)?);
             }
         }
@@ -649,6 +749,7 @@ impl Supervisor {
     fn spawn_exit_watcher(&self) {
         let child_slot = Arc::clone(&self.current_child);
         let pid_slot = Arc::clone(&self.current_pid);
+        let pending_exit = Arc::clone(&self.pending_exit);
         let tx = self.tx.clone();
         thread::spawn(move || {
             let mut child = {
@@ -659,6 +760,17 @@ impl Supervisor {
                 }
             };
             let result = child.wait();
+            // Stash the resolved exit code *before* we clear `current_pid`.
+            // The PID clear is what makes a racing Stop see "no child" and
+            // skip the graceful-stop pipeline; without `pending_exit` first
+            // that Stop would never reach `record_child_exit`, dropping the
+            // `last_exit_code` update and the `Exit/Post` hook. With it,
+            // `stop_child_gracefully` can detect "the child already exited"
+            // and run the bookkeeping deterministically. The exit code is
+            // stored *before* the PID clear so the Stop handler that beats
+            // the `ChildExited` message in the channel can still see it.
+            let exit_code = exit_code_of(&result);
+            *pending_exit.lock().unwrap() = Some(exit_code);
             // Clear the PID *before* announcing the exit. Once the child is
             // dead the OS can recycle its PID, so any stop/pause/continue
             // path that snapshots `current_pid` after this point gets `None`
@@ -677,6 +789,16 @@ impl Supervisor {
     }
 
     fn stop_child_gracefully(&mut self) {
+        // If the exit watcher already saw the child die — but its
+        // `ChildExited` message has not yet been processed by the main loop
+        // — `pending_exit` holds the resolved code while `current_pid` has
+        // already been cleared. Process the exit here so `last_exit_code`
+        // gets updated and the `Exit/Post` hook fires; otherwise this code
+        // path returns early below and both bookkeeping steps are skipped.
+        if let Some(code) = self.pending_exit.lock().unwrap().take() {
+            self.record_child_exit(code);
+            return;
+        }
         let pid = *self.current_pid.lock().unwrap();
         let Some(pid) = pid else {
             return;
@@ -778,6 +900,22 @@ impl Supervisor {
                 }
             }
             // Fall back to killing the immediate child where there is no job.
+            //
+            // KNOWN LIMITATION (finding #15): while the exit watcher is
+            // blocked in `Child::wait()` it has already `take()`n the
+            // `Child` out of `self.current_child` (see `spawn_exit_watcher`).
+            // The slot we re-acquire here is therefore `None` for the
+            // common case of "child still running", and this fallback
+            // becomes a no-op — leaving the managed child running while the
+            // supervisor reports `Stopped`. A robust fix would require a
+            // shared kill handle (e.g. cache the PID separately and signal
+            // via `libc::kill(pid, SIGTERM)` / `nix::sys::signal::kill`),
+            // but neither `libc` nor `nix` is a workspace dependency today
+            // and NGSM is a Windows-only product (the Windows path above
+            // covers the same scenario via Job Objects + `TerminateProcess`).
+            // Accepting the limitation rather than pulling in a new
+            // dependency for a CI-only code path. If the project ever
+            // ships a non-Windows release, revisit and add `libc`/`nix`.
             #[cfg(not(windows))]
             if let Some(mut child) = self.current_child.lock().unwrap().take() {
                 let _ = child.kill();
@@ -826,23 +964,22 @@ impl Supervisor {
         None
     }
 
-    /// Build a write-end pipe handed to the child as its stdio, attach the
-    /// matching read-end to a [`RotationSink`], and spawn a reader thread
-    /// that funnels the child's output into the rotating log file.
+    /// Build a write-end pipe handed to the child as its stdio and spawn a
+    /// reader thread that funnels the child's output into the provided
+    /// [`RotationSink`]. The sink is supplied by [`dedup_sinks`] so that
+    /// stdout and stderr targeting the same path share a single mutex,
+    /// file handle, and rotation state (see finding #11).
     fn attach_pipe_sink(
         &mut self,
         label: &str,
-        stream: &IoStream,
+        sink: Arc<RotationSink>,
     ) -> Result<Stdio, SupervisorError> {
-        let sink = Arc::new(RotationSink::open(stream, self.config.rotation.clone())?);
         let (reader, writer) = os_pipe::pipe().map_err(SupervisorError::Io)?;
 
-        let sink_clone = Arc::clone(&sink);
         let name = self.name.clone();
         let label = label.to_string();
-        thread::spawn(move || pipe_reader_loop(name, label, reader, sink_clone));
+        thread::spawn(move || pipe_reader_loop(name, label, reader, sink));
 
-        self.sinks.push(sink);
         Ok(Stdio::from(writer))
     }
 
@@ -1078,10 +1215,60 @@ impl Supervisor {
     /// current-child state (reaping the handle), and fire the `Exit/Post`
     /// hook. Used by both the spontaneous-exit path and controlled stop, so
     /// the hook runs no matter how the child ended.
+    ///
+    /// Also clears `pending_exit` so the stop-race short-circuit in
+    /// [`Self::stop_child_gracefully`] cannot fire a second time for the
+    /// same child generation (e.g. once via the racing Stop path and again
+    /// via the normal `ChildExited` arm in the main loop).
     fn record_child_exit(&self, exit_code: i32) {
         *self.last_exit_code.lock().unwrap() = Some(exit_code);
+        *self.pending_exit.lock().unwrap() = None;
         self.set_current(None);
         self.fire_hook(HookPoint::ExitPost, None, Some(exit_code));
+    }
+
+    /// Block forever draining the control channel until a Stop / Shutdown
+    /// arrives. Used by the `ExitAction::Ignore` quiesce path: the child has
+    /// exited and we've decided not to respawn it, but the service stays
+    /// alive so SCM can still stop it cleanly. Rotate / Pause / Continue /
+    /// Power are handled normally (the pause/continue ones report a vacuous
+    /// success because there is no child tree to act on); a disconnected
+    /// channel is treated like Stop so the supervisor cannot get stuck.
+    fn wait_for_stop_quiesced(&self) -> Result<ExitReason, SupervisorError> {
+        let writer = event_log::EventWriter::for_service(self.name.clone());
+        loop {
+            match self.rx.recv() {
+                Ok(SupervisorMessage::Stop) => {
+                    // No child to gracefully stop, but fire the pre-stop hook
+                    // (mirrors the spawn-loop's Stop arm) and emit the
+                    // stopped event so the dashboard sees a clean shutdown.
+                    self.fire_hook(HookPoint::StopPre, None, None);
+                    writer.stopped(servicemanager_core::events::StopReason::ScmStop);
+                    return Ok(ExitReason::Stopped);
+                }
+                Ok(SupervisorMessage::Rotate) => self.rotate_sinks_now(),
+                Ok(SupervisorMessage::Pause(ack)) => {
+                    // No tree to suspend — `suspend_tree` already returns
+                    // `true` when `current_pid` is `None`, so the runner
+                    // sees the pause as vacuously satisfied.
+                    let _ = ack.send(self.suspend_tree());
+                }
+                Ok(SupervisorMessage::Continue(ack)) => {
+                    let _ = ack.send(self.resume_tree());
+                }
+                Ok(SupervisorMessage::PowerEvent(ev)) => self.handle_power_event(ev),
+                // A stray ChildExited cannot reach here in practice (the exit
+                // watcher fired before we entered quiesce, and no new child
+                // was spawned), but if it did arrive late we just drop it.
+                Ok(SupervisorMessage::ChildExited(_)) => {}
+                // Sender side gone — treat as an implicit stop so the
+                // runner's join returns instead of blocking forever.
+                Err(_) => {
+                    writer.stopped(servicemanager_core::events::StopReason::ScmStop);
+                    return Ok(ExitReason::Stopped);
+                }
+            }
+        }
     }
 
     fn sleep_or_stop(&self, delay: Duration) -> Result<bool, SupervisorError> {
@@ -1124,7 +1311,9 @@ fn open_log_file(
     let path = Path::new(&stream.path);
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            let _ = std::fs::create_dir_all(parent);
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!("[supervisor] cannot create log dir {parent:?}: {e}");
+            }
         }
     }
     maybe_rotate(path, rotation);
@@ -1237,4 +1426,133 @@ mod tests {
         assert!(parse_env_entry("=value").is_err());
         assert!(parse_env_entry("BAD\0NAME=x").is_err());
     }
+
+    #[test]
+    fn pending_exit_starts_empty_and_is_take_consumable() {
+        // The supervisor's stop/child-exit race fix relies on the
+        // `pending_exit` slot being empty until the exit watcher populates
+        // it, and being `take()`-consumable so the stop path can run
+        // `record_child_exit` for it at most once. Pin both invariants so
+        // a future refactor that switches storage strategy keeps the same
+        // contract.
+        let sup = Supervisor::new("Test", ManagedApplicationConfig::default());
+        assert!(
+            sup.pending_exit.lock().unwrap().is_none(),
+            "pending_exit must start empty"
+        );
+        // Simulate the exit watcher storing a code.
+        *sup.pending_exit.lock().unwrap() = Some(42);
+        // The stop path uses `take()` to read-and-clear in one shot, so a
+        // second concurrent stop cannot fire `record_child_exit` again for
+        // the same exit.
+        let taken = sup.pending_exit.lock().unwrap().take();
+        assert_eq!(taken, Some(42));
+        assert!(sup.pending_exit.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn record_child_exit_clears_pending_exit_to_avoid_double_fire() {
+        // The race fix has two paths that could record the exit: the racing
+        // Stop path (which `take`s pending_exit) and the main loop's normal
+        // ChildExited arm (which calls `record_child_exit` directly with
+        // the exit code from the channel message). `record_child_exit`
+        // therefore unconditionally clears pending_exit so the Stop path's
+        // short-circuit cannot fire after a normal ChildExited has already
+        // been handled.
+        let sup = Supervisor::new("Test", ManagedApplicationConfig::default());
+        *sup.pending_exit.lock().unwrap() = Some(7);
+        sup.record_child_exit(7);
+        assert!(
+            sup.pending_exit.lock().unwrap().is_none(),
+            "record_child_exit must clear pending_exit"
+        );
+        assert_eq!(*sup.last_exit_code.lock().unwrap(), Some(7));
+    }
+
+    #[test]
+    fn ignore_quiesce_returns_stopped_when_stop_message_arrives() {
+        // `ExitAction::Ignore` parks the supervisor in `wait_for_stop_quiesced`
+        // instead of respawning the child. Pin the contract: the quiesce
+        // loop must NOT exit on its own, and a Stop message must end it
+        // cleanly with `ExitReason::Stopped` (so the runner reports a clean
+        // service stop to SCM rather than treating Ignore as a failure).
+        let sup = Supervisor::new("IgnoreQuiesce", ManagedApplicationConfig::default());
+        let stop = sup.stop_signal();
+        // Send Stop *before* entering the quiesce loop. Because Stop is in
+        // the channel, the very first `recv()` returns it and we exit
+        // immediately — no race, no hang risk in CI.
+        stop.stop();
+        let result = sup
+            .wait_for_stop_quiesced()
+            .expect("quiesce should not error");
+        assert_eq!(result, ExitReason::Stopped);
+    }
+
+    #[test]
+    fn ignore_quiesce_drains_non_terminal_signals_until_stop() {
+        // Rotate must NOT terminate the quiesce loop — only Stop (or a
+        // disconnected channel) does. Queue a Rotate, then a Stop on the
+        // same thread (mpsc preserves single-thread FIFO order across
+        // cloned senders), and assert the loop drains the Rotate and only
+        // returns once Stop is processed.
+        let sup = Supervisor::new("IgnoreDrain", ManagedApplicationConfig::default());
+        let rotate = sup.rotate_signal();
+        let stop = sup.stop_signal();
+
+        rotate.rotate();
+        stop.stop();
+        let result = sup
+            .wait_for_stop_quiesced()
+            .expect("quiesce should not error");
+        assert_eq!(result, ExitReason::Stopped);
+    }
+
+    #[test]
+    fn ignore_quiesce_returns_stopped_when_channel_disconnects() {
+        // A disconnected channel must be treated as an implicit Stop so the
+        // runner's join can return. Drop the supervisor's external signal
+        // handles before entering the quiesce loop — the internal `tx`
+        // belongs to the Supervisor itself, so we have to consume it by
+        // taking it out. Easiest equivalent: send Stop *after* dropping
+        // every external sender; alternatively, drop the only remaining
+        // external sender and rely on the internal one to keep the channel
+        // alive. To exercise the disconnect path, we replace the receiver
+        // with a fresh, sender-less one and rebuild a stand-in Supervisor.
+        // Here we exercise the simpler invariant: with no senders left, the
+        // quiesce loop must not block forever.
+        let (tx, rx) = mpsc::channel::<SupervisorMessage>();
+        drop(tx); // all senders gone
+        let sup = Supervisor {
+            name: "IgnoreDisconnect".into(),
+            config: ManagedApplicationConfig::default(),
+            rx,
+            // The remaining fields are unused by the quiesce path, but must
+            // be valid. Use a throwaway `tx` so the struct constructs; the
+            // quiesce loop only reads `self.rx`.
+            tx: mpsc::channel().0,
+            current_child: Arc::new(Mutex::new(None)),
+            current_pid: Arc::new(Mutex::new(None)),
+            last_exit_code: Arc::new(Mutex::new(None)),
+            pending_exit: Arc::new(Mutex::new(None)),
+            sinks: Vec::new(),
+            startup_tx: mpsc::channel().0,
+            startup_rx: None,
+            #[cfg(windows)]
+            job: None,
+        };
+        let result = sup
+            .wait_for_stop_quiesced()
+            .expect("quiesce should not error");
+        assert_eq!(result, ExitReason::Stopped);
+    }
+
+    // NOTE: A genuine end-to-end regression test for the stop/child-exit
+    // race would need a test harness that lets us spawn a real child, then
+    // interpose between "child has exited" and "supervisor processes
+    // ChildExited" to inject a Stop. No such harness exists today (the
+    // supervisor owns its channel privately, and there is no
+    // dependency-injection seam on the child handle), and standing one up
+    // is a non-trivial restructure. The unit tests above pin the shared-
+    // state contract the fix relies on; a follow-up integration test
+    // should be added once that harness lands.
 }

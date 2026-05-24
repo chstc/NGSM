@@ -11,6 +11,14 @@ fn default_config_version() -> u32 {
     1
 }
 
+/// Minimum permitted auto-refresh interval, in seconds. Zero would tick every
+/// frame and visibly thrash the UI; anything below 1 s isn't useful here.
+pub const AUTO_REFRESH_SECS_MIN: u32 = 1;
+/// Maximum permitted auto-refresh interval, in seconds (one hour). Keeps the
+/// value well clear of the `i32` overflow the UI cast would hit and prevents
+/// effectively-disabled-refresh from hand-edited configs.
+pub const AUTO_REFRESH_SECS_MAX: u32 = 3600;
+
 /// User preferences persisted between sessions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
@@ -45,18 +53,36 @@ pub struct ConfigLoad {
 }
 
 /// Parse config JSON. On parse failure, returns defaults with a warning
-/// describing what couldn't be parsed.
+/// describing what couldn't be parsed. Out-of-range numeric fields are
+/// clamped to the supported UI range and the clamp is reported via the
+/// returned warning so the user knows their on-disk value was adjusted.
 pub fn parse_config(text: &str) -> ConfigLoad {
     match serde_json::from_str::<Config>(text) {
-        Ok(config) => ConfigLoad {
-            config,
-            warning: None,
-        },
+        Ok(mut config) => {
+            let warning = normalize(&mut config);
+            ConfigLoad { config, warning }
+        }
         Err(e) => ConfigLoad {
             config: Config::default(),
             warning: Some(format!("config.json is corrupt — using defaults: {e}")),
         },
     }
+}
+
+/// Clamp deserialized fields into their supported runtime ranges. Returns a
+/// human-readable warning when any value had to be adjusted, otherwise None.
+fn normalize(config: &mut Config) -> Option<String> {
+    let raw = config.auto_refresh_secs;
+    let clamped = raw.clamp(AUTO_REFRESH_SECS_MIN, AUTO_REFRESH_SECS_MAX);
+    if clamped != raw {
+        config.auto_refresh_secs = clamped;
+        return Some(format!(
+            "auto_refresh_secs clamped from {raw} to {clamped} (allowed: {min}..={max})",
+            min = AUTO_REFRESH_SECS_MIN,
+            max = AUTO_REFRESH_SECS_MAX,
+        ));
+    }
+    None
 }
 
 /// Serialise preferences to pretty JSON.
@@ -147,5 +173,53 @@ mod tests {
         let result = parse_config(no_v);
         assert_eq!(result.config.v, 1);
         assert!(result.warning.is_none());
+    }
+
+    /// Helper: build a config JSON blob with the given `auto_refresh_secs`,
+    /// write it to a temp file, read it back, and run it through
+    /// `parse_config` — mirroring what `load()` does on disk.
+    fn parse_written_with_auto_refresh_secs(secs: u32) -> ConfigLoad {
+        use std::io::Write;
+        let json = format!(
+            r#"{{"v":1,"auto_refresh":true,"auto_refresh_secs":{secs},"managed_only":true}}"#
+        );
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(json.as_bytes()).unwrap();
+        f.flush().unwrap();
+        let text = std::fs::read_to_string(f.path()).unwrap();
+        parse_config(&text)
+    }
+
+    #[test]
+    fn parse_config_clamps_auto_refresh_secs_below_minimum() {
+        let result = parse_written_with_auto_refresh_secs(0);
+        assert_eq!(result.config.auto_refresh_secs, AUTO_REFRESH_SECS_MIN);
+        let w = result.warning.expect("expected a clamp warning");
+        assert!(
+            w.contains("clamped from 0 to 1"),
+            "warning should describe the clamp, got: {w}"
+        );
+    }
+
+    #[test]
+    fn parse_config_clamps_auto_refresh_secs_above_maximum() {
+        let result = parse_written_with_auto_refresh_secs(100_000);
+        assert_eq!(result.config.auto_refresh_secs, AUTO_REFRESH_SECS_MAX);
+        let w = result.warning.expect("expected a clamp warning");
+        assert!(
+            w.contains("clamped from 100000 to 3600"),
+            "warning should describe the clamp, got: {w}"
+        );
+    }
+
+    #[test]
+    fn parse_config_accepts_valid_auto_refresh_secs_without_warning() {
+        let result = parse_written_with_auto_refresh_secs(30);
+        assert_eq!(result.config.auto_refresh_secs, 30);
+        assert!(
+            result.warning.is_none(),
+            "got warning: {:?}",
+            result.warning
+        );
     }
 }

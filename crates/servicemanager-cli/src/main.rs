@@ -279,8 +279,10 @@ enum RecoveryAction {
 #[derive(Args, Debug)]
 struct RecoverySetArgs {
     /// Default action when a process exit code has no explicit mapping.
+    /// Optional: when omitted, the existing default_action on the service is
+    /// preserved so other fields (delays, exit_actions) can be updated alone.
     #[arg(long, value_enum)]
-    default_action: ExitActionArg,
+    default_action: Option<ExitActionArg>,
 
     /// Milliseconds to delay before restarting the service.
     #[arg(long)]
@@ -606,11 +608,44 @@ fn cmd_status(name: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_install(args: &InstallArgs, json: bool) -> Result<()> {
-    let has_hooks = !args.hook.is_empty();
-    let has_rotation = args.rotate_bytes.is_some()
+/// True when the user passed any `--rotate-*` flag — i.e. asked install to
+/// configure log rotation. Centralised so the cmd_install dispatch, the
+/// extended path, and the validator below agree on what "rotation requested"
+/// means.
+fn install_args_have_rotation(args: &InstallArgs) -> bool {
+    args.rotate_bytes.is_some()
         || args.rotate_seconds.is_some()
-        || args.rotate_online != RotateOnlineArg::Offline;
+        || args.rotate_online != RotateOnlineArg::Offline
+}
+
+/// Reject install configurations that ask for log rotation without a log
+/// stream to rotate.
+///
+/// `ManagedApplicationConfig::has_online_rotation` (and the
+/// supervisor's rotate request path) require at least one redirected
+/// stdout/stderr stream; without one, the rotation config is inert and a
+/// later `ngsm rotate` is silently refused. Catching this at the CLI
+/// boundary surfaces the misconfiguration immediately, instead of
+/// installing a service whose rotation flags do nothing.
+pub(crate) fn validate_install_args(args: &InstallArgs) -> Result<()> {
+    if install_args_have_rotation(args) && args.stdout.is_none() && args.stderr.is_none() {
+        return Err(servicemanager_core::Error::InvalidConfig(
+            "rotation flags (--rotate-bytes, --rotate-seconds, --rotate-online) \
+             require --stdout and/or --stderr; rotation cannot operate without \
+             a redirected log stream"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn cmd_install(args: &InstallArgs, json: bool) -> Result<()> {
+    // Reject rotation flags without a redirected log stream before any
+    // SCM / registry side effect.
+    validate_install_args(args)?;
+
+    let has_hooks = !args.hook.is_empty();
+    let has_rotation = install_args_have_rotation(args);
 
     if has_hooks || has_rotation {
         // ops::install does not yet carry hooks or rotation in InstallSpec.
@@ -661,10 +696,7 @@ fn cmd_install_extended(args: &InstallArgs, json: bool) -> Result<()> {
         },
         ..Default::default()
     };
-    if args.rotate_bytes.is_some()
-        || args.rotate_seconds.is_some()
-        || args.rotate_online != RotateOnlineArg::Offline
-    {
+    if install_args_have_rotation(args) {
         managed.rotation = LogRotationConfig {
             enabled: Some(true),
             online: Some(args.rotate_online.as_nssm_value()),
@@ -676,6 +708,14 @@ fn cmd_install_extended(args: &InstallArgs, json: bool) -> Result<()> {
     for raw in &args.hook {
         managed.hooks.push(parse_hook_spec(raw)?);
     }
+
+    // Pre-validate the full config *before* creating the SCM service. A
+    // doomed config (e.g. relative AppDirectory, non-numeric exit-action
+    // key) would otherwise create the SCM service first and then fail at
+    // registry-write time, leaving an orphan if rollback also failed.
+    // Mirrors what `servicemanager_ops::install` does for the simple path.
+    servicemanager_ops::validate_managed_config(&managed)
+        .map_err(servicemanager_core::Error::InvalidConfig)?;
 
     let binary_path = build_run_service_command(&args.name)?;
     let display = args.display.clone().unwrap_or_else(|| args.name.clone());
@@ -908,7 +948,38 @@ fn cmd_unset(name: &str, param: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Reject `ngsm edit <name>` invocations that supply no editable fields.
+///
+/// All of `EditArgs`'s value-bearing fields are `Option`, so it is parseable
+/// with only the service name — but then `ops::edit` reads the config, has
+/// nothing to change, and the CLI prints `Edited '<name>'.` That is
+/// indistinguishable from a real edit and misleads operators in scripts.
+///
+/// `force_native` is intentionally excluded: on its own it changes nothing
+/// (it only relaxes a guard on the other flags).
+fn validate_edit_args(args: &EditArgs) -> Result<()> {
+    let nothing_to_change = args.application.is_none()
+        && args.app_parameters.is_none()
+        && args.app_directory.is_none()
+        && args.display.is_none()
+        && args.start.is_none()
+        && args.stdout.is_none()
+        && args.stderr.is_none();
+    if nothing_to_change {
+        return Err(servicemanager_core::Error::InvalidConfig(
+            "no edit fields specified; try `ngsm edit --help` to see editable fields".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn cmd_edit(args: &EditArgs, json: bool) -> Result<()> {
+    // A bare `ngsm edit <service>` with no field flags would otherwise
+    // succeed silently and print "Edited '<name>'." — surface that the
+    // operator gave us nothing to do instead of pretending we changed
+    // something.
+    validate_edit_args(args)?;
+
     let want_native = args.display.is_some() || args.start.is_some();
 
     // Refuse to mix --force-native (which targets only native SCM metadata)
@@ -1045,7 +1116,31 @@ fn cmd_recovery_set(name: &str, args: &RecoverySetArgs, json: bool) -> Result<()
     // is not set.
     let current =
         servicemanager_ops::read_recovery(name).map_err(servicemanager_core::Error::other)?;
+    let spec = merge_recovery_args(name, &current, args)?;
+    let msg = servicemanager_ops::save_recovery(spec).map_err(servicemanager_core::Error::other)?;
+    if json {
+        println!("{}", serde_json::json!({ "saved": name }));
+    } else {
+        println!("{msg}");
+    }
+    Ok(())
+}
 
+/// Merge a `RecoverySetArgs` payload onto the currently-persisted recovery
+/// spec for `name`, returning the spec that should be written back.
+///
+/// Every field on `RecoverySetArgs` is optional — when a CLI flag is absent,
+/// the matching field on `current` is preserved. This lets users update one
+/// knob at a time (e.g. `recovery set foo --restart-delay-ms 5000`) without
+/// restating the others.
+///
+/// Extracted as a free function so it can be unit-tested without touching the
+/// registry (which `read_recovery`/`save_recovery` would require).
+fn merge_recovery_args(
+    name: &str,
+    current: &RecoverySpec,
+    args: &RecoverySetArgs,
+) -> Result<RecoverySpec> {
     let restart_delay_ms = if args.no_restart_delay {
         None
     } else {
@@ -1061,7 +1156,7 @@ fn cmd_recovery_set(name: &str, args: &RecoverySetArgs, json: bool) -> Result<()
     let mut exit_actions: BTreeMap<String, ExitAction> = if args.clear_exit_actions {
         BTreeMap::new()
     } else {
-        current.exit_actions
+        current.exit_actions.clone()
     };
 
     // Parse and apply --exit-action CODE=ACTION entries.
@@ -1074,23 +1169,31 @@ fn cmd_recovery_set(name: &str, args: &RecoverySetArgs, json: bool) -> Result<()
         let action = parse_exit_action(action_str).map_err(|e| {
             servicemanager_core::Error::InvalidConfig(format!("exit-action '{raw}': {e}"))
         })?;
-        exit_actions.insert(code_str.trim().to_string(), action);
+        let code = code_str.trim().to_string();
+        // Reject keys the supervisor would never match (non-numeric, the
+        // reserved "default", embedded whitespace/NUL, ...) up front, so
+        // a bad value cannot be silently persisted in the registry.
+        servicemanager_ops::validate_exit_action_key(&code).map_err(|e| {
+            servicemanager_core::Error::InvalidConfig(format!("exit-action '{raw}': {e}"))
+        })?;
+        exit_actions.insert(code, action);
     }
 
-    let spec = RecoverySpec {
+    // default_action is optional on the CLI — preserve the existing value
+    // when the flag is absent so partial updates do not force the operator
+    // to restate it.
+    let default_action = match args.default_action {
+        Some(arg) => arg.into(),
+        None => current.default_action,
+    };
+
+    Ok(RecoverySpec {
         name: name.to_string(),
         restart_delay_ms,
         throttle_delay_ms,
-        default_action: args.default_action.into(),
+        default_action,
         exit_actions,
-    };
-    let msg = servicemanager_ops::save_recovery(spec).map_err(servicemanager_core::Error::other)?;
-    if json {
-        println!("{}", serde_json::json!({ "saved": name }));
-    } else {
-        println!("{msg}");
-    }
-    Ok(())
+    })
 }
 
 /// Parse an exit-action string (case-insensitive).
@@ -1135,6 +1238,31 @@ fn cmd_processes(name: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Supervisor-supported `(event, action)` hook points.
+///
+/// Mirrors `servicemanager-supervisor::hooks::HookPoint` exactly. If the
+/// supervisor grows a new point, add it here too — anything not in this
+/// list is silently dropped at runtime, so the CLI rejects it up front
+/// rather than persisting a hook that will never fire.
+const SUPPORTED_HOOK_POINTS: &[(&str, &str)] = &[
+    ("Start", "Pre"),
+    ("Start", "Post"),
+    ("Stop", "Pre"),
+    ("Exit", "Post"),
+    ("Rotate", "Pre"),
+    ("Rotate", "Post"),
+    ("Power", "Change"),
+    ("Power", "Resume"),
+];
+
+fn supported_hook_points_pretty() -> String {
+    SUPPORTED_HOOK_POINTS
+        .iter()
+        .map(|(e, a)| format!("{e}/{a}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Parse a `EVENT/ACTION=command` spec from `--hook`.
 fn parse_hook_spec(raw: &str) -> Result<HookConfig> {
     let (lhs, command) = raw.split_once('=').ok_or_else(|| {
@@ -1149,13 +1277,34 @@ fn parse_hook_spec(raw: &str) -> Result<HookConfig> {
     })?;
     let event = event.trim();
     let action = action.trim();
+    let command = command.trim();
     // Reject hook names that cannot be used as registry subkey / value names.
     servicemanager_core::validate_hook_component(event, "event")?;
     servicemanager_core::validate_hook_component(action, "action")?;
+    // Reject `(event, action)` pairs the supervisor does not understand —
+    // matched case-insensitively, since the registry layer is case-insensitive
+    // and silently accepting `Foo/Bar=cmd` would install a hook that never
+    // fires.
+    if !SUPPORTED_HOOK_POINTS
+        .iter()
+        .any(|(e, a)| event.eq_ignore_ascii_case(e) && action.eq_ignore_ascii_case(a))
+    {
+        return Err(servicemanager_core::Error::InvalidConfig(format!(
+            "hook spec '{raw}' uses unsupported event/action '{event}/{action}'; \
+             supported points are: {}",
+            supported_hook_points_pretty()
+        )));
+    }
+    // An empty command would install a hook the supervisor cannot execute.
+    if command.is_empty() {
+        return Err(servicemanager_core::Error::InvalidConfig(format!(
+            "hook spec '{raw}' has an empty command — provide a command to run"
+        )));
+    }
     Ok(HookConfig {
         event: event.to_string(),
         action: action.to_string(),
-        command: command.trim().to_string(),
+        command: command.to_string(),
     })
 }
 
@@ -1239,6 +1388,51 @@ mod tests {
     }
 
     #[test]
+    fn parse_hook_spec_accepts_supported_points() {
+        // Every supervisor-supported (event, action) pair round-trips.
+        for (event, action) in SUPPORTED_HOOK_POINTS {
+            let raw = format!("{event}/{action}=C:\\hook.cmd");
+            let h = parse_hook_spec(&raw)
+                .unwrap_or_else(|e| panic!("expected {event}/{action} to be accepted, got {e:?}"));
+            assert_eq!(h.event, *event);
+            assert_eq!(h.action, *action);
+            assert_eq!(h.command, "C:\\hook.cmd");
+        }
+    }
+
+    #[test]
+    fn parse_hook_spec_rejects_unsupported_pair() {
+        // Unrecognized event/action pairs would install a hook the
+        // supervisor silently ignores at runtime — reject up front.
+        let err = parse_hook_spec("Foo/Bar=cmd").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported") && msg.contains("Foo/Bar"),
+            "expected unsupported-pair message, got {msg:?}"
+        );
+        // Also lists the supported set so the user can fix it.
+        assert!(
+            msg.contains("Start/Pre"),
+            "expected supported list in {msg:?}"
+        );
+        // Almost-supported variants (wrong action under a real event) are
+        // still rejected.
+        assert!(parse_hook_spec("Start/Resume=cmd").is_err());
+        assert!(parse_hook_spec("Power/Pre=cmd").is_err());
+    }
+
+    #[test]
+    fn parse_hook_spec_rejects_empty_command() {
+        let err = parse_hook_spec("Start/Pre=").unwrap_err();
+        assert!(
+            err.to_string().contains("empty command"),
+            "expected empty-command message, got {err:?}"
+        );
+        // Whitespace-only command is also empty after trim.
+        assert!(parse_hook_spec("Start/Pre=   ").is_err());
+    }
+
+    #[test]
     fn truncate_adds_ellipsis_past_limit() {
         assert_eq!(truncate("short", 10), "short");
         let t = truncate("abcdefghij", 5);
@@ -1259,5 +1453,203 @@ mod tests {
     fn parse_exit_action_rejects_unknown() {
         assert!(parse_exit_action("reboot").is_err());
         assert!(parse_exit_action("").is_err());
+    }
+
+    /// Build an `InstallArgs` with the minimum required positional fields
+    /// and every optional knob at its default. Tests then mutate only the
+    /// flags they care about, so an unrelated field flip later cannot
+    /// silently broaden test coverage.
+    fn install_args_defaults() -> InstallArgs {
+        InstallArgs {
+            name: "TestSvc".into(),
+            application: "C:\\app\\svc.exe".into(),
+            app_parameters: None,
+            app_directory: None,
+            display: None,
+            start: StartTypeArg::Manual,
+            stdout: None,
+            stderr: None,
+            rotate_bytes: None,
+            rotate_seconds: None,
+            rotate_online: RotateOnlineArg::Offline,
+            hook: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn parse_install_args_rejects_rotation_flags_without_stdout_or_stderr() {
+        // --rotate-bytes alone (no --stdout / --stderr) must be rejected.
+        // Without a redirected log stream, `has_online_rotation` returns
+        // false and `ngsm rotate` later refuses the request — install
+        // should not silently accept inert rotation config.
+        let mut args = install_args_defaults();
+        args.rotate_bytes = Some(1_024_000);
+        let err = validate_install_args(&args).expect_err(
+            "--rotate-bytes without --stdout/--stderr must be rejected at the CLI boundary",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--stdout") && msg.contains("--stderr"),
+            "error should name the missing flags, got {msg:?}"
+        );
+        assert!(
+            msg.contains("rotation"),
+            "error should explain why rotation needs them, got {msg:?}"
+        );
+
+        // --rotate-seconds alone — same rejection.
+        let mut args = install_args_defaults();
+        args.rotate_seconds = Some(3600);
+        assert!(validate_install_args(&args).is_err());
+
+        // --rotate-online online — same rejection.
+        let mut args = install_args_defaults();
+        args.rotate_online = RotateOnlineArg::Online;
+        assert!(validate_install_args(&args).is_err());
+    }
+
+    #[test]
+    fn parse_install_args_accepts_rotation_flags_with_stdout() {
+        // The complementary positive case: rotation flags + --stdout
+        // (or --stderr) is the supported configuration and must pass.
+        let mut args = install_args_defaults();
+        args.rotate_bytes = Some(1_024_000);
+        args.stdout = Some("C:\\logs\\out.log".into());
+        validate_install_args(&args).expect("rotation + stdout is valid");
+
+        let mut args = install_args_defaults();
+        args.rotate_seconds = Some(3600);
+        args.stderr = Some("C:\\logs\\err.log".into());
+        validate_install_args(&args).expect("rotation + stderr is valid");
+    }
+
+    #[test]
+    fn parse_install_args_accepts_no_rotation_and_no_streams() {
+        // The vanilla install path (no rotation, no streams) must keep
+        // passing — the validator only fires when rotation is requested.
+        let args = install_args_defaults();
+        validate_install_args(&args).expect("plain install with no rotation must pass");
+    }
+
+    /// Build a `RecoverySetArgs` with everything off — tests then flip just
+    /// the field they care about.
+    fn recovery_set_args_defaults() -> RecoverySetArgs {
+        RecoverySetArgs {
+            default_action: None,
+            restart_delay_ms: None,
+            no_restart_delay: false,
+            throttle_delay_ms: None,
+            no_throttle_delay: false,
+            exit_actions: Vec::new(),
+            clear_exit_actions: false,
+        }
+    }
+
+    /// A baseline persisted recovery spec to merge against in unit tests.
+    fn recovery_spec_baseline() -> RecoverySpec {
+        let mut exit_actions = BTreeMap::new();
+        exit_actions.insert("0".into(), ExitAction::Ignore);
+        RecoverySpec {
+            name: "TestSvc".into(),
+            restart_delay_ms: Some(1_000),
+            throttle_delay_ms: Some(2_000),
+            default_action: ExitAction::Restart,
+            exit_actions,
+        }
+    }
+
+    #[test]
+    fn recovery_set_with_only_restart_delay_preserves_default_action() {
+        // Regression for finding #9: a partial update that only changes
+        // restart_delay_ms must keep the existing default_action — it should
+        // not silently flip to a clap-supplied default.
+        let current = recovery_spec_baseline();
+        let mut args = recovery_set_args_defaults();
+        args.restart_delay_ms = Some(5_000);
+
+        let merged = merge_recovery_args("TestSvc", &current, &args).expect("merge succeeds");
+
+        assert_eq!(merged.restart_delay_ms, Some(5_000));
+        assert_eq!(
+            merged.default_action, current.default_action,
+            "default_action must be preserved when --default-action is absent"
+        );
+        // Untouched fields are still preserved.
+        assert_eq!(merged.throttle_delay_ms, current.throttle_delay_ms);
+        assert_eq!(merged.exit_actions, current.exit_actions);
+    }
+
+    /// Build an `EditArgs` with only the service name — every editable
+    /// field at None — so tests can flip one flag at a time.
+    fn edit_args_defaults() -> EditArgs {
+        EditArgs {
+            name: "TestSvc".into(),
+            application: None,
+            app_parameters: None,
+            app_directory: None,
+            display: None,
+            start: None,
+            stdout: None,
+            stderr: None,
+            force_native: false,
+        }
+    }
+
+    #[test]
+    fn bare_edit_returns_error_about_no_fields() {
+        // Regression for finding #16: a bare `ngsm edit <name>` with no
+        // editable flags must be rejected at the CLI boundary instead of
+        // silently reporting success.
+        let args = edit_args_defaults();
+        let err = validate_edit_args(&args).expect_err("bare edit must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no edit fields"),
+            "error should explain no fields were specified, got {msg:?}"
+        );
+        assert!(
+            msg.contains("--help"),
+            "error should point to --help for the field list, got {msg:?}"
+        );
+
+        // --force-native on its own is also nothing-to-change: the flag only
+        // relaxes a guard, it carries no new value.
+        let mut args = edit_args_defaults();
+        args.force_native = true;
+        assert!(
+            validate_edit_args(&args).is_err(),
+            "--force-native without any value-bearing flag must also be rejected"
+        );
+    }
+
+    #[test]
+    fn edit_with_one_field_passes_validation() {
+        // The complementary positive case: any single editable flag is
+        // enough to make the invocation meaningful.
+        let mut args = edit_args_defaults();
+        args.display = Some("New Display".into());
+        validate_edit_args(&args).expect("--display alone is valid");
+
+        let mut args = edit_args_defaults();
+        args.application = Some("C:\\app\\new.exe".into());
+        validate_edit_args(&args).expect("--application alone is valid");
+
+        let mut args = edit_args_defaults();
+        args.start = Some(StartTypeArg::Automatic);
+        validate_edit_args(&args).expect("--start alone is valid");
+    }
+
+    #[test]
+    fn recovery_set_with_explicit_default_action_overrides() {
+        // When the operator does pass --default-action, the new value wins.
+        let current = recovery_spec_baseline();
+        let mut args = recovery_set_args_defaults();
+        args.default_action = Some(ExitActionArg::Exit);
+        args.restart_delay_ms = Some(5_000);
+
+        let merged = merge_recovery_args("TestSvc", &current, &args).expect("merge succeeds");
+
+        assert_eq!(merged.default_action, ExitAction::Exit);
+        assert_eq!(merged.restart_delay_ms, Some(5_000));
     }
 }

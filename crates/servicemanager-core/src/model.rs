@@ -258,13 +258,55 @@ impl ServiceDefinition {
         if self.managed.is_some() {
             return true;
         }
-        match image_path_exe_name(&self.native.image_path) {
-            Some(exe) => {
-                exe.eq_ignore_ascii_case("ngsm.exe") || exe.eq_ignore_ascii_case("nssm.exe")
+        if let Some(exe) = image_path_exe_name(&self.native.image_path) {
+            if exe.eq_ignore_ascii_case("ngsm.exe") || exe.eq_ignore_ascii_case("nssm.exe") {
+                return true;
             }
-            None => false,
+        }
+        // Fallback: image_path_exe_name splits an unquoted path at the first
+        // whitespace, so an unquoted SCM image path like
+        //   C:\Program Files\NGSM\ngsm.exe run-service Foo
+        // yields the basename "Program", which does not match the runner.
+        // Win32's CommandLineToArgvW resolves this by trying progressively
+        // longer prefixes, which we cannot replicate without touching the
+        // filesystem. Instead, scan for a token-boundary occurrence of the
+        // runner basename — preceded by `\` or `/`, followed by whitespace
+        // or end-of-string — which catches the unquoted-spaces case without
+        // matching directory names or argument substrings that merely
+        // contain "ngsm.exe" / "nssm.exe".
+        image_path_contains_runner_token(&self.native.image_path)
+    }
+}
+
+/// Return true if `image_path` contains an `ngsm.exe` or `nssm.exe` runner
+/// token: an occurrence (case-insensitive) preceded by `\` or `/` and
+/// followed by whitespace or end-of-string.
+///
+/// This is a secondary check used only when the primary
+/// [`image_path_exe_name`] split has failed to identify the runner —
+/// principally because an unquoted SCM image path contains spaces in the
+/// directory (e.g. `C:\Program Files\NGSM\ngsm.exe ...`).
+///
+/// The token-boundary requirement is what keeps the negative cases in
+/// `is_managed_matches_executable_basename_not_substring` rejected: a
+/// directory like `C:\nssm.exe-backup\realservice.exe` has `nssm.exe`
+/// followed by `-`, not whitespace, so it is not a token; an argument like
+/// `--label ngsm.exe` is not preceded by `\` or `/`, so it is not a token.
+fn image_path_contains_runner_token(image_path: &str) -> bool {
+    let lower = image_path.to_ascii_lowercase();
+    for needle in ["\\ngsm.exe", "/ngsm.exe", "\\nssm.exe", "/nssm.exe"] {
+        let mut offset = 0usize;
+        while let Some(idx) = lower[offset..].find(needle) {
+            let abs = offset + idx;
+            let end = abs + needle.len();
+            let next = lower[end..].chars().next();
+            if next.is_none_or(|c| c.is_whitespace()) {
+                return true;
+            }
+            offset = abs + 1;
         }
     }
+    false
 }
 
 /// Extract the executable's file name from an SCM image path.
@@ -340,6 +382,45 @@ mod tests {
         assert!(!def_with_image("C:\\app\\runner.exe --label ngsm.exe").is_managed());
         assert!(!def_with_image("C:\\Windows\\System32\\svchost.exe -k netsvcs").is_managed());
         assert!(!def_with_image("").is_managed());
+    }
+
+    #[test]
+    fn is_managed_for_unquoted_program_files_ngsm() {
+        // The classic unquoted-with-spaces case. Win32 itself resolves this
+        // by probing the filesystem; we use a token-boundary fallback.
+        assert!(def_with_image("C:\\Program Files\\NGSM\\ngsm.exe run-service Foo").is_managed());
+        // Trailing executable with no args still classifies as managed.
+        assert!(def_with_image("C:\\Program Files\\NGSM\\ngsm.exe").is_managed());
+        // Forward slashes work too.
+        assert!(def_with_image("C:/Program Files/NGSM/ngsm.exe run-service Foo").is_managed());
+        // Case-insensitive match.
+        assert!(def_with_image("C:\\Program Files\\NGSM\\NGSM.EXE run-service Foo").is_managed());
+    }
+
+    #[test]
+    fn is_managed_for_unquoted_program_files_nssm() {
+        assert!(def_with_image("C:\\Program Files\\NSSM\\nssm.exe run-service Foo").is_managed());
+        assert!(def_with_image("C:\\Program Files\\NSSM\\nssm.exe").is_managed());
+        assert!(def_with_image("C:\\Program Files\\NSSM\\NSSM.EXE run-service Foo").is_managed());
+    }
+
+    #[test]
+    fn is_managed_still_rejects_substring_in_dir_name() {
+        // Existing negative case must still hold: `nssm.exe` followed by `-`
+        // (not whitespace / end-of-string) is not a token boundary.
+        assert!(!def_with_image("C:\\nssm.exe-backup\\realservice.exe").is_managed());
+        // And followed by another path segment.
+        assert!(!def_with_image("C:\\ngsm.exe.dir\\real.exe").is_managed());
+    }
+
+    #[test]
+    fn is_managed_still_rejects_substring_in_args() {
+        // `ngsm.exe` appears in args, not preceded by `\` or `/`, so the
+        // token-boundary check rejects it (and the primary basename check
+        // already rejected `app.exe`).
+        assert!(!def_with_image("C:\\app.exe --label ngsm.exe").is_managed());
+        // Same shape with nssm.exe as a bare arg value.
+        assert!(!def_with_image("C:\\app.exe --runner nssm.exe").is_managed());
     }
 
     #[test]

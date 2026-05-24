@@ -14,6 +14,7 @@ mod data;
 mod elevation;
 pub mod event_log_reader;
 mod forms;
+mod metrics;
 mod recovery;
 
 slint::include_modules!();
