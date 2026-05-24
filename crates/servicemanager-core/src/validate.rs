@@ -99,6 +99,13 @@ pub fn validate_hook_component(name: &str, kind: &str) -> Result<()> {
 /// Drive-relative (`\foo`), drive-with-no-separator (`C:foo`), and any
 /// non-rooted path (`foo`, `..\foo`) are rejected.
 pub fn validate_absolute_path(field: &str, value: &str) -> Result<()> {
+    if value.chars().any(|c| c.is_control()) {
+        return Err(Error::InvalidConfig(format!(
+            "{field} contains a control character (e.g. NUL, tab, newline); \
+             these characters can truncate or corrupt the path as it crosses \
+             the registry / Win32 / process-spawn boundaries"
+        )));
+    }
     if !is_unambiguously_absolute_windows(value) {
         return Err(Error::InvalidConfig(format!(
             "{field} must be an absolute path (e.g. C:\\path or \\\\server\\share\\path), \
@@ -291,6 +298,33 @@ mod tests {
             msg.contains(r"\foo") || msg.contains("\\foo"),
             "missing the offending value in {msg:?}"
         );
+    }
+
+    #[test]
+    fn validate_absolute_path_rejects_embedded_nul() {
+        let err = validate_absolute_path("Application", "C:\\app\\\0svc.exe").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("control character"),
+            "expected control-character message, got {msg:?}"
+        );
+        assert!(
+            msg.contains("Application"),
+            "expected field name in {msg:?}"
+        );
+    }
+
+    #[test]
+    fn validate_absolute_path_rejects_tab_and_newline() {
+        assert!(validate_absolute_path("Application", "C:\\app\\foo\tbar.exe").is_err());
+        assert!(validate_absolute_path("Application", "C:\\app\\foo\nbar.exe").is_err());
+        assert!(validate_absolute_path("Application", "C:\\app\\foo\rbar.exe").is_err());
+    }
+
+    #[test]
+    fn validate_absolute_path_accepts_valid_drive_and_unc() {
+        assert!(validate_absolute_path("Application", "C:\\app.exe").is_ok());
+        assert!(validate_absolute_path("Application", "\\\\server\\share\\app.exe").is_ok());
     }
 
     #[test]
