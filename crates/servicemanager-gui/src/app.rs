@@ -365,6 +365,9 @@ fn wire_callbacks(window: &MainWindow) {
             // applying to a stale or replaced modal.
             st.active_modal_op = None;
             if let Some(win) = st.window.upgrade() {
+                clear_modal_fields(&win);
+                win.set_modal_service_name("".into());
+                win.set_modal_error("".into());
                 win.set_active_modal(0);
                 win.set_modal_busy(false);
             }
@@ -397,14 +400,21 @@ fn wire_callbacks(window: &MainWindow) {
             let form = forms::InstallForm {
                 name: win.get_modal_name().to_string(),
                 display_name: win.get_modal_display().to_string(),
+                description: win.get_modal_description().to_string(),
                 application: win.get_modal_application().to_string(),
                 app_parameters: win.get_modal_arguments().to_string(),
                 app_directory: win.get_modal_working_dir().to_string(),
                 stdout: win.get_modal_stdout().to_string(),
                 stderr: win.get_modal_stderr().to_string(),
+                account: win.get_modal_account().to_string(),
+                password: win.get_modal_password().to_string(),
                 start_type: int_to_start_type(win.get_modal_start_type()),
             };
-            match form.to_spec() {
+            let mut form = form;
+            let spec = form.to_spec();
+            form.clear_password();
+            clear_modal_password(&win);
+            match spec {
                 Ok(spec) => {
                     let token = st.next_modal_op.wrapping_add(1);
                     st.next_modal_op = token;
@@ -429,13 +439,19 @@ fn wire_callbacks(window: &MainWindow) {
                 return;
             };
             form.display_name = win.get_modal_display().to_string();
+            form.description = win.get_modal_description().to_string();
             form.application = win.get_modal_application().to_string();
             form.app_parameters = win.get_modal_arguments().to_string();
             form.app_directory = win.get_modal_working_dir().to_string();
             form.stdout = win.get_modal_stdout().to_string();
             form.stderr = win.get_modal_stderr().to_string();
+            form.account = win.get_modal_account().to_string();
+            form.password = win.get_modal_password().to_string();
             form.start_type = int_to_start_type(win.get_modal_start_type());
-            match form.to_spec() {
+            let spec = form.to_spec();
+            form.clear_password();
+            clear_modal_password(&win);
+            match spec {
                 Ok(spec) => {
                     let token = st.next_modal_op.wrapping_add(1);
                     st.next_modal_op = token;
@@ -459,6 +475,8 @@ fn wire_callbacks(window: &MainWindow) {
             let name = win.get_modal_service_name().to_string();
             win.set_status_text(format!("Removing '{name}'…").into());
             try_send_job(st, &win, Job::Remove(name));
+            clear_modal_fields(&win);
+            win.set_modal_service_name("".into());
             win.set_active_modal(0);
         });
     });
@@ -658,11 +676,14 @@ fn open_edit_modal(st: &mut AppState, win: &MainWindow, name: &str) {
     let form = forms::EditForm::from_definition(def);
     win.set_modal_service_name(form.name.clone().into());
     win.set_modal_display(form.display_name.clone().into());
+    win.set_modal_description(form.description.clone().into());
     win.set_modal_application(form.application.clone().into());
     win.set_modal_arguments(form.app_parameters.clone().into());
     win.set_modal_working_dir(form.app_directory.clone().into());
     win.set_modal_stdout(form.stdout.clone().into());
     win.set_modal_stderr(form.stderr.clone().into());
+    win.set_modal_account(form.account.clone().into());
+    win.set_modal_password("".into());
     win.set_modal_start_type(start_type_to_int(form.start_type));
     win.set_modal_error("".into());
     win.set_modal_busy(false);
@@ -673,11 +694,19 @@ fn open_edit_modal(st: &mut AppState, win: &MainWindow, name: &str) {
 fn clear_modal_fields(win: &MainWindow) {
     win.set_modal_name("".into());
     win.set_modal_display("".into());
+    win.set_modal_description("".into());
     win.set_modal_application("".into());
     win.set_modal_arguments("".into());
     win.set_modal_working_dir("".into());
     win.set_modal_stdout("".into());
     win.set_modal_stderr("".into());
+    win.set_modal_account("".into());
+    win.set_modal_start_type(0);
+    clear_modal_password(win);
+}
+
+fn clear_modal_password(win: &MainWindow) {
+    win.set_modal_password("".into());
 }
 
 fn int_to_start_type(v: i32) -> InstallStartType {
@@ -796,10 +825,13 @@ fn drain_results() {
                     if !should_apply_modal_result(st.active_modal_op, token) {
                         continue;
                     }
+                    clear_modal_password(&win);
                     match result {
                         Ok(msg) => {
                             st.active_modal_op = None;
                             win.set_modal_busy(false);
+                            clear_modal_fields(&win);
+                            win.set_modal_service_name("".into());
                             win.set_active_modal(0);
                             win.set_status_text(msg.into());
                             try_send_job(st, &win, Job::Refresh);
@@ -809,7 +841,7 @@ fn drain_results() {
                             // subsequent modal isn't matched against it.
                             st.active_modal_op = None;
                             win.set_modal_busy(false);
-                            win.set_modal_error(e.into());
+                            win.set_modal_error(e.to_string().into());
                         }
                     }
                 }
@@ -817,11 +849,14 @@ fn drain_results() {
                     if !should_apply_modal_result(st.active_modal_op, token) {
                         continue;
                     }
+                    clear_modal_password(&win);
                     match result {
                         Ok(msg) => {
                             st.active_modal_op = None;
                             win.set_modal_busy(false);
                             st.edit_form = None;
+                            clear_modal_fields(&win);
+                            win.set_modal_service_name("".into());
                             win.set_active_modal(0);
                             win.set_status_text(msg.into());
                             try_send_job(st, &win, Job::Refresh);
@@ -829,7 +864,10 @@ fn drain_results() {
                         Err(e) => {
                             st.active_modal_op = None;
                             win.set_modal_busy(false);
-                            win.set_modal_error(e.into());
+                            if let Some(form) = st.edit_form.as_mut() {
+                                form.clear_password();
+                            }
+                            win.set_modal_error(e.to_string().into());
                         }
                     }
                 }

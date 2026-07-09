@@ -1,7 +1,7 @@
 use servicemanager_core::ServiceDefinition;
 use servicemanager_win32::{query_service, remove_service};
 
-use crate::error::OpResult;
+use crate::error::{message_error, OpResult};
 
 /// Remove an NGSM-managed (or, with `force_native`, any) Windows service.
 ///
@@ -26,7 +26,7 @@ use crate::error::OpResult;
 pub fn remove(name: &str, force_native: bool, purge_managed_config: bool) -> OpResult {
     // Query once; we need both the SCM state (for the stopped check) and the
     // managed config (for the ownership check, when force_native is false).
-    let native = query_service(name).map_err(|e| e.to_string())?;
+    let native = query_service(name)?;
 
     if !force_native {
         // Fail closed: an unreadable managed config means ownership cannot be
@@ -34,10 +34,10 @@ pub fn remove(name: &str, force_native: bool, purge_managed_config: bool) -> OpR
         let managed = match servicemanager_registry::read_managed_config(name) {
             Ok(m) => m,
             Err(e) => {
-                return Err(format!(
+                return Err(message_error(format!(
                     "'{name}': managed ownership cannot be determined — its managed config \
                      is unreadable ({e}); refusing to remove it"
-                ));
+                )));
             }
         };
         let def = ServiceDefinition {
@@ -46,9 +46,9 @@ pub fn remove(name: &str, force_native: bool, purge_managed_config: bool) -> OpR
             runtime: native.runtime.clone(),
         };
         if !def.is_managed() {
-            return Err(format!(
+            return Err(message_error(format!(
                 "'{name}' is not an NGSM-managed service — refusing to remove it"
-            ));
+            )));
         }
     }
 
@@ -63,18 +63,21 @@ pub fn remove(name: &str, force_native: bool, purge_managed_config: bool) -> OpR
         Some(ServiceState::Stopped) | None
     );
     if !stopped {
-        return Err(format!(
+        return Err(message_error(format!(
             "'{name}' is not stopped — stop it before removing it"
-        ));
+        )));
     }
 
     // Remove the SCM service first: if that fails the service keeps its
     // managed config and the caller can retry. Only then scrub the registry,
     // and surface a cleanup failure instead of silently dropping it.
-    remove_service(name).map_err(|e| e.to_string())?;
+    remove_service(name)?;
     if purge_managed_config && is_managed_for_purge(name) {
-        servicemanager_registry::delete_managed_config(name)
-            .map_err(|e| format!("service removed, but managed config cleanup failed: {e}"))?;
+        servicemanager_registry::delete_managed_config(name).map_err(|e| {
+            message_error(format!(
+                "service removed, but managed config cleanup failed: {e}"
+            ))
+        })?;
     }
     Ok(format!("Removed '{name}'."))
 }

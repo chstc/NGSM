@@ -2,6 +2,70 @@
 
 All notable changes to NGSM. Versions follow `vMAJOR.MINOR.PATCH`; categories follow [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased] — 2026-07-09
+
+End-to-end hardening and compatibility pass across the CLI, GUI, broker,
+shared ops layer, Win32 wrappers, supervisor event log, and documentation.
+
+### Added
+
+- Added native SCM description, dependency, service account, and
+  password update support through the shared ops layer. CLI passwords are
+  accepted only via `--password-stdin`; broker requests reject password
+  payloads; GUI password entry is masked and cleared after submit/cancel
+  and worker results.
+- Added `ngsm reset <service> <param>` as the NSSM-compatible alias for
+  deleting a managed registry value and falling back to defaults.
+- Added `ngsm statuscode <service>`, which prints the raw `SERVICE_*`
+  state string and exits with the SCM state code.
+- Added `ngsm repair <service>` and broker `repair_runner` to safely
+  rebind a managed service to the ACL-validated
+  `ngsm.exe run-service <name>` image path and restore `Win32OwnProcess`
+  without exposing raw `ImagePath` or service-type editing.
+- Added broker install/edit support for dependencies/account fields and
+  install support for shared hook/rotation configuration.
+- Added ACL-based runner-location validation, in addition to the existing
+  user-writable path heuristics, to reject unsafe owners or writable ACLs.
+
+### Changed
+
+- Moved install hook/rotation support into shared `servicemanager-ops`
+  validation and install specs so CLI and broker use the same path.
+- Changed `servicemanager-ops` errors from string-only results to
+  structured core errors, with stringification kept at CLI/GUI/broker
+  boundaries.
+- Split CLI hook parsing into a focused module.
+- Updated direct `windows` crate usage to `0.62.2`, deduping the direct
+  Windows API dependency with Slint's stack.
+- Removed unused `thiserror` dependencies from broker, registry, and
+  win32 crates.
+
+### Fixed
+
+- Serialized supervisor event-log append/rotation cycles and test
+  program-data isolation to make concurrent event logging deterministic.
+- Fixed GUI Recovery validation to accept negative exit codes, matching
+  ops and registry behavior.
+- Fixed GUI Recent Events ordering to sort by parsed RFC 3339 instants
+  instead of raw timestamp strings, handling fractional seconds and
+  non-UTC offsets correctly.
+- Hardened dependency validation: service dependencies now align with
+  service-name validation, group dependencies have explicit safe-name
+  rules, and dependency errors avoid echoing supplied values.
+- Moved no-op edit rejection into shared ops/EditSpec handling so CLI,
+  GUI, and broker cannot report a successful edit when no fields changed.
+- Redacted password-bearing `Debug` output for ops specs and Win32
+  install options.
+- Hardened `test-broker.ps1` to feed the capability token through
+  redirected stdin without persisting it in a temporary file.
+
+### Documentation
+
+- Updated README, SECURITY, and architecture/build documentation for the
+  new command surface, GUI account/password behavior, broker protocol,
+  repair/rebind policy, MSRV, release provenance, install location
+  guidance, and secret-handling guarantees.
+
 ## [v0.3.2] — 2026-05-23
 
 Second code-review remediation cycle on top of v0.3.1. 15 findings addressed

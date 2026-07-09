@@ -27,8 +27,9 @@ pub mod windows_close;
 pub use console_ctrl::{ensure_console, send_ctrl_break};
 #[cfg(windows)]
 pub use control::{
-    build_run_service_command, control_service, install_service, remove_service, start_service,
-    update_native_config, InstallOptions, InstallStartType, ServiceControlSignal,
+    build_run_service_command, control_service, install_service, remove_service,
+    repair_service_runner, start_service, update_native_config, validate_runner_acl_chain,
+    InstallOptions, InstallStartType, ServiceControlSignal, ServiceDependencies,
     SERVICE_CONTROL_ROTATE,
 };
 #[cfg(windows)]

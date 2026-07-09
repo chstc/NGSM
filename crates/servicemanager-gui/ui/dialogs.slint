@@ -41,6 +41,39 @@ component Field inherits Rectangle {
     }
 }
 
+component PasswordField inherits Rectangle {
+    in property <string> label;
+    in-out property <string> text;
+    height: 54px;
+    VerticalLayout {
+        spacing: 5px;
+        Text {
+            text: root.label;
+            color: Theme.text-dim;
+            font-size: 12px;
+        }
+        Rectangle {
+            height: 32px;
+            border-radius: Theme.radius-sm;
+            border-width: 1px;
+            border-color: ti.has-focus ? Theme.cyan : Theme.card-border;
+            background: Theme.bg;
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                ti := TextInput {
+                    text <=> root.text;
+                    color: Theme.text;
+                    font-size: 13px;
+                    input-type: InputType.password;
+                    single-line: true;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}
+
 // A read-only labelled value.
 component ReadField inherits Rectangle {
     in property <string> label;
@@ -118,11 +151,14 @@ component ErrorText inherits Text {
 export component InstallDialog inherits Rectangle {
     in-out property <string> name;
     in-out property <string> display-name;
+    in-out property <string> description;
     in-out property <string> application;
     in-out property <string> arguments;
     in-out property <string> working-dir;
     in-out property <string> stdout-path;
     in-out property <string> stderr-path;
+    in-out property <string> account;
+    in-out property <string> password;
     in-out property <int> start-type;
     in property <string> error;
     in property <bool> busy;
@@ -154,6 +190,7 @@ export component InstallDialog inherits Rectangle {
                     spacing: 8px;
                     Field { label: "Service name"; text <=> root.name; }
                     Field { label: "Display name"; text <=> root.display-name; }
+                    Field { label: "Description"; text <=> root.description; }
                     Field { label: "Application"; text <=> root.application; }
                     HorizontalLayout {
                         alignment: start;
@@ -163,6 +200,8 @@ export component InstallDialog inherits Rectangle {
                     Field { label: "Working directory"; text <=> root.working-dir; }
                     Field { label: "stdout log"; text <=> root.stdout-path; }
                     Field { label: "stderr log"; text <=> root.stderr-path; }
+                    Field { label: "Service account (optional)"; text <=> root.account; }
+                    PasswordField { label: "Password (optional)"; text <=> root.password; }
                     StartTypePick { value <=> root.start-type; }
                 }
             }
@@ -182,11 +221,14 @@ export component InstallDialog inherits Rectangle {
 export component EditDialog inherits Rectangle {
     in property <string> service-name;
     in-out property <string> display-name;
+    in-out property <string> description;
     in-out property <string> application;
     in-out property <string> arguments;
     in-out property <string> working-dir;
     in-out property <string> stdout-path;
     in-out property <string> stderr-path;
+    in-out property <string> account;
+    in-out property <string> password;
     in-out property <int> start-type;
     in property <string> error;
     in property <bool> busy;
@@ -218,6 +260,7 @@ export component EditDialog inherits Rectangle {
                     spacing: 8px;
                     ReadField { label: "Service name"; value: root.service-name; }
                     Field { label: "Display name"; text <=> root.display-name; }
+                    Field { label: "Description"; text <=> root.description; }
                     Field { label: "Application"; text <=> root.application; }
                     HorizontalLayout {
                         alignment: start;
@@ -227,9 +270,11 @@ export component EditDialog inherits Rectangle {
                     Field { label: "Working directory"; text <=> root.working-dir; }
                     Field { label: "stdout log"; text <=> root.stdout-path; }
                     Field { label: "stderr log"; text <=> root.stderr-path; }
+                    Field { label: "Service account"; text <=> root.account; }
+                    PasswordField { label: "New password (blank = unchanged)"; text <=> root.password; }
                     StartTypePick { value <=> root.start-type; }
                     Text {
-                        text: "Only fields you change are written.";
+                        text: "Only fields you change are written. Password text is cleared after submit.";
                         color: Theme.text-faint;
                         font-size: 12px;
                     }

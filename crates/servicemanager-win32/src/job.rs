@@ -7,8 +7,8 @@ use std::mem::size_of;
 use std::os::windows::io::{AsRawHandle, RawHandle};
 
 use servicemanager_core::{Error, Result};
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE};
+use windows::core::{BOOL, PCWSTR};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
@@ -99,7 +99,7 @@ impl JobObject {
         // SAFETY: `handle` is the live process handle just opened; `self.0`
         // is the live job handle owned by this type; `in_job` is a valid
         // out-pointer.
-        let result = unsafe { IsProcessInJob(handle, self.0, &mut in_job) };
+        let result = unsafe { IsProcessInJob(handle, Some(self.0), &mut in_job) };
         // SAFETY: closing the process handle opened above, exactly once.
         unsafe {
             let _ = CloseHandle(handle);

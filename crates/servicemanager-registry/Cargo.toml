@@ -10,7 +10,6 @@ publish = false
 
 [dependencies]
 servicemanager-core = { workspace = true }
-thiserror = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }

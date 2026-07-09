@@ -2,9 +2,9 @@
 //! and broker to eliminate verbatim duplication (M-02).
 //!
 //! Every public function returns [`OpResult`] — `Ok(message)` is a
-//! human-readable success status; `Err(message)` is a failure message.
-//! Callers format these strings for their own UI (CLI stdout, GUI status bar,
-//! broker JSON value).
+//! human-readable success status; `Err(error)` is a structured core error.
+//! Callers convert errors to display strings at their own UI or wire boundary
+//! (CLI stderr/stdout, GUI status bar, broker JSON value).
 //!
 //! # Crate layout
 //!
@@ -17,6 +17,7 @@
 //! | `install` | [`install`] + rollback |
 //! | `edit` | [`edit`] |
 //! | `remove` | [`remove`] (with stopped check + `force_native` option) |
+//! | `repair` | [`repair_runner`] (safe NGSM runner ImagePath/type rebind) |
 //! | `lifecycle` | [`start`], [`stop`], [`pause`], [`continue_service`], [`restart`] |
 //! | `rotate` | [`rotate`] (with online-rotation preflight) |
 //! | `recovery` | [`read_recovery`], [`save_recovery`] |
@@ -30,6 +31,7 @@ pub mod lifecycle;
 pub mod list;
 pub mod recovery;
 pub mod remove;
+pub mod repair;
 pub mod rotate;
 pub mod specs;
 pub mod validate;
@@ -44,5 +46,6 @@ pub use lifecycle::{continue_service, pause, restart, start, stop};
 pub use list::list_services;
 pub use recovery::{read_recovery, save_recovery, validate_exit_action_key};
 pub use remove::remove;
+pub use repair::repair_runner;
 pub use rotate::rotate;
 pub use validate::validate_managed_config;

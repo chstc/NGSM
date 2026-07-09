@@ -87,7 +87,7 @@ impl RecoveryForm {
             if code.is_empty() {
                 continue;
             }
-            if code.parse::<u32>().is_err() {
+            if code.parse::<i32>().is_err() {
                 return Err(format!("Exit code '{code}' is not a valid number."));
             }
             if exit_actions.contains_key(code) {
@@ -308,6 +308,20 @@ mod tests {
         assert_eq!(spec.exit_actions.len(), 2);
         assert_eq!(spec.exit_actions.get("1"), Some(&ExitAction::Restart));
         assert_eq!(spec.exit_actions.get("2"), Some(&ExitAction::Exit));
+    }
+
+    #[test]
+    fn to_spec_accepts_negative_exit_codes() {
+        let form = RecoveryForm {
+            service: "DemoA".into(),
+            rows: vec![RecoveryExitRow {
+                exit_code: "-1".into(),
+                action: 1, // Ignore
+            }],
+            ..Default::default()
+        };
+        let spec = form.to_spec().expect("negative codes should validate");
+        assert_eq!(spec.exit_actions.get("-1"), Some(&ExitAction::Ignore));
     }
 
     #[test]

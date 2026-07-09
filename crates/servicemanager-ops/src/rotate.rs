@@ -1,6 +1,6 @@
 use servicemanager_win32::{control_service, ServiceControlSignal, SERVICE_CONTROL_ROTATE};
 
-use crate::error::OpResult;
+use crate::error::{message_error, OpResult};
 
 /// Request an online log rotation for a managed service.
 ///
@@ -12,17 +12,20 @@ use crate::error::OpResult;
 /// Re-reads the managed config rather than trusting a potentially-stale caller
 /// snapshot, matching the preflight logic in the GUI, CLI, and broker.
 pub fn rotate(name: &str) -> OpResult {
-    match servicemanager_registry::read_managed_config(name).map_err(|e| e.to_string())? {
+    match servicemanager_registry::read_managed_config(name)? {
         Some(cfg) if cfg.has_online_rotation() => {}
         Some(_) => {
-            return Err(format!(
+            return Err(message_error(format!(
                 "'{name}' does not use online log rotation — its logs rotate on restart, \
                  not on demand"
-            ))
+            )))
         }
-        None => return Err(format!("'{name}' is not an NGSM-managed service")),
+        None => {
+            return Err(message_error(format!(
+                "'{name}' is not an NGSM-managed service"
+            )))
+        }
     }
-    control_service(name, ServiceControlSignal::User(SERVICE_CONTROL_ROTATE))
-        .map_err(|e| e.to_string())?;
+    control_service(name, ServiceControlSignal::User(SERVICE_CONTROL_ROTATE))?;
     Ok(format!("Rotate requested for '{name}'."))
 }

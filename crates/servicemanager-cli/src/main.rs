@@ -1,18 +1,20 @@
 use std::collections::BTreeMap;
+use std::io::{self, BufRead};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use servicemanager_core::{
-    ExitAction, HookConfig, IoRedirectionConfig, IoStream, LogRotationConfig,
-    ManagedApplicationConfig, ManagementKind, Result, ServiceDefinition,
+    ExitAction, LogRotationConfig, ManagementKind, Result, ServiceDefinition, ServiceState,
 };
 use servicemanager_ops::{EditSpec, InstallSpec, RecoverySpec};
 use servicemanager_win32::{
-    build_run_service_command, control_service, enumerate_descendants, install_service,
-    query_service, remove_service, start_service, update_native_config, InstallOptions,
-    InstallStartType, ServiceControlSignal,
+    control_service, enumerate_descendants, query_service, start_service, update_native_config,
+    InstallStartType, ServiceControlSignal, ServiceDependencies,
 };
+
+mod hooks;
+use hooks::parse_hook_spec;
 
 // NGSM is a Windows service manager: it drives the Windows SCM and registry
 // and has no meaning on other platforms. The build is intentionally
@@ -137,8 +139,26 @@ enum Command {
         /// NSSM value name to delete.
         param: String,
     },
+    /// Reset a single NSSM-compatible parameter value to its default.
+    Reset {
+        /// Service name.
+        name: String,
+        /// NSSM value name to reset.
+        param: String,
+    },
+    /// Print the service state and exit with the raw SCM state code.
+    #[command(name = "statuscode")]
+    StatusCode {
+        /// Service name.
+        name: String,
+    },
     /// Edit an installed service. Only the supplied fields are changed.
     Edit(EditArgs),
+    /// Repair a managed service's NGSM runner ImagePath and service type.
+    Repair {
+        /// Service name.
+        name: String,
+    },
     /// Force the supervisor to rotate the service's logs now. Requires the
     /// service to be running.
     Rotate {
@@ -199,9 +219,30 @@ struct EditArgs {
     /// Replace the SCM display name.
     #[arg(long)]
     display: Option<String>,
+    /// Replace the SCM description. Pass an empty string to clear it.
+    #[arg(long)]
+    description: Option<String>,
     /// Replace the SCM start type.
     #[arg(long, value_enum)]
     start: Option<StartTypeArg>,
+    /// Replace SCM service dependencies with the supplied service name. May be repeated.
+    #[arg(long = "depend-service")]
+    depend_service: Vec<String>,
+    /// Replace SCM service dependencies with the supplied load-order group. May be repeated.
+    #[arg(long = "depend-group")]
+    depend_group: Vec<String>,
+    /// Clear all SCM dependencies.
+    #[arg(
+        long = "clear-dependencies",
+        conflicts_with_all = ["depend_service", "depend_group"]
+    )]
+    clear_dependencies: bool,
+    /// Replace the SCM service account.
+    #[arg(long)]
+    account: Option<String>,
+    /// Read the service account password from one stdin line.
+    #[arg(long)]
+    password_stdin: bool,
     /// Replace the stdout log path.
     #[arg(long)]
     stdout: Option<String>,
@@ -230,9 +271,24 @@ struct InstallArgs {
     /// Display name shown in services.msc.
     #[arg(long)]
     display: Option<String>,
+    /// Description shown in services.msc.
+    #[arg(long)]
+    description: Option<String>,
     /// SCM start type.
     #[arg(long, value_enum, default_value_t = StartTypeArg::Manual)]
     start: StartTypeArg,
+    /// Add a service dependency by service name. May be repeated.
+    #[arg(long = "depend-service")]
+    depend_service: Vec<String>,
+    /// Add a load-order group dependency. May be repeated.
+    #[arg(long = "depend-group")]
+    depend_group: Vec<String>,
+    /// SCM service account.
+    #[arg(long)]
+    account: Option<String>,
+    /// Read the service account password from one stdin line.
+    #[arg(long)]
+    password_stdin: bool,
     /// File path to receive the child's stdout.
     #[arg(long)]
     stdout: Option<String>,
@@ -393,6 +449,9 @@ fn main() -> ExitCode {
     }
 
     let cli = Cli::parse();
+    if let Some(Command::StatusCode { name }) = &cli.command {
+        return cmd_statuscode_exit(name, cli.json);
+    }
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -476,7 +535,13 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Get { name, param } => cmd_get(name, param, cli.json),
         Command::Set { name, param, value } => cmd_set(name, param, value, cli.json),
         Command::Unset { name, param } => cmd_unset(name, param, cli.json),
+        Command::Reset { name, param } => cmd_reset(name, param, cli.json),
+        Command::StatusCode { name } => {
+            let _ = cmd_statuscode_exit(name, cli.json);
+            Ok(())
+        }
         Command::Edit(args) => cmd_edit(args, cli.json),
+        Command::Repair { name } => cmd_repair(name, cli.json),
         Command::Rotate { name } => cmd_rotate(name, cli.json),
         Command::Recovery(args) => cmd_recovery(args, cli.json),
         Command::Processes { name } => cmd_processes(name, cli.json),
@@ -636,121 +701,123 @@ pub(crate) fn validate_install_args(args: &InstallArgs) -> Result<()> {
                 .into(),
         ));
     }
+    dependencies_from_cli(&args.depend_service, &args.depend_group)?;
+    validate_password_stdin_usage(args.account.as_deref(), args.password_stdin)?;
     Ok(())
+}
+
+fn dependencies_from_cli(services: &[String], groups: &[String]) -> Result<ServiceDependencies> {
+    let dependencies = ServiceDependencies {
+        services: services.to_vec(),
+        groups: groups.to_vec(),
+    };
+    dependencies.validate()?;
+    Ok(dependencies)
+}
+
+fn edit_dependencies_from_cli(args: &EditArgs) -> Result<Option<ServiceDependencies>> {
+    if args.clear_dependencies {
+        return Ok(Some(ServiceDependencies::default()));
+    }
+    if args.depend_service.is_empty() && args.depend_group.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(dependencies_from_cli(
+        &args.depend_service,
+        &args.depend_group,
+    )?))
+}
+
+fn validate_password_stdin_usage(account: Option<&str>, password_stdin: bool) -> Result<()> {
+    if password_stdin && account.is_none() {
+        return Err(servicemanager_core::Error::InvalidConfig(
+            "--password-stdin requires --account".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_password_stdin_line() -> Result<String> {
+    let mut line = String::new();
+    let bytes = io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| servicemanager_core::Error::other(format!("read password from stdin: {e}")))?;
+    if bytes == 0 {
+        return Err(servicemanager_core::Error::InvalidConfig(
+            "--password-stdin was specified but stdin did not provide a line".into(),
+        ));
+    }
+    if line.ends_with('\n') {
+        line.pop();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+    }
+    if line.contains('\0') {
+        return Err(servicemanager_core::Error::InvalidConfig(
+            "password read from stdin contains an embedded NUL".into(),
+        ));
+    }
+    Ok(line)
 }
 
 fn cmd_install(args: &InstallArgs, json: bool) -> Result<()> {
     // Reject rotation flags without a redirected log stream before any
     // SCM / registry side effect.
     validate_install_args(args)?;
+    let dependencies = dependencies_from_cli(&args.depend_service, &args.depend_group)?;
 
-    let has_hooks = !args.hook.is_empty();
-    let has_rotation = install_args_have_rotation(args);
-
-    if has_hooks || has_rotation {
-        // ops::install does not yet carry hooks or rotation in InstallSpec.
-        // Fall back to the full local path for these CLI-only extended options.
-        cmd_install_extended(args, json)
-    } else {
-        let spec = InstallSpec {
-            name: args.name.clone(),
-            display_name: args.display.clone(),
-            application: args.application.clone(),
-            app_parameters: args.app_parameters.clone(),
-            app_directory: args.app_directory.clone(),
-            stdout: args.stdout.clone(),
-            stderr: args.stderr.clone(),
-            start_type: args.start.into(),
-        };
-        let msg = servicemanager_ops::install(spec).map_err(servicemanager_core::Error::other)?;
-        if json {
-            println!("{}", serde_json::json!({ "installed": args.name }));
-        } else {
-            println!("{msg}");
-        }
-        Ok(())
-    }
-}
-
-/// Full local install path used when hook or rotation options are present
-/// (features not yet supported in [`servicemanager_ops::InstallSpec`]).
-fn cmd_install_extended(args: &InstallArgs, json: bool) -> Result<()> {
-    if args.application.trim().is_empty() {
-        return Err(servicemanager_core::Error::InvalidConfig(
-            "application path is required".into(),
-        ));
-    }
-
-    // Build (and validate) the complete managed config *before* creating the
-    // SCM service, so a bad hook spec or argument fails without leaving an
-    // orphaned, unconfigured service behind.
-    let mut managed = ManagedApplicationConfig {
-        application: Some(args.application.clone()),
-        app_parameters: args.app_parameters.clone(),
-        app_directory: args.app_directory.clone(),
-        io: IoRedirectionConfig {
-            stdin: None,
-            stdout: args.stdout.clone().map(cli_io_stream),
-            stderr: args.stderr.clone().map(cli_io_stream),
-            timestamp_log: None,
-        },
-        ..Default::default()
-    };
-    if install_args_have_rotation(args) {
-        managed.rotation = LogRotationConfig {
+    let rotation = if install_args_have_rotation(args) {
+        LogRotationConfig {
             enabled: Some(true),
             online: Some(args.rotate_online.as_nssm_value()),
             seconds: args.rotate_seconds,
             bytes: args.rotate_bytes,
             delay_ms: None,
-        };
-    }
-    for raw in &args.hook {
-        managed.hooks.push(parse_hook_spec(raw)?);
-    }
+        }
+    } else {
+        LogRotationConfig::default()
+    };
+    let hooks = args
+        .hook
+        .iter()
+        .map(|raw| parse_hook_spec(raw))
+        .collect::<Result<Vec<_>>>()?;
+    let password = if args.password_stdin {
+        Some(read_password_stdin_line()?)
+    } else {
+        None
+    };
 
-    // Pre-validate the full config *before* creating the SCM service. A
-    // doomed config (e.g. relative AppDirectory, non-numeric exit-action
-    // key) would otherwise create the SCM service first and then fail at
-    // registry-write time, leaving an orphan if rollback also failed.
-    // Mirrors what `servicemanager_ops::install` does for the simple path.
-    servicemanager_ops::validate_managed_config(&managed)
-        .map_err(servicemanager_core::Error::InvalidConfig)?;
-
-    let binary_path = build_run_service_command(&args.name)?;
-    let display = args.display.clone().unwrap_or_else(|| args.name.clone());
-
-    install_service(&InstallOptions {
+    let spec = InstallSpec {
         name: args.name.clone(),
-        display_name: display,
-        binary_path,
+        display_name: args.display.clone(),
+        description: args.description.clone(),
+        application: args.application.clone(),
+        app_parameters: args.app_parameters.clone(),
+        app_directory: args.app_directory.clone(),
+        stdout: args.stdout.clone(),
+        stderr: args.stderr.clone(),
+        rotation,
+        hooks,
         start_type: args.start.into(),
-    })?;
+        dependencies,
+        account: args.account.clone(),
+        password,
+    };
 
-    // Roll the SCM service back if the managed config write fails — otherwise
-    // the service exists but the runner has nothing to run.
-    if let Err(e) = servicemanager_registry::create_managed_config(&args.name, &managed) {
-        return Err(match remove_service(&args.name) {
-            Ok(()) => servicemanager_core::Error::other(format!(
-                "install failed, service rolled back: {e}"
-            )),
-            Err(re) => servicemanager_core::Error::other(format!(
-                "install failed ({e}); rollback also failed ({re})"
-            )),
-        });
-    }
-
+    let msg = servicemanager_ops::install(spec)?;
     if json {
         println!("{}", serde_json::json!({ "installed": args.name }));
     } else {
-        println!("Installed service '{}'.", args.name);
+        println!("{msg}");
     }
     Ok(())
 }
 
 fn cmd_remove(name: &str, purge_config: bool, force_native: bool, json: bool) -> Result<()> {
-    let msg = servicemanager_ops::remove(name, force_native, purge_config)
-        .map_err(servicemanager_core::Error::other)?;
+    let msg = servicemanager_ops::remove(name, force_native, purge_config)?;
     if json {
         println!("{}", serde_json::json!({ "removed": name }));
     } else {
@@ -818,7 +885,7 @@ fn cmd_control(name: &str, action: ServiceAction, force_native: bool, json: bool
         ServiceAction::Pause => (servicemanager_ops::pause(name), "paused"),
         ServiceAction::Continue => (servicemanager_ops::continue_service(name), "continued"),
     };
-    let msg = msg.map_err(servicemanager_core::Error::other)?;
+    let msg = msg?;
 
     if json {
         println!("{}", serde_json::json!({ json_key: name }));
@@ -833,8 +900,7 @@ fn cmd_restart(name: &str, timeout_ms: u32, force_native: bool, json: bool) -> R
         // Bypass the NGSM-managed check — run the restart loop locally.
         cmd_restart_force_native(name, timeout_ms, json)
     } else {
-        let msg = servicemanager_ops::restart(name, timeout_ms as u64)
-            .map_err(servicemanager_core::Error::other)?;
+        let msg = servicemanager_ops::restart(name, timeout_ms as u64)?;
         if json {
             println!("{}", serde_json::json!({ "restarted": name }));
         } else {
@@ -948,12 +1014,91 @@ fn cmd_unset(name: &str, param: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn cmd_reset(name: &str, param: &str, json: bool) -> Result<()> {
+    servicemanager_registry::unset_value(name, param)?;
+    if json {
+        println!("{}", serde_json::json!({ "service": name, "reset": param }));
+    } else {
+        println!("Reset {param} on '{name}'.");
+    }
+    Ok(())
+}
+
+fn cmd_statuscode_exit(name: &str, json: bool) -> ExitCode {
+    match query_service(name) {
+        Ok(native) => {
+            let state = native
+                .runtime
+                .as_ref()
+                .map(|r| r.state)
+                .unwrap_or(ServiceState::Unknown);
+            let code = statuscode_exit_code(state);
+            let text = statuscode_state_text(state);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "service": name,
+                        "state": text,
+                        "code": code,
+                    })
+                );
+            } else {
+                println!("{text}");
+            }
+            ExitCode::from(code)
+        }
+        Err(e) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "service": name,
+                        "state": "SERVICE_UNKNOWN",
+                        "code": 0,
+                        "error": e.to_string(),
+                    })
+                );
+            } else {
+                eprintln!("error: {e}");
+            }
+            ExitCode::from(0)
+        }
+    }
+}
+
+fn statuscode_exit_code(state: ServiceState) -> u8 {
+    match state {
+        ServiceState::Stopped => 1,
+        ServiceState::StartPending => 2,
+        ServiceState::StopPending => 3,
+        ServiceState::Running => 4,
+        ServiceState::ContinuePending => 5,
+        ServiceState::PausePending => 6,
+        ServiceState::Paused => 7,
+        ServiceState::Unknown => 0,
+    }
+}
+
+fn statuscode_state_text(state: ServiceState) -> &'static str {
+    match state {
+        ServiceState::Stopped => "SERVICE_STOPPED",
+        ServiceState::StartPending => "SERVICE_START_PENDING",
+        ServiceState::StopPending => "SERVICE_STOP_PENDING",
+        ServiceState::Running => "SERVICE_RUNNING",
+        ServiceState::ContinuePending => "SERVICE_CONTINUE_PENDING",
+        ServiceState::PausePending => "SERVICE_PAUSE_PENDING",
+        ServiceState::Paused => "SERVICE_PAUSED",
+        ServiceState::Unknown => "SERVICE_UNKNOWN",
+    }
+}
+
 /// Reject `ngsm edit <name>` invocations that supply no editable fields.
 ///
-/// All of `EditArgs`'s value-bearing fields are `Option`, so it is parseable
-/// with only the service name — but then `ops::edit` reads the config, has
-/// nothing to change, and the CLI prints `Edited '<name>'.` That is
-/// indistinguishable from a real edit and misleads operators in scripts.
+/// `EditArgs` is parseable with only the service name — but then `ops::edit`
+/// reads the config, has nothing to change, and the CLI prints
+/// `Edited '<name>'.` That is indistinguishable from a real edit and misleads
+/// operators in scripts.
 ///
 /// `force_native` is intentionally excluded: on its own it changes nothing
 /// (it only relaxes a guard on the other flags).
@@ -962,7 +1107,13 @@ fn validate_edit_args(args: &EditArgs) -> Result<()> {
         && args.app_parameters.is_none()
         && args.app_directory.is_none()
         && args.display.is_none()
+        && args.description.is_none()
         && args.start.is_none()
+        && args.depend_service.is_empty()
+        && args.depend_group.is_empty()
+        && !args.clear_dependencies
+        && args.account.is_none()
+        && !args.password_stdin
         && args.stdout.is_none()
         && args.stderr.is_none();
     if nothing_to_change {
@@ -970,6 +1121,8 @@ fn validate_edit_args(args: &EditArgs) -> Result<()> {
             "no edit fields specified; try `ngsm edit --help` to see editable fields".into(),
         ));
     }
+    edit_dependencies_from_cli(args)?;
+    validate_password_stdin_usage(args.account.as_deref(), args.password_stdin)?;
     Ok(())
 }
 
@@ -980,7 +1133,13 @@ fn cmd_edit(args: &EditArgs, json: bool) -> Result<()> {
     // something.
     validate_edit_args(args)?;
 
-    let want_native = args.display.is_some() || args.start.is_some();
+    let dependencies = edit_dependencies_from_cli(args)?;
+    let want_native = args.display.is_some()
+        || args.description.is_some()
+        || args.start.is_some()
+        || dependencies.is_some()
+        || args.account.is_some()
+        || args.password_stdin;
 
     // Refuse to mix --force-native (which targets only native SCM metadata)
     // with managed-field flags. The operator's intent is ambiguous: a partial
@@ -1007,10 +1166,19 @@ fn cmd_edit(args: &EditArgs, json: bool) -> Result<()> {
     // ops::edit is not usable (it always enforces NGSM-managed ownership).
     // Fall through to the direct SCM call for that narrow case.
     if args.force_native && want_native {
+        let password = if args.password_stdin {
+            Some(read_password_stdin_line()?)
+        } else {
+            None
+        };
         update_native_config(
             &args.name,
             args.display.as_deref(),
+            args.description.as_deref(),
             args.start.map(Into::into),
+            dependencies.as_ref(),
+            args.account.as_deref(),
+            password.as_deref(),
         )?;
         if json {
             println!("{}", serde_json::json!({ "edited": args.name }));
@@ -1021,17 +1189,26 @@ fn cmd_edit(args: &EditArgs, json: bool) -> Result<()> {
     }
 
     // Delegate to ops — enforces NGSM-managed ownership internally.
+    let password = if args.password_stdin {
+        Some(read_password_stdin_line()?)
+    } else {
+        None
+    };
     let spec = EditSpec {
         name: args.name.clone(),
         display_name: args.display.clone(),
+        description: args.description.clone(),
         application: args.application.clone(),
         app_parameters: args.app_parameters.clone(),
         app_directory: args.app_directory.clone(),
         stdout: args.stdout.clone(),
         stderr: args.stderr.clone(),
         start_type: args.start.map(Into::into),
+        dependencies,
+        account: args.account.clone(),
+        password,
     };
-    let msg = servicemanager_ops::edit(spec).map_err(servicemanager_core::Error::other)?;
+    let msg = servicemanager_ops::edit(spec)?;
     if json {
         println!("{}", serde_json::json!({ "edited": args.name }));
     } else {
@@ -1040,8 +1217,21 @@ fn cmd_edit(args: &EditArgs, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn cmd_repair(name: &str, json: bool) -> Result<()> {
+    let msg = servicemanager_ops::repair_runner(name)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "repaired": name, "runner": true })
+        );
+    } else {
+        println!("{msg}");
+    }
+    Ok(())
+}
+
 fn cmd_rotate(name: &str, json: bool) -> Result<()> {
-    let msg = servicemanager_ops::rotate(name).map_err(servicemanager_core::Error::other)?;
+    let msg = servicemanager_ops::rotate(name)?;
     if json {
         let state = query_service(name)
             .ok()
@@ -1069,8 +1259,7 @@ fn cmd_recovery(args: &RecoveryArgs, global_json: bool) -> Result<()> {
 }
 
 fn cmd_recovery_show(name: &str, json: bool) -> Result<()> {
-    let spec =
-        servicemanager_ops::read_recovery(name).map_err(servicemanager_core::Error::other)?;
+    let spec = servicemanager_ops::read_recovery(name)?;
     if json {
         let exit_map: BTreeMap<&str, String> = spec
             .exit_actions
@@ -1114,10 +1303,9 @@ fn cmd_recovery_show(name: &str, json: bool) -> Result<()> {
 fn cmd_recovery_set(name: &str, args: &RecoverySetArgs, json: bool) -> Result<()> {
     // Read the current spec so we can merge in-place when --clear-exit-actions
     // is not set.
-    let current =
-        servicemanager_ops::read_recovery(name).map_err(servicemanager_core::Error::other)?;
+    let current = servicemanager_ops::read_recovery(name)?;
     let spec = merge_recovery_args(name, &current, args)?;
-    let msg = servicemanager_ops::save_recovery(spec).map_err(servicemanager_core::Error::other)?;
+    let msg = servicemanager_ops::save_recovery(spec)?;
     if json {
         println!("{}", serde_json::json!({ "saved": name }));
     } else {
@@ -1238,89 +1426,6 @@ fn cmd_processes(name: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Supervisor-supported `(event, action)` hook points.
-///
-/// Mirrors `servicemanager-supervisor::hooks::HookPoint` exactly. If the
-/// supervisor grows a new point, add it here too — anything not in this
-/// list is silently dropped at runtime, so the CLI rejects it up front
-/// rather than persisting a hook that will never fire.
-const SUPPORTED_HOOK_POINTS: &[(&str, &str)] = &[
-    ("Start", "Pre"),
-    ("Start", "Post"),
-    ("Stop", "Pre"),
-    ("Exit", "Post"),
-    ("Rotate", "Pre"),
-    ("Rotate", "Post"),
-    ("Power", "Change"),
-    ("Power", "Resume"),
-];
-
-fn supported_hook_points_pretty() -> String {
-    SUPPORTED_HOOK_POINTS
-        .iter()
-        .map(|(e, a)| format!("{e}/{a}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Parse a `EVENT/ACTION=command` spec from `--hook`.
-fn parse_hook_spec(raw: &str) -> Result<HookConfig> {
-    let (lhs, command) = raw.split_once('=').ok_or_else(|| {
-        servicemanager_core::Error::InvalidConfig(format!(
-            "hook spec '{raw}' must be EVENT/ACTION=command"
-        ))
-    })?;
-    let (event, action) = lhs.split_once('/').ok_or_else(|| {
-        servicemanager_core::Error::InvalidConfig(format!(
-            "hook spec '{raw}' must be EVENT/ACTION=command"
-        ))
-    })?;
-    let event = event.trim();
-    let action = action.trim();
-    let command = command.trim();
-    // Reject hook names that cannot be used as registry subkey / value names.
-    servicemanager_core::validate_hook_component(event, "event")?;
-    servicemanager_core::validate_hook_component(action, "action")?;
-    // Reject `(event, action)` pairs the supervisor does not understand —
-    // matched case-insensitively, since the registry layer is case-insensitive
-    // and silently accepting `Foo/Bar=cmd` would install a hook that never
-    // fires.
-    if !SUPPORTED_HOOK_POINTS
-        .iter()
-        .any(|(e, a)| event.eq_ignore_ascii_case(e) && action.eq_ignore_ascii_case(a))
-    {
-        return Err(servicemanager_core::Error::InvalidConfig(format!(
-            "hook spec '{raw}' uses unsupported event/action '{event}/{action}'; \
-             supported points are: {}",
-            supported_hook_points_pretty()
-        )));
-    }
-    // An empty command would install a hook the supervisor cannot execute.
-    if command.is_empty() {
-        return Err(servicemanager_core::Error::InvalidConfig(format!(
-            "hook spec '{raw}' has an empty command — provide a command to run"
-        )));
-    }
-    Ok(HookConfig {
-        event: event.to_string(),
-        action: action.to_string(),
-        command: command.to_string(),
-    })
-}
-
-/// Wrap a log-file path in a plain [`IoStream`] (default share/disposition).
-/// Used only by the extended install path (hooks/rotation); basic installs
-/// go through [`servicemanager_ops::install`] which has its own internal helper.
-fn cli_io_stream(path: String) -> IoStream {
-    IoStream {
-        path,
-        share_mode: None,
-        creation_disposition: None,
-        flags_and_attributes: None,
-        copy_and_truncate: None,
-    }
-}
-
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -1374,65 +1479,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hook_spec_parses_event_action_command() {
-        let h = parse_hook_spec("Start/Pre=C:\\warmup.cmd").unwrap();
-        assert_eq!(h.event, "Start");
-        assert_eq!(h.action, "Pre");
-        assert_eq!(h.command, "C:\\warmup.cmd");
-    }
-
-    #[test]
-    fn hook_spec_rejects_malformed_input() {
-        assert!(parse_hook_spec("no-equals-sign").is_err());
-        assert!(parse_hook_spec("NoSlash=command").is_err());
-    }
-
-    #[test]
-    fn parse_hook_spec_accepts_supported_points() {
-        // Every supervisor-supported (event, action) pair round-trips.
-        for (event, action) in SUPPORTED_HOOK_POINTS {
-            let raw = format!("{event}/{action}=C:\\hook.cmd");
-            let h = parse_hook_spec(&raw)
-                .unwrap_or_else(|e| panic!("expected {event}/{action} to be accepted, got {e:?}"));
-            assert_eq!(h.event, *event);
-            assert_eq!(h.action, *action);
-            assert_eq!(h.command, "C:\\hook.cmd");
-        }
-    }
-
-    #[test]
-    fn parse_hook_spec_rejects_unsupported_pair() {
-        // Unrecognized event/action pairs would install a hook the
-        // supervisor silently ignores at runtime — reject up front.
-        let err = parse_hook_spec("Foo/Bar=cmd").unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("unsupported") && msg.contains("Foo/Bar"),
-            "expected unsupported-pair message, got {msg:?}"
-        );
-        // Also lists the supported set so the user can fix it.
-        assert!(
-            msg.contains("Start/Pre"),
-            "expected supported list in {msg:?}"
-        );
-        // Almost-supported variants (wrong action under a real event) are
-        // still rejected.
-        assert!(parse_hook_spec("Start/Resume=cmd").is_err());
-        assert!(parse_hook_spec("Power/Pre=cmd").is_err());
-    }
-
-    #[test]
-    fn parse_hook_spec_rejects_empty_command() {
-        let err = parse_hook_spec("Start/Pre=").unwrap_err();
-        assert!(
-            err.to_string().contains("empty command"),
-            "expected empty-command message, got {err:?}"
-        );
-        // Whitespace-only command is also empty after trim.
-        assert!(parse_hook_spec("Start/Pre=   ").is_err());
-    }
-
-    #[test]
     fn truncate_adds_ellipsis_past_limit() {
         assert_eq!(truncate("short", 10), "short");
         let t = truncate("abcdefghij", 5);
@@ -1455,6 +1501,57 @@ mod tests {
         assert!(parse_exit_action("").is_err());
     }
 
+    #[test]
+    fn statuscode_maps_service_states_to_scm_codes_and_names() {
+        let cases = [
+            (ServiceState::Stopped, 1, "SERVICE_STOPPED"),
+            (ServiceState::StartPending, 2, "SERVICE_START_PENDING"),
+            (ServiceState::StopPending, 3, "SERVICE_STOP_PENDING"),
+            (ServiceState::Running, 4, "SERVICE_RUNNING"),
+            (ServiceState::ContinuePending, 5, "SERVICE_CONTINUE_PENDING"),
+            (ServiceState::PausePending, 6, "SERVICE_PAUSE_PENDING"),
+            (ServiceState::Paused, 7, "SERVICE_PAUSED"),
+            (ServiceState::Unknown, 0, "SERVICE_UNKNOWN"),
+        ];
+        for (state, code, text) in cases {
+            assert_eq!(statuscode_exit_code(state), code);
+            assert_eq!(statuscode_state_text(state), text);
+        }
+    }
+
+    #[test]
+    fn reset_and_statuscode_parse_as_commands() {
+        let cli = Cli::try_parse_from(["ngsm", "reset", "MySvc", "AppStdout"]).unwrap();
+        match cli.command {
+            Some(Command::Reset { name, param }) => {
+                assert_eq!(name, "MySvc");
+                assert_eq!(param, "AppStdout");
+            }
+            other => panic!("expected reset command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["ngsm", "statuscode", "MySvc"]).unwrap();
+        match cli.command {
+            Some(Command::StatusCode { name }) => assert_eq!(name, "MySvc"),
+            other => panic!("expected statuscode command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["ngsm", "repair", "MySvc"]).unwrap();
+        match cli.command {
+            Some(Command::Repair { name }) => assert_eq!(name, "MySvc"),
+            other => panic!("expected repair command, got {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["ngsm", "edit", "MySvc", "--image-path", "C:\\evil.exe"]).is_err(),
+            "raw ImagePath editing must not be accepted"
+        );
+        assert!(
+            Cli::try_parse_from(["ngsm", "edit", "MySvc", "--service-type", "kernel"]).is_err(),
+            "raw service type editing must not be accepted"
+        );
+    }
+
     /// Build an `InstallArgs` with the minimum required positional fields
     /// and every optional knob at its default. Tests then mutate only the
     /// flags they care about, so an unrelated field flip later cannot
@@ -1466,7 +1563,12 @@ mod tests {
             app_parameters: None,
             app_directory: None,
             display: None,
+            description: None,
             start: StartTypeArg::Manual,
+            depend_service: Vec::new(),
+            depend_group: Vec::new(),
+            account: None,
+            password_stdin: false,
             stdout: None,
             stderr: None,
             rotate_bytes: None,
@@ -1531,6 +1633,85 @@ mod tests {
         validate_install_args(&args).expect("plain install with no rotation must pass");
     }
 
+    #[test]
+    fn install_args_parse_dependencies_and_account_without_argv_password() {
+        let cli = Cli::try_parse_from([
+            "ngsm",
+            "install",
+            "TestSvc",
+            "C:\\app\\svc.exe",
+            "--depend-service",
+            "Tcpip",
+            "--depend-group",
+            "NetworkProvider",
+            "--account",
+            ".\\svc_user",
+            "--password-stdin",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Command::Install(args)) => {
+                validate_install_args(&args).expect("dependencies/account are valid");
+                assert_eq!(args.depend_service, vec!["Tcpip"]);
+                assert_eq!(args.depend_group, vec!["NetworkProvider"]);
+                assert_eq!(args.account.as_deref(), Some(".\\svc_user"));
+                assert!(args.password_stdin);
+            }
+            other => panic!("expected install command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn install_rejects_password_without_account_and_no_password_argv_flag_exists() {
+        let mut args = install_args_defaults();
+        args.password_stdin = true;
+        let err = validate_install_args(&args)
+            .expect_err("--password-stdin without --account must be rejected")
+            .to_string();
+        assert!(err.contains("--account"), "got: {err}");
+        assert!(
+            !err.contains("argv-password-value"),
+            "error must not echo password-like data: {err}"
+        );
+
+        let err = Cli::try_parse_from([
+            "ngsm",
+            "install",
+            "TestSvc",
+            "C:\\app\\svc.exe",
+            "--password",
+            "argv-password-value",
+        ])
+        .expect_err("password must not be accepted as argv flag");
+        assert!(
+            err.to_string().contains("--password-stdin")
+                || err.to_string().contains("unexpected argument"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn install_rejects_invalid_dependency_entries_without_echoing_value() {
+        let mut args = install_args_defaults();
+        args.depend_service.push("Bad\nName".into());
+        let err = validate_install_args(&args)
+            .expect_err("control chars in dependencies must be rejected")
+            .to_string();
+        assert!(err.contains("control"), "got: {err}");
+        assert!(
+            !err.contains("Bad"),
+            "dependency value should not be echoed: {err}"
+        );
+
+        let mut args = install_args_defaults();
+        args.depend_group.push(String::new());
+        let err = validate_install_args(&args)
+            .expect_err("empty group dependency must be rejected")
+            .to_string();
+        assert!(err.contains("empty"), "got: {err}");
+    }
+
     /// Build a `RecoverySetArgs` with everything off — tests then flip just
     /// the field they care about.
     fn recovery_set_args_defaults() -> RecoverySetArgs {
@@ -1588,7 +1769,13 @@ mod tests {
             app_parameters: None,
             app_directory: None,
             display: None,
+            description: None,
             start: None,
+            depend_service: Vec::new(),
+            depend_group: Vec::new(),
+            clear_dependencies: false,
+            account: None,
+            password_stdin: false,
             stdout: None,
             stderr: None,
             force_native: false,
@@ -1637,6 +1824,66 @@ mod tests {
         let mut args = edit_args_defaults();
         args.start = Some(StartTypeArg::Automatic);
         validate_edit_args(&args).expect("--start alone is valid");
+    }
+
+    #[test]
+    fn edit_dependency_flags_are_edit_fields_and_clear_conflicts() {
+        let mut args = edit_args_defaults();
+        args.depend_service.push("Tcpip".into());
+        validate_edit_args(&args).expect("--depend-service alone is valid");
+        let deps = edit_dependencies_from_cli(&args)
+            .expect("dependencies parse")
+            .expect("dependencies set");
+        assert_eq!(deps.services, vec!["Tcpip"]);
+        assert!(deps.groups.is_empty());
+
+        let mut args = edit_args_defaults();
+        args.clear_dependencies = true;
+        validate_edit_args(&args).expect("--clear-dependencies alone is valid");
+        let deps = edit_dependencies_from_cli(&args)
+            .expect("dependencies parse")
+            .expect("clear dependencies set");
+        assert!(deps.is_empty());
+
+        assert!(
+            Cli::try_parse_from([
+                "ngsm",
+                "edit",
+                "TestSvc",
+                "--clear-dependencies",
+                "--depend-service",
+                "Tcpip",
+            ])
+            .is_err(),
+            "clear and explicit dependencies must conflict"
+        );
+    }
+
+    #[test]
+    fn edit_accepts_password_stdin_only_with_account_and_rejects_password_argv() {
+        let mut args = edit_args_defaults();
+        args.account = Some(".\\svc_user".into());
+        args.password_stdin = true;
+        validate_edit_args(&args).expect("account + password-stdin is valid");
+
+        let mut args = edit_args_defaults();
+        args.password_stdin = true;
+        let err = validate_edit_args(&args)
+            .expect_err("--password-stdin without --account must be rejected")
+            .to_string();
+        assert!(err.contains("--account"), "got: {err}");
+
+        assert!(
+            Cli::try_parse_from([
+                "ngsm",
+                "edit",
+                "TestSvc",
+                "--password",
+                "argv-password-value",
+            ])
+            .is_err(),
+            "password must not be accepted as argv flag"
+        );
     }
 
     #[test]

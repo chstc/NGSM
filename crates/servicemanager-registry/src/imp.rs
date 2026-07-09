@@ -305,9 +305,15 @@ fn open_subkey(parent: HKEY, path: &str, sam: REG_SAM_FLAGS) -> Result<RegKey> {
     // call; `&mut key` is a valid out-parameter. The returned handle is
     // taken under RAII ownership by `RegKey`.
     unsafe {
-        RegOpenKeyExW(parent, PCWSTR::from_raw(wide.as_ptr()), 0, sam, &mut key)
-            .ok()
-            .map_err(|e| map_reg_error(&format!("RegOpenKeyEx({path})"), e))?;
+        RegOpenKeyExW(
+            parent,
+            PCWSTR::from_raw(wide.as_ptr()),
+            Some(0),
+            sam,
+            &mut key,
+        )
+        .ok()
+        .map_err(|e| map_reg_error(&format!("RegOpenKeyEx({path})"), e))?;
     }
     Ok(RegKey(key))
 }
@@ -551,7 +557,7 @@ fn enumerate_string_values(key: &RegKey) -> Result<Vec<(String, String)>> {
             RegEnumValueW(
                 key.0,
                 index,
-                PWSTR::from_raw(name_buf.as_mut_ptr()),
+                Some(PWSTR::from_raw(name_buf.as_mut_ptr())),
                 &mut name_len,
                 None,
                 Some(&mut value_type),
@@ -616,10 +622,10 @@ fn enumerate_subkey_names(key: &RegKey) -> Result<Vec<String>> {
             RegEnumKeyExW(
                 key.0,
                 index,
-                PWSTR::from_raw(name_buf.as_mut_ptr()),
+                Some(PWSTR::from_raw(name_buf.as_mut_ptr())),
                 &mut name_len,
                 None,
-                PWSTR::null(),
+                None,
                 None,
                 None,
             )
@@ -1500,7 +1506,7 @@ fn create_subkey(parent: HKEY, path: &str, sam: REG_SAM_FLAGS) -> Result<RegKey>
         RegCreateKeyExW(
             parent,
             PCWSTR::from_raw(wide.as_ptr()),
-            0,
+            Some(0),
             PCWSTR::null(),
             REG_OPTION_NON_VOLATILE,
             sam,
@@ -1535,7 +1541,7 @@ fn write_string(key: &RegKey, name: &str, value: &str) -> Result<()> {
         RegSetValueExW(
             key.0,
             PCWSTR::from_raw(wide_name.as_ptr()),
-            0,
+            Some(0),
             REG_SZ,
             Some(&bytes),
         )
@@ -1567,7 +1573,7 @@ fn write_multi_string(key: &RegKey, name: &str, values: &[String]) -> Result<()>
         RegSetValueExW(
             key.0,
             PCWSTR::from_raw(wide_name.as_ptr()),
-            0,
+            Some(0),
             REG_MULTI_SZ,
             Some(&bytes),
         )
@@ -1586,7 +1592,7 @@ fn write_u32(key: &RegKey, name: &str, value: u32) -> Result<()> {
         RegSetValueExW(
             key.0,
             PCWSTR::from_raw(wide_name.as_ptr()),
-            0,
+            Some(0),
             REG_DWORD,
             Some(&bytes),
         )

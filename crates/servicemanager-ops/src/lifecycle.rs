@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use servicemanager_win32::{control_service, query_service, start_service, ServiceControlSignal};
 
-use crate::error::OpResult;
+use crate::error::{message_error, OpResult};
 use crate::helpers::{ensure_enabled, ensure_ngsm_managed};
 
 /// Request that a service be started.
@@ -11,9 +11,9 @@ use crate::helpers::{ensure_enabled, ensure_ngsm_managed};
 /// Re-validates NGSM ownership and enabled state against current SCM/registry
 /// state before issuing the start — the caller's snapshot may be stale.
 pub fn start(name: &str) -> OpResult {
-    ensure_ngsm_managed(name).map_err(|e| e.to_string())?;
-    ensure_enabled(name).map_err(|e| e.to_string())?;
-    start_service(name).map_err(|e| e.to_string())?;
+    ensure_ngsm_managed(name)?;
+    ensure_enabled(name)?;
+    start_service(name)?;
     Ok(format!("Start requested for '{name}'."))
 }
 
@@ -21,10 +21,8 @@ pub fn start(name: &str) -> OpResult {
 ///
 /// Re-validates NGSM ownership before issuing the stop control.
 pub fn stop(name: &str) -> OpResult {
-    ensure_ngsm_managed(name).map_err(|e| e.to_string())?;
-    control_service(name, ServiceControlSignal::Stop)
-        .map(|_| ())
-        .map_err(|e| e.to_string())?;
+    ensure_ngsm_managed(name)?;
+    control_service(name, ServiceControlSignal::Stop).map(|_| ())?;
     Ok(format!("Stop requested for '{name}'."))
 }
 
@@ -32,10 +30,8 @@ pub fn stop(name: &str) -> OpResult {
 ///
 /// Re-validates NGSM ownership before issuing the pause control.
 pub fn pause(name: &str) -> OpResult {
-    ensure_ngsm_managed(name).map_err(|e| e.to_string())?;
-    control_service(name, ServiceControlSignal::Pause)
-        .map(|_| ())
-        .map_err(|e| e.to_string())?;
+    ensure_ngsm_managed(name)?;
+    control_service(name, ServiceControlSignal::Pause).map(|_| ())?;
     Ok(format!("Pause requested for '{name}'."))
 }
 
@@ -45,10 +41,8 @@ pub fn pause(name: &str) -> OpResult {
 ///
 /// Named `continue_service` because `continue` is a Rust keyword.
 pub fn continue_service(name: &str) -> OpResult {
-    ensure_ngsm_managed(name).map_err(|e| e.to_string())?;
-    control_service(name, ServiceControlSignal::Continue)
-        .map(|_| ())
-        .map_err(|e| e.to_string())?;
+    ensure_ngsm_managed(name)?;
+    control_service(name, ServiceControlSignal::Continue).map(|_| ())?;
     Ok(format!("Continue requested for '{name}'."))
 }
 
@@ -63,10 +57,10 @@ pub fn continue_service(name: &str) -> OpResult {
 pub fn restart(name: &str, stop_timeout_ms: u64) -> OpResult {
     use servicemanager_core::ServiceState;
 
-    ensure_ngsm_managed(name).map_err(|e| e.to_string())?;
-    ensure_enabled(name).map_err(|e| e.to_string())?;
+    ensure_ngsm_managed(name)?;
+    ensure_enabled(name)?;
 
-    let snapshot = query_service(name).map_err(|e| e.to_string())?;
+    let snapshot = query_service(name)?;
     let initial = snapshot.runtime.as_ref().map(|r| r.state);
     let needs_stop = !matches!(initial, Some(ServiceState::Stopped) | None);
 
@@ -74,17 +68,16 @@ pub fn restart(name: &str, stop_timeout_ms: u64) -> OpResult {
         match control_service(name, ServiceControlSignal::Stop) {
             Ok(_) => {}
             Err(e) => {
-                let msg = e.to_string();
                 // Swallow "service not active" — another stopper may have
                 // beaten us to it (race is harmless).
-                if !(msg.contains("0x80070426") || msg.contains("has not been started")) {
-                    return Err(msg);
+                if !is_service_not_active_error(&e) {
+                    return Err(e);
                 }
             }
         }
         let deadline = Instant::now() + Duration::from_millis(stop_timeout_ms);
         loop {
-            let s = query_service(name).map_err(|e| e.to_string())?;
+            let s = query_service(name)?;
             if matches!(
                 s.runtime.as_ref().map(|r| r.state),
                 Some(ServiceState::Stopped)
@@ -92,7 +85,9 @@ pub fn restart(name: &str, stop_timeout_ms: u64) -> OpResult {
                 break;
             }
             if Instant::now() >= deadline {
-                return Err(format!("'{name}' did not stop within {stop_timeout_ms} ms"));
+                return Err(message_error(format!(
+                    "'{name}' did not stop within {stop_timeout_ms} ms"
+                )));
             }
             thread::sleep(Duration::from_millis(200));
         }
@@ -101,6 +96,11 @@ pub fn restart(name: &str, stop_timeout_ms: u64) -> OpResult {
         thread::sleep(Duration::from_millis(250));
     }
 
-    start_service(name).map_err(|e| e.to_string())?;
+    start_service(name)?;
     Ok(format!("Restarted '{name}'."))
+}
+
+fn is_service_not_active_error(error: &servicemanager_core::Error) -> bool {
+    let msg = error.to_string();
+    msg.contains("0x80070426") || msg.contains("has not been started")
 }
