@@ -1,7 +1,8 @@
 use servicemanager_core::{
-    validate_absolute_path, validate_hook_component, ManagedApplicationConfig,
+    validate_absolute_path, validate_hook_component, LogRotationConfig, ManagedApplicationConfig,
 };
 
+use crate::error::{message_error, Result};
 use crate::recovery::validate_exit_action_key;
 
 /// Pure pre-validation of a [`ManagedApplicationConfig`] that mirrors every
@@ -23,12 +24,16 @@ use crate::recovery::validate_exit_action_key;
 ///
 /// Returns `Err(message)` naming the first offending field, suitable for
 /// surfacing directly to the user.
-pub fn validate_managed_config(cfg: &ManagedApplicationConfig) -> Result<(), String> {
+pub fn validate_managed_config(cfg: &ManagedApplicationConfig) -> Result<()> {
     // 1. Application must be present and non-empty — without it the
     //    registry writer would reject the config as unmanaged.
     match cfg.application.as_deref() {
         Some(app) if !app.trim().is_empty() => {}
-        _ => return Err("managed config requires a non-empty Application value".into()),
+        _ => {
+            return Err(message_error(
+                "managed config requires a non-empty Application value",
+            ))
+        }
     }
 
     // 2. Absolute-path checks mirror the registry writer's path validation
@@ -36,35 +41,35 @@ pub fn validate_managed_config(cfg: &ManagedApplicationConfig) -> Result<(), Str
     //    also rejects NUL / control characters, so these calls double as
     //    NUL prechecks for the path-valued fields.
     if let Some(app) = &cfg.application {
-        validate_absolute_path("Application", app).map_err(|e| e.to_string())?;
+        validate_absolute_path("Application", app)?;
     }
     if let Some(dir) = cfg.app_directory.as_deref().filter(|d| !d.is_empty()) {
-        validate_absolute_path("AppDirectory", dir).map_err(|e| e.to_string())?;
+        validate_absolute_path("AppDirectory", dir)?;
     }
     if let Some(s) = &cfg.io.stdin {
-        validate_absolute_path("AppStdin", &s.path).map_err(|e| e.to_string())?;
+        validate_absolute_path("AppStdin", &s.path)?;
     }
     if let Some(s) = &cfg.io.stdout {
-        validate_absolute_path("AppStdout", &s.path).map_err(|e| e.to_string())?;
+        validate_absolute_path("AppStdout", &s.path)?;
     }
     if let Some(s) = &cfg.io.stderr {
-        validate_absolute_path("AppStderr", &s.path).map_err(|e| e.to_string())?;
+        validate_absolute_path("AppStderr", &s.path)?;
     }
 
     // 3. Hook event/action names must be usable as registry subkey / value
     //    names. Mirrors `validate_hook_component` calls in `write_into_key`.
     for hook in &cfg.hooks {
-        validate_hook_component(&hook.event, "event").map_err(|e| e.to_string())?;
-        validate_hook_component(&hook.action, "action").map_err(|e| e.to_string())?;
+        validate_hook_component(&hook.event, "event")?;
+        validate_hook_component(&hook.action, "action")?;
         // The registry writer's NUL precheck covers the hook command field
         // too. Mirror it here so a NUL in `command` is caught before the
         // SCM service is created.
         if hook.command.contains('\0') {
-            return Err(format!(
+            return Err(message_error(format!(
                 "AppEvents\\{}\\{} (command) contains an embedded NUL — \
                  registry strings cannot carry NULs",
                 hook.event, hook.action
-            ));
+            )));
         }
     }
 
@@ -72,7 +77,8 @@ pub fn validate_managed_config(cfg: &ManagedApplicationConfig) -> Result<(), Str
     //    `=`, NUL, and non-numeric keys are all rejected. Re-uses the same
     //    validator the recovery editor funnels every caller through.
     for code in cfg.exit_actions.keys() {
-        validate_exit_action_key(code).map_err(|e| format!("AppExit\\{code}: {e}"))?;
+        validate_exit_action_key(code)
+            .map_err(|e| message_error(format!("AppExit\\{code}: {e}")))?;
     }
 
     // 5. NUL precheck for the remaining REG_SZ / REG_MULTI_SZ string fields
@@ -96,11 +102,92 @@ pub fn validate_managed_config(cfg: &ManagedApplicationConfig) -> Result<(), Str
     Ok(())
 }
 
-fn check_no_nul(field: &str, value: &str) -> Result<(), String> {
-    if value.contains('\0') {
-        return Err(format!(
-            "{field} contains an embedded NUL — registry strings cannot carry NULs"
+/// Install-specific validation that is stricter than the registry writer's
+/// shape checks.
+///
+/// These checks prevent installing configurations that the supervisor would
+/// later ignore (unsupported hooks) or that make requested features inert
+/// (rotation without a redirected log stream). Call this before creating the
+/// SCM service.
+pub(crate) fn validate_install_config(cfg: &ManagedApplicationConfig) -> Result<()> {
+    if install_rotation_requested(&cfg.rotation)
+        && cfg.io.stdout.is_none()
+        && cfg.io.stderr.is_none()
+    {
+        return Err(message_error(
+            "rotation flags (--rotate-bytes, --rotate-seconds, --rotate-online) \
+             require --stdout and/or --stderr; rotation cannot operate without \
+             a redirected log stream",
         ));
+    }
+
+    if let Some(online) = cfg.rotation.online {
+        if online > 2 {
+            return Err(message_error(format!(
+                "rotation online mode must be 0 (offline), 1 (online), or 2 (online-asap); got {online}"
+            )));
+        }
+    }
+
+    for hook in &cfg.hooks {
+        if !is_supported_hook_point(&hook.event, &hook.action) {
+            return Err(message_error(format!(
+                "hook uses unsupported event/action '{}/{}'; supported points are: {}",
+                hook.event,
+                hook.action,
+                supported_hook_points_pretty()
+            )));
+        }
+        if hook.command.trim().is_empty() {
+            return Err(message_error(format!(
+                "hook {}/{} has an empty command — provide a command to run",
+                hook.event, hook.action
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn install_rotation_requested(rotation: &LogRotationConfig) -> bool {
+    rotation.enabled == Some(true)
+        || rotation.seconds.is_some()
+        || rotation.bytes.is_some()
+        || rotation.delay_ms.is_some()
+        || matches!(rotation.online, Some(v) if v != 0)
+}
+
+/// Supervisor-supported `(event, action)` hook points.
+const SUPPORTED_HOOK_POINTS: &[(&str, &str)] = &[
+    ("Start", "Pre"),
+    ("Start", "Post"),
+    ("Stop", "Pre"),
+    ("Exit", "Post"),
+    ("Rotate", "Pre"),
+    ("Rotate", "Post"),
+    ("Power", "Change"),
+    ("Power", "Resume"),
+];
+
+fn is_supported_hook_point(event: &str, action: &str) -> bool {
+    SUPPORTED_HOOK_POINTS
+        .iter()
+        .any(|(e, a)| event.eq_ignore_ascii_case(e) && action.eq_ignore_ascii_case(a))
+}
+
+fn supported_hook_points_pretty() -> String {
+    SUPPORTED_HOOK_POINTS
+        .iter()
+        .map(|(e, a)| format!("{e}/{a}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn check_no_nul(field: &str, value: &str) -> Result<()> {
+    if value.contains('\0') {
+        return Err(message_error(format!(
+            "{field} contains an embedded NUL — registry strings cannot carry NULs"
+        )));
     }
     Ok(())
 }
@@ -128,7 +215,7 @@ mod tests {
             application: None,
             ..Default::default()
         };
-        let err = validate_managed_config(&cfg).unwrap_err();
+        let err = validate_managed_config(&cfg).unwrap_err().to_string();
         assert!(err.contains("Application"), "got: {err}");
     }
 
@@ -136,7 +223,7 @@ mod tests {
     fn rejects_empty_application() {
         let mut cfg = minimal_valid_config();
         cfg.application = Some("   ".into());
-        let err = validate_managed_config(&cfg).unwrap_err();
+        let err = validate_managed_config(&cfg).unwrap_err().to_string();
         assert!(err.contains("Application"), "got: {err}");
     }
 
@@ -144,7 +231,7 @@ mod tests {
     fn rejects_relative_application_path() {
         let mut cfg = minimal_valid_config();
         cfg.application = Some("svc.exe".into());
-        let err = validate_managed_config(&cfg).unwrap_err();
+        let err = validate_managed_config(&cfg).unwrap_err().to_string();
         assert!(err.contains("absolute"), "got: {err}");
         assert!(err.contains("Application"), "got: {err}");
     }
@@ -153,7 +240,7 @@ mod tests {
     fn rejects_relative_app_directory() {
         let mut cfg = minimal_valid_config();
         cfg.app_directory = Some("relative\\dir".into());
-        let err = validate_managed_config(&cfg).unwrap_err();
+        let err = validate_managed_config(&cfg).unwrap_err().to_string();
         assert!(err.contains("AppDirectory"), "got: {err}");
     }
 
@@ -167,7 +254,7 @@ mod tests {
             flags_and_attributes: None,
             copy_and_truncate: None,
         });
-        let err = validate_managed_config(&cfg).unwrap_err();
+        let err = validate_managed_config(&cfg).unwrap_err().to_string();
         assert!(err.contains("AppStdout"), "got: {err}");
     }
 
@@ -180,7 +267,7 @@ mod tests {
                 action: ExitAction::Restart,
             },
         );
-        let err = validate_managed_config(&cfg).unwrap_err();
+        let err = validate_managed_config(&cfg).unwrap_err().to_string();
         assert!(err.contains("default"), "got: {err}");
         assert!(err.contains("AppExit"), "got: {err}");
     }
@@ -194,7 +281,7 @@ mod tests {
                 action: ExitAction::Restart,
             },
         );
-        let err = validate_managed_config(&cfg).unwrap_err();
+        let err = validate_managed_config(&cfg).unwrap_err().to_string();
         assert!(err.contains("AppExit\\abc"), "got: {err}");
     }
 
@@ -206,7 +293,7 @@ mod tests {
             action: "Pre".into(),
             command: "C:\\hooks\\warmup.cmd".into(),
         });
-        let err = validate_managed_config(&cfg).unwrap_err();
+        let err = validate_managed_config(&cfg).unwrap_err().to_string();
         assert!(err.contains("event"), "got: {err}");
     }
 
@@ -218,7 +305,7 @@ mod tests {
             action: "Pre".into(),
             command: "C:\\hooks\\warmup.cmd".into(),
         });
-        let err = validate_managed_config(&cfg).unwrap_err();
+        let err = validate_managed_config(&cfg).unwrap_err().to_string();
         assert!(err.contains("event"), "got: {err}");
     }
 
@@ -230,7 +317,7 @@ mod tests {
             action: "Pre".into(),
             command: "C:\\hooks\\warmup.cmd\0".into(),
         });
-        let err = validate_managed_config(&cfg).unwrap_err();
+        let err = validate_managed_config(&cfg).unwrap_err().to_string();
         assert!(err.contains("NUL"), "got: {err}");
         assert!(err.contains("command"), "got: {err}");
     }
@@ -239,7 +326,7 @@ mod tests {
     fn rejects_nul_in_app_parameters() {
         let mut cfg = minimal_valid_config();
         cfg.app_parameters = Some("--foo\0--bar".into());
-        let err = validate_managed_config(&cfg).unwrap_err();
+        let err = validate_managed_config(&cfg).unwrap_err().to_string();
         assert!(err.contains("AppParameters"), "got: {err}");
         assert!(err.contains("NUL"), "got: {err}");
     }
@@ -249,7 +336,7 @@ mod tests {
         let mut cfg = minimal_valid_config();
         cfg.environment.push("FOO=1".into());
         cfg.environment.push("BAR=\0bad".into());
-        let err = validate_managed_config(&cfg).unwrap_err();
+        let err = validate_managed_config(&cfg).unwrap_err().to_string();
         assert!(err.contains("AppEnvironment[1]"), "got: {err}");
     }
 
@@ -266,7 +353,7 @@ mod tests {
     fn install_rejects_invalid_application_path_before_touching_scm() {
         let mut cfg = minimal_valid_config();
         cfg.application = Some("not_absolute.exe".into());
-        let err = validate_managed_config(&cfg).unwrap_err();
+        let err = validate_managed_config(&cfg).unwrap_err().to_string();
         assert!(err.contains("Application"), "got: {err}");
         assert!(err.contains("absolute"), "got: {err}");
     }
@@ -280,7 +367,7 @@ mod tests {
                 action: ExitAction::Restart,
             },
         );
-        let err = validate_managed_config(&cfg).unwrap_err();
+        let err = validate_managed_config(&cfg).unwrap_err().to_string();
         assert!(err.contains("default"), "got: {err}");
     }
 
@@ -296,7 +383,100 @@ mod tests {
             action: "Pre".into(),
             command: "C:\\hooks\\warmup.cmd".into(),
         });
-        let err = validate_managed_config(&cfg).unwrap_err();
+        let err = validate_managed_config(&cfg).unwrap_err().to_string();
         assert!(err.contains("event"), "got: {err}");
+    }
+
+    #[test]
+    fn install_validation_rejects_rotation_without_stdout_or_stderr() {
+        let mut cfg = minimal_valid_config();
+        cfg.rotation.bytes = Some(1_024_000);
+
+        let err = validate_install_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("--stdout"), "got: {err}");
+        assert!(err.contains("--stderr"), "got: {err}");
+        assert!(err.contains("rotation"), "got: {err}");
+    }
+
+    #[test]
+    fn install_validation_treats_enabled_rotation_as_requested() {
+        let mut cfg = minimal_valid_config();
+        cfg.rotation.enabled = Some(true);
+
+        let err = validate_install_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("rotation"), "got: {err}");
+    }
+
+    #[test]
+    fn install_validation_accepts_rotation_with_stdout() {
+        let mut cfg = minimal_valid_config();
+        cfg.io.stdout = Some(IoStream {
+            path: "C:\\logs\\out.log".into(),
+            share_mode: None,
+            creation_disposition: None,
+            flags_and_attributes: None,
+            copy_and_truncate: None,
+        });
+        cfg.rotation.bytes = Some(1_024_000);
+
+        validate_install_config(&cfg).expect("rotation with stdout should be valid");
+    }
+
+    #[test]
+    fn install_validation_rejects_invalid_rotation_online_mode() {
+        let mut cfg = minimal_valid_config();
+        cfg.io.stdout = Some(IoStream {
+            path: "C:\\logs\\out.log".into(),
+            share_mode: None,
+            creation_disposition: None,
+            flags_and_attributes: None,
+            copy_and_truncate: None,
+        });
+        cfg.rotation.online = Some(3);
+
+        let err = validate_install_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("0"), "got: {err}");
+        assert!(err.contains("1"), "got: {err}");
+        assert!(err.contains("2"), "got: {err}");
+    }
+
+    #[test]
+    fn install_validation_accepts_supported_hook_point() {
+        let mut cfg = minimal_valid_config();
+        cfg.hooks.push(HookConfig {
+            event: "Start".into(),
+            action: "Pre".into(),
+            command: "C:\\hooks\\warmup.cmd".into(),
+        });
+
+        validate_install_config(&cfg).expect("supported hook point should be valid");
+    }
+
+    #[test]
+    fn install_validation_rejects_unsupported_hook_point() {
+        let mut cfg = minimal_valid_config();
+        cfg.hooks.push(HookConfig {
+            event: "Foo".into(),
+            action: "Bar".into(),
+            command: "C:\\hooks\\warmup.cmd".into(),
+        });
+
+        let err = validate_install_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("unsupported"), "got: {err}");
+        assert!(err.contains("Foo/Bar"), "got: {err}");
+        assert!(err.contains("Start/Pre"), "got: {err}");
+    }
+
+    #[test]
+    fn install_validation_rejects_empty_hook_command() {
+        let mut cfg = minimal_valid_config();
+        cfg.hooks.push(HookConfig {
+            event: "Start".into(),
+            action: "Pre".into(),
+            command: "   ".into(),
+        });
+
+        let err = validate_install_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("empty command"), "got: {err}");
     }
 }

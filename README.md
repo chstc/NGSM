@@ -41,7 +41,7 @@ here with the equally permissive **0BSD** license.
   filter persistence).
 - **Full CLI** — `install`, `remove`, `edit`, `list`, `status`,
   `start` / `stop` / `restart` / `pause` / `continue`, `rotate`,
-  `get` / `set` / `unset`.
+  `get` / `set` / `reset` / `unset`, `statuscode`, `repair`.
 - **Process supervision** — restart and throttle policies, per-exit-code
   actions (`AppExit`), and a Job Object so the whole process tree dies with
   the service.
@@ -83,20 +83,32 @@ Anything that creates, changes, or controls a service must be run **elevated**
 ngsm                                   Launch the desktop GUI
 ngsm install MySvc "C:\app\app.exe"     Install a service
 ngsm install MySvc "C:\app\app.exe" --app-parameters "--flag" --stdout "C:\logs\out.log"
+ngsm install MySvc "C:\app\app.exe" --depend-service Tcpip --account ".\svc_user" --password-stdin
 ngsm list                               List NGSM-managed services
 ngsm status MySvc                       Show a service's state
+ngsm statuscode MySvc                   Print SERVICE_* state and exit with SCM state code
 ngsm start MySvc                        Start it (also: stop / restart / pause / continue)
 ngsm edit MySvc --display "My Service"  Edit an installed service
+ngsm edit MySvc --description "Runs My Service"
+ngsm edit MySvc --depend-group NetworkProvider
+ngsm edit MySvc --clear-dependencies
+ngsm repair MySvc                       Rebind SCM ImagePath to the validated NGSM runner
 ngsm remove MySvc                       Remove a service and its config
 ngsm get MySvc AppDirectory             Read an NSSM-compatible value
 ngsm set MySvc AppDirectory "C:\app"    Write one
+ngsm reset MySvc AppDirectory           Reset one NSSM-compatible value
 ```
 
 `ngsm --help` and `ngsm <command> --help` list every option.
 
+NGSM does not expose raw `ImagePath` or service-type editing for managed
+services. Use `ngsm repair <service>` to safely restore the SCM binding to the
+validated `ngsm.exe run-service <service>` command and `Win32OwnProcess`
+service type.
+
 ## Building from source
 
-Requires a Windows host with the **Rust** toolchain (stable; MSRV 1.88) and
+Requires a Windows host with the **Rust** toolchain (stable; MSRV 1.90) and
 the **MSVC** build tools.
 
 ```text
@@ -132,7 +144,7 @@ A Cargo workspace of focused crates:
 
 ## License
 
-NGSM is released under the **BSD Zero Clause License (0BSD)** — see
-[LICENSE](LICENSE). It is a permissive, OSI-approved license that requires no
-attribution, chosen to preserve the no-strings spirit of the public-domain
-NSSM project this descends from.
+NGSM's own source code is released under the **BSD Zero Clause License
+(0BSD)** — see [LICENSE](LICENSE). The official GUI binary also links the
+Slint UI framework, which is used under Slint's GPLv3 terms; see
+[SECURITY.md](SECURITY.md) for the bundled dependency notes.

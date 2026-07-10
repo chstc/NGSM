@@ -186,7 +186,7 @@ fn validate_owner_sid(owner_sid: &str) -> Result<()> {
         ConvertStringSidToSidW(PCWSTR::from_raw(wide.as_ptr()), &mut psid)
             .map_err(|e| Error::other(format!("invalid owner SID '{owner_sid}': {e}")))?;
         if !psid.is_invalid() {
-            let _ = LocalFree(HLOCAL(psid.0));
+            let _ = LocalFree(Some(HLOCAL(psid.0)));
         }
     }
     Ok(())
@@ -624,7 +624,7 @@ fn create_pipe_instance(pipe_name: &str, sddl: &str, first: bool) -> Result<Owne
     // exactly once here.
     unsafe {
         if !sd.0.is_null() {
-            let _ = LocalFree(HLOCAL(sd.0));
+            let _ = LocalFree(Some(HLOCAL(sd.0)));
         }
     }
 

@@ -27,18 +27,28 @@ fn iter_log_paths() -> Vec<std::path::PathBuf> {
 ///
 /// Reads only the trailing TAIL_BYTES from each file (rather than the
 /// whole thing), so cost is bounded regardless of file size. Sorts by
-/// the RFC 3339 ts field descending — newest first — to tolerate
-/// out-of-order writes from clock skew between concurrent supervisors.
+/// parsed RFC 3339 instants descending — newest first — to tolerate
+/// fractional seconds, non-Z offsets, and out-of-order writes from
+/// clock skew between concurrent supervisors. Records with unparseable
+/// timestamps are skipped, matching `read_since`.
 /// Caller is on the worker thread; this is allowed to do file I/O.
 pub fn read_recent(max: usize) -> Vec<EventRecord> {
     let mut all: Vec<EventRecord> = Vec::new();
     for path in iter_log_paths() {
         parse_tail_into(&path, &mut all);
     }
-    // ts is RFC 3339 UTC — lexicographic order matches time order.
-    all.sort_by(|a, b| b.ts.cmp(&a.ts));
-    all.truncate(max);
-    all
+    let mut parsed: Vec<(time::OffsetDateTime, EventRecord)> = all
+        .into_iter()
+        .filter_map(|rec| parse_rfc3339_ts(&rec.ts).ok().map(|ts| (ts, rec)))
+        .collect();
+    parsed.sort_by(|(a, _), (b, _)| b.cmp(a));
+    parsed.truncate(max);
+    parsed.into_iter().map(|(_, rec)| rec).collect()
+}
+
+fn parse_rfc3339_ts(ts: &str) -> Result<time::OffsetDateTime, time::error::Parse> {
+    use time::format_description::well_known::Rfc3339;
+    time::OffsetDateTime::parse(ts, &Rfc3339)
 }
 
 /// Read the last TAIL_BYTES of `path`, drop the first (possibly partial)
@@ -95,7 +105,6 @@ const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 /// file is tail-read and the first (partial) line dropped.
 pub fn read_since(since: time::OffsetDateTime) -> std::io::Result<Vec<EventRecord>> {
     use std::io::{BufRead, BufReader, Seek, SeekFrom};
-    use time::format_description::well_known::Rfc3339;
 
     let mut parsed: Vec<(time::OffsetDateTime, EventRecord)> = Vec::new();
 
@@ -132,7 +141,7 @@ pub fn read_since(since: time::OffsetDateTime) -> std::io::Result<Vec<EventRecor
             let Ok(rec) = serde_json::from_str::<EventRecord>(&line) else {
                 continue;
             };
-            let Ok(ts) = time::OffsetDateTime::parse(&rec.ts, &Rfc3339) else {
+            let Ok(ts) = parse_rfc3339_ts(&rec.ts) else {
                 continue;
             };
             if ts >= since {
@@ -346,6 +355,33 @@ mod tests {
         assert_eq!(out[0].service, "newest");
         assert_eq!(out[1].service, "middle");
         assert_eq!(out[2].service, "oldest");
+    }
+
+    #[test]
+    fn read_recent_sorts_by_parsed_instant_not_string() {
+        let (_g, _dir) = isolate();
+        write_active(&[
+            r#"{"ts":"2026-05-23T08:30:00Z","service":"base","event":"started","pid":1}"#,
+            r#"{"ts":"2026-05-23T08:30:00.100Z","service":"fractional-newest","event":"started","pid":2}"#,
+            r#"{"ts":"2026-05-23T09:00:00+01:00","service":"offset-oldest","event":"started","pid":3}"#,
+        ]);
+        let out = read_recent(50);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].service, "fractional-newest");
+        assert_eq!(out[1].service, "base");
+        assert_eq!(out[2].service, "offset-oldest");
+    }
+
+    #[test]
+    fn read_recent_skips_records_with_unparseable_timestamps() {
+        let (_g, _dir) = isolate();
+        write_active(&[
+            r#"{"ts":"NOT-A-DATE","service":"bad","event":"started","pid":1}"#,
+            r#"{"ts":"2026-05-22T14:15:00Z","service":"good","event":"started","pid":2}"#,
+        ]);
+        let out = read_recent(50);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].service, "good");
     }
 
     use time::macros::datetime;

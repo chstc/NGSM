@@ -1,6 +1,6 @@
 use servicemanager_win32::update_native_config;
 
-use crate::error::OpResult;
+use crate::error::{message_error, OpResult};
 use crate::helpers::io_stream;
 use crate::specs::EditSpec;
 
@@ -16,19 +16,23 @@ use crate::specs::EditSpec;
 /// current registry state — the UI button / CLI snapshot may be stale, and a
 /// native-only edit must not slip through unchecked.
 pub fn edit(spec: EditSpec) -> OpResult {
+    if !spec.has_changes() {
+        return Err(servicemanager_core::Error::InvalidConfig(
+            "no edit fields specified".into(),
+        ));
+    }
+
     let touches_managed = spec.application.is_some()
         || spec.app_parameters.is_some()
         || spec.app_directory.is_some()
         || spec.stdout.is_some()
         || spec.stderr.is_some();
 
-    let Some(mut managed) =
-        servicemanager_registry::read_managed_config(&spec.name).map_err(|e| e.to_string())?
-    else {
-        return Err(format!(
+    let Some(mut managed) = servicemanager_registry::read_managed_config(&spec.name)? else {
+        return Err(message_error(format!(
             "'{}' is not an NGSM-managed service — refusing to edit it",
             spec.name
-        ));
+        )));
     };
 
     if touches_managed {
@@ -36,7 +40,7 @@ pub fn edit(spec: EditSpec) -> OpResult {
             // Defence in depth — the edit form already rejects an empty
             // application, but never write one even if that changes.
             if v.trim().is_empty() {
-                return Err("Application path must not be empty.".into());
+                return Err(message_error("Application path must not be empty."));
             }
             managed.application = Some(v);
         }
@@ -61,13 +65,25 @@ pub fn edit(spec: EditSpec) -> OpResult {
                 Some(io_stream(v))
             };
         }
-        servicemanager_registry::write_managed_config(&spec.name, &managed)
-            .map_err(|e| e.to_string())?;
+        servicemanager_registry::write_managed_config(&spec.name, &managed)?;
     }
 
-    if spec.display_name.is_some() || spec.start_type.is_some() {
-        update_native_config(&spec.name, spec.display_name.as_deref(), spec.start_type)
-            .map_err(|e| e.to_string())?;
+    if spec.display_name.is_some()
+        || spec.description.is_some()
+        || spec.start_type.is_some()
+        || spec.dependencies.is_some()
+        || spec.account.is_some()
+        || spec.password.is_some()
+    {
+        update_native_config(
+            &spec.name,
+            spec.display_name.as_deref(),
+            spec.description.as_deref(),
+            spec.start_type,
+            spec.dependencies.as_ref(),
+            spec.account.as_deref(),
+            spec.password.as_deref(),
+        )?;
     }
     Ok(format!("Edited '{}'.", spec.name))
 }
@@ -78,6 +94,19 @@ mod tests {
 
     /// The `edit` function cannot be unit-tested against real SCM/registry;
     /// the tests here cover the pure pre-check logic only.
+
+    #[test]
+    fn edit_rejects_noop_before_registry_lookup() {
+        let spec = EditSpec {
+            name: "NoSuchServiceNeeded".into(),
+            ..Default::default()
+        };
+
+        let err = edit(spec)
+            .expect_err("no-op edit must be rejected before registry/SCM access")
+            .to_string();
+        assert!(err.contains("no edit fields"), "got: {err}");
+    }
 
     #[test]
     fn edit_empty_application_is_caught_by_type_system() {

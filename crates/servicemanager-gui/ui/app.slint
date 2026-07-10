@@ -51,11 +51,14 @@ export component MainWindow inherits Window {
     in property <int> active-modal: 0;
     in-out property <string> modal-name;
     in-out property <string> modal-display;
+    in-out property <string> modal-description;
     in-out property <string> modal-application;
     in-out property <string> modal-arguments;
     in-out property <string> modal-working-dir;
     in-out property <string> modal-stdout;
     in-out property <string> modal-stderr;
+    in-out property <string> modal-account;
+    in-out property <string> modal-password;
     in-out property <int> modal-start-type;
     in property <string> modal-error;
     in property <bool> modal-busy;
@@ -368,11 +371,14 @@ export component MainWindow inherits Window {
     if root.active-modal == 1 : InstallDialog {
         name <=> root.modal-name;
         display-name <=> root.modal-display;
+        description <=> root.modal-description;
         application <=> root.modal-application;
         arguments <=> root.modal-arguments;
         working-dir <=> root.modal-working-dir;
         stdout-path <=> root.modal-stdout;
         stderr-path <=> root.modal-stderr;
+        account <=> root.modal-account;
+        password <=> root.modal-password;
         start-type <=> root.modal-start-type;
         error: root.modal-error;
         busy: root.modal-busy;
@@ -383,11 +389,14 @@ export component MainWindow inherits Window {
     if root.active-modal == 2 : EditDialog {
         service-name: root.modal-service-name;
         display-name <=> root.modal-display;
+        description <=> root.modal-description;
         application <=> root.modal-application;
         arguments <=> root.modal-arguments;
         working-dir <=> root.modal-working-dir;
         stdout-path <=> root.modal-stdout;
         stderr-path <=> root.modal-stderr;
+        account <=> root.modal-account;
+        password <=> root.modal-password;
         start-type <=> root.modal-start-type;
         error: root.modal-error;
         busy: root.modal-busy;

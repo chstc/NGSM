@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use servicemanager_core::{ExitAction, ExitActionPolicy};
 
-use crate::error::OpResult;
+use crate::error::{message_error, OpResult, Result};
 use crate::specs::RecoverySpec;
 
 /// Validate a per-exit-code action map key.
@@ -20,25 +20,31 @@ use crate::specs::RecoverySpec;
 /// because the CLI's `CODE=ACTION` parser is line-oriented and would
 /// produce nonsense splits, and because such characters cannot round-
 /// trip cleanly through the registry as a value name.
-pub fn validate_exit_action_key(s: &str) -> Result<(), &'static str> {
+pub fn validate_exit_action_key(s: &str) -> Result<()> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
-        return Err("exit-action key must not be empty");
+        return Err(message_error("exit-action key must not be empty"));
     }
     if trimmed.eq_ignore_ascii_case("default") {
-        return Err("'default' is not a per-exit-code key; set the default action separately");
+        return Err(message_error(
+            "'default' is not a per-exit-code key; set the default action separately",
+        ));
     }
     if s.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err("exit-action key must not contain whitespace or control characters");
+        return Err(message_error(
+            "exit-action key must not contain whitespace or control characters",
+        ));
     }
     if s.contains('=') {
-        return Err("exit-action key must not contain '='");
+        return Err(message_error("exit-action key must not contain '='"));
     }
     if s.contains('\0') {
-        return Err("exit-action key must not contain NUL");
+        return Err(message_error("exit-action key must not contain NUL"));
     }
     if s.parse::<i32>().is_err() {
-        return Err("exit-action key must be an i32 exit code (e.g. -1, 0, 1, 2147483647)");
+        return Err(message_error(
+            "exit-action key must be an i32 exit code (e.g. -1, 0, 1, 2147483647)",
+        ));
     }
     Ok(())
 }
@@ -54,15 +60,14 @@ pub fn save_recovery(spec: RecoverySpec) -> OpResult {
     // up funneling through, so an out-of-spec key cannot reach the
     // registry no matter which surface produced it.
     for code in spec.exit_actions.keys() {
-        validate_exit_action_key(code).map_err(|e| format!("exit-action code '{code}': {e}"))?;
+        validate_exit_action_key(code)
+            .map_err(|e| message_error(format!("exit-action code '{code}': {e}")))?;
     }
-    let Some(mut managed) =
-        servicemanager_registry::read_managed_config(&spec.name).map_err(|e| e.to_string())?
-    else {
-        return Err(format!(
+    let Some(mut managed) = servicemanager_registry::read_managed_config(&spec.name)? else {
+        return Err(message_error(format!(
             "'{}' is not an NGSM-managed service — refusing to edit its recovery policy",
             spec.name
-        ));
+        )));
     };
     managed.restart.restart_delay_ms = spec.restart_delay_ms;
     managed.restart.throttle_delay_ms = spec.throttle_delay_ms;
@@ -75,18 +80,18 @@ pub fn save_recovery(spec: RecoverySpec) -> OpResult {
         .iter()
         .map(|(code, action)| (code.clone(), ExitActionPolicy { action: *action }))
         .collect();
-    servicemanager_registry::write_managed_config(&spec.name, &managed)
-        .map_err(|e| e.to_string())?;
+    servicemanager_registry::write_managed_config(&spec.name, &managed)?;
     Ok(format!("Saved recovery policy for '{}'.", spec.name))
 }
 
 /// Read the current recovery policy for a managed service. Returns an
 /// `Err` if the service is not NGSM-managed or its config is unreadable.
-pub fn read_recovery(name: &str) -> Result<RecoverySpec, String> {
-    let Some(managed) =
-        servicemanager_registry::read_managed_config(name).map_err(|e| e.to_string())?
-    else {
-        return Err(format!("'{}' is not an NGSM-managed service", name));
+pub fn read_recovery(name: &str) -> Result<RecoverySpec> {
+    let Some(managed) = servicemanager_registry::read_managed_config(name)? else {
+        return Err(message_error(format!(
+            "'{}' is not an NGSM-managed service",
+            name
+        )));
     };
     // The registry pseudo-key "default" mirrors restart.default_action;
     // filter it out so the returned spec only contains per-exit-code
@@ -115,7 +120,9 @@ mod tests {
 
     #[test]
     fn read_recovery_for_unknown_service_returns_error_mentioning_managed() {
-        let err = read_recovery("__definitely_does_not_exist_zzz").unwrap_err();
+        let err = read_recovery("__definitely_does_not_exist_zzz")
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("not an NGSM-managed service") || err.contains("not"),
             "error should mention not-managed: {err}"

@@ -49,7 +49,7 @@ slint = { version = "~1.16", default-features = false, features = ["std", "backe
 slint-build = "~1.16"
 
 [workspace.dependencies.windows]
-version = "0.58"
+version = "0.62.2"
 features = [
     "Win32_Foundation",
     "Win32_System_Services",

@@ -34,8 +34,9 @@ scope.
   [Antivirus & sandbox reports](#antivirus--sandbox-reports) below.
 - Stale or hand-edited registry state under a service's `Parameters` key —
   if the registry is wrong, NGSM may produce surprising output. Use
-  `ngsm get <svc>` / `ngsm set <svc> ...` to repair rather than editing
-  the registry directly.
+  `ngsm get <svc> <param>` / `ngsm set <svc> <param> <value>` to inspect
+  and repair individual managed values rather than editing the registry
+  directly.
 
 ## Supported versions
 
@@ -114,11 +115,14 @@ Signing is on the project's backlog but not yet committed to a timeline.
 
 ### Build provenance
 
-- **All releases are built from the public repository** by CI
-  (`.github/workflows/ci.yml`, `windows-latest` runner, pinned Rust 1.90).
-- **The released `ngsm.exe` is the same artifact** that CI built from the
-  tagged commit. There is no second build pipeline, no third-party
-  repackaging, and no post-build modification.
+- **Release source is public.** Release binaries are produced from the public
+  repository/tag for the release being published.
+- **Current public CI is PR validation only.** The workflow at
+  `src-rust/.github/workflows/ci.yml` runs fmt, clippy, tests, debug build,
+  and release build on `windows-latest` with Rust 1.90, but it does not run
+  on release tags and does not upload release artifacts. Until a release
+  workflow exists, do not treat the PR CI build as provenance for a published
+  `ngsm.exe`.
 - **No telemetry, no network calls** outside what the managed child process
   itself does. NGSM does not phone home.
 
@@ -127,7 +131,7 @@ Signing is on the project's backlog but not yet committed to a timeline.
 The single `ngsm.exe` statically links:
 
 - The Rust standard library and the C runtime (no `MSVCRT*.DLL` dependency).
-- The Slint UI framework, used under its
+- The Slint UI framework, used by the official GUI binary under its
   [GPLv3 license](https://slint.dev/terms-and-conditions.html#gplv3).
 - Standard Rust ecosystem crates (serde, time, clap, etc.) — see
   [Cargo.lock](Cargo.lock) in the repo for the exact resolved dependency
@@ -153,8 +157,8 @@ The single `ngsm.exe` statically links:
   rc.exe from the preinstalled Windows SDK on the GitHub-managed
   `windows-latest` image. Pinning a specific SDK path is on the backlog as
   a supply-chain-hygiene improvement.
-- The MSRV is currently 1.90 (driven by transitive Slint deps); CI pins to
-  exactly that version to prevent toolchain drift between dev and release.
+- The MSRV is currently 1.90 (driven by transitive Slint deps); public PR CI
+  pins to exactly that version to prevent toolchain drift during validation.
 
 ### Audit history
 

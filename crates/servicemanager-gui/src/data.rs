@@ -11,7 +11,7 @@ use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::sync::Arc;
 use std::thread;
 
-use servicemanager_core::ServiceDefinition;
+use servicemanager_core::{Error as CoreError, Result as CoreResult, ServiceDefinition};
 use servicemanager_win32::{enumerate_descendants, query_service, ProcessInfo};
 
 // Re-export the canonical spec types from ops so that other GUI modules that
@@ -79,22 +79,22 @@ pub enum JobResult {
     },
     /// Outcome of a `SaveRecovery` job — routed to the Recovery view's own
     /// status line. `Ok` carries the success message, `Err` the failure.
-    RecoverySaved(Result<String, String>),
+    RecoverySaved(CoreResult<String>),
     /// Outcome of an `Install` job — routed back to the Install dialog. The
     /// `token` echoes the submitting modal's operation id so a stale result
     /// (cancelled / replaced before the worker finished) can be dropped.
     Installed {
         token: u64,
-        result: Result<String, String>,
+        result: CoreResult<String>,
     },
     /// Outcome of an `Edit` job — routed back to the Edit dialog. The
     /// `token` echoes the submitting modal's operation id so a stale result
     /// (cancelled / replaced before the worker finished) can be dropped.
     Edited {
         token: u64,
-        result: Result<String, String>,
+        result: CoreResult<String>,
     },
-    Error(String),
+    Error(CoreError),
 }
 
 /// Maximum number of jobs held in the worker queue. 16 is plenty for any
@@ -285,7 +285,7 @@ fn execute(job: Job) -> JobResult {
                     metrics,
                 }
             }
-            Err(e) => JobResult::Error(format!("enumerate: {e}")),
+            Err(e) => JobResult::Error(CoreError::other(format!("enumerate: {e}"))),
         },
         Job::Install { spec, token } => JobResult::Installed {
             token,
@@ -297,19 +297,19 @@ fn execute(job: Job) -> JobResult {
         },
         Job::Start(n) => match servicemanager_ops::start(&n) {
             Ok(msg) => JobResult::Acted(msg),
-            Err(e) => JobResult::Error(format!("{n}: {e}")),
+            Err(e) => JobResult::Error(CoreError::other(format!("{n}: {e}"))),
         },
         Job::Stop(n) => match servicemanager_ops::stop(&n) {
             Ok(msg) => JobResult::Acted(msg),
-            Err(e) => JobResult::Error(format!("{n}: {e}")),
+            Err(e) => JobResult::Error(CoreError::other(format!("{n}: {e}"))),
         },
         Job::Pause(n) => match servicemanager_ops::pause(&n) {
             Ok(msg) => JobResult::Acted(msg),
-            Err(e) => JobResult::Error(format!("{n}: {e}")),
+            Err(e) => JobResult::Error(CoreError::other(format!("{n}: {e}"))),
         },
         Job::Continue(n) => match servicemanager_ops::continue_service(&n) {
             Ok(msg) => JobResult::Acted(msg),
-            Err(e) => JobResult::Error(format!("{n}: {e}")),
+            Err(e) => JobResult::Error(CoreError::other(format!("{n}: {e}"))),
         },
         Job::Rotate(n) => match servicemanager_ops::rotate(&n) {
             Ok(msg) => JobResult::Acted(msg),
@@ -335,14 +335,14 @@ fn execute(job: Job) -> JobResult {
     }
 }
 
-fn processes(name: &str) -> Result<JobResult, String> {
-    let snap = query_service(name).map_err(|e| e.to_string())?;
+fn processes(name: &str) -> CoreResult<JobResult> {
+    let snap = query_service(name)?;
     let pid = snap
         .runtime
         .as_ref()
         .and_then(|r| r.pid)
-        .ok_or_else(|| format!("service '{name}' is not running"))?;
-    let descendants = enumerate_descendants(pid).map_err(|e| e.to_string())?;
+        .ok_or_else(|| CoreError::other(format!("service '{name}' is not running")))?;
+    let descendants = enumerate_descendants(pid)?;
     Ok(JobResult::Processes {
         service: name.to_string(),
         processes: descendants,

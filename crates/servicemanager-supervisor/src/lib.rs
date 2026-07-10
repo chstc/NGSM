@@ -39,6 +39,9 @@ pub mod event_log;
 pub mod hooks;
 pub mod rotation;
 
+#[cfg(test)]
+pub(crate) static TEST_PROGRAM_DATA_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 use hooks::{find_hook, is_resume_event, run_hook, HookPoint};
 use rotation::{dedup_sinks, maybe_rotate, pipe_reader_loop, RotationSink};
 
@@ -1376,6 +1379,15 @@ mod tests {
     use super::*;
     use servicemanager_core::HookConfig;
 
+    fn isolate_program_data() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
+        let guard = crate::TEST_PROGRAM_DATA_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("NGSM_PROGRAM_DATA_DIR", dir.path());
+        (guard, dir)
+    }
+
     #[test]
     fn resume_events_are_classified() {
         // PBT_APMRESUMEAUTOMATIC = 18, PBT_APMRESUMESUSPEND = 7
@@ -1471,6 +1483,7 @@ mod tests {
 
     #[test]
     fn ignore_quiesce_returns_stopped_when_stop_message_arrives() {
+        let (_g, _dir) = isolate_program_data();
         // `ExitAction::Ignore` parks the supervisor in `wait_for_stop_quiesced`
         // instead of respawning the child. Pin the contract: the quiesce
         // loop must NOT exit on its own, and a Stop message must end it
@@ -1490,6 +1503,7 @@ mod tests {
 
     #[test]
     fn ignore_quiesce_drains_non_terminal_signals_until_stop() {
+        let (_g, _dir) = isolate_program_data();
         // Rotate must NOT terminate the quiesce loop — only Stop (or a
         // disconnected channel) does. Queue a Rotate, then a Stop on the
         // same thread (mpsc preserves single-thread FIFO order across
@@ -1509,6 +1523,7 @@ mod tests {
 
     #[test]
     fn ignore_quiesce_returns_stopped_when_channel_disconnects() {
+        let (_g, _dir) = isolate_program_data();
         // A disconnected channel must be treated as an implicit Stop so the
         // runner's join can return. Drop the supervisor's external signal
         // handles before entering the quiesce loop — the internal `tx`

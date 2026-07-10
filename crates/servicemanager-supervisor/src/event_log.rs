@@ -118,16 +118,18 @@ impl EventWriter {
         let mut line = serde_json::to_string(&record)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         line.push('\n');
-        append_one(&path, line.as_bytes())?;
-        // The record is already on disk; rotation failure is a housekeeping
-        // problem, not a write failure. Log and continue.
-        if let Err(e) = maybe_rotate(&path) {
-            eprintln!(
-                "[supervisor:{}] event log rotation failed (ignored): {e}",
-                self.service
-            );
-        }
-        Ok(())
+        with_event_log_write_lock(|| {
+            append_one(&path, line.as_bytes())?;
+            // The record is already on disk; rotation failure is a housekeeping
+            // problem, not a write failure. Log and continue.
+            if let Err(e) = maybe_rotate(&path) {
+                eprintln!(
+                    "[supervisor:{}] event log rotation failed (ignored): {e}",
+                    self.service
+                );
+            }
+            Ok(())
+        })
     }
 }
 
@@ -140,6 +142,61 @@ fn now_rfc3339() -> String {
 fn append_one(path: &PathBuf, bytes: &[u8]) -> std::io::Result<()> {
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
     f.write_all(bytes)
+}
+
+/// Serialize each event-log append/rotation cycle so concurrent writers never
+/// split records or rotate a file another writer is actively appending to.
+#[cfg(windows)]
+fn with_event_log_write_lock<F>(f: F) -> std::io::Result<()>
+where
+    F: FnOnce() -> std::io::Result<()>,
+{
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
+
+    const TIMEOUT_MS: u32 = 5_000;
+
+    let name_wide: Vec<u16> = "Global\\NGSM-events-log-write\0".encode_utf16().collect();
+    let mutex: HANDLE = unsafe {
+        CreateMutexW(None, false, PCWSTR(name_wide.as_ptr())).map_err(std::io::Error::other)?
+    };
+
+    let wait_result = unsafe { WaitForSingleObject(mutex, TIMEOUT_MS) };
+    if wait_result != WAIT_OBJECT_0 && wait_result != WAIT_ABANDONED {
+        unsafe {
+            let _ = CloseHandle(mutex);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("event log write mutex wait failed: {wait_result:?}"),
+        ));
+    }
+
+    struct MutexGuard(HANDLE);
+    impl Drop for MutexGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = ReleaseMutex(self.0);
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    let _guard = MutexGuard(mutex);
+    f()
+}
+
+#[cfg(not(windows))]
+fn with_event_log_write_lock<F>(f: F) -> std::io::Result<()>
+where
+    F: FnOnce() -> std::io::Result<()>,
+{
+    use std::sync::Mutex;
+
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    f()
 }
 
 /// On Windows: serialize rotation across all supervisor processes using a
@@ -273,15 +330,11 @@ fn rotate_with_mutex(active: &PathBuf) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Tests in this module touch the same env var (`NGSM_PROGRAM_DATA_DIR`)
-    /// and the same on-disk artifacts, so they serialize on this mutex.
-    /// (Cargo runs each test crate's tests in one binary, multithreaded.)
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn isolate() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
-        let guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = crate::TEST_PROGRAM_DATA_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("NGSM_PROGRAM_DATA_DIR", dir.path());
         (guard, dir)

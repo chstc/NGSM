@@ -108,7 +108,7 @@ impl Drop for HandleGuard {
     }
 }
 
-extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> windows::Win32::Foundation::BOOL {
+unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
     // SAFETY: `lparam` was set to `state_ptr` (a `*mut EnumState` on the
     // caller's stack) in `post_wm_close_to_process`. The serialisation mutex
     // ensures no concurrent enumeration, so this is the only live mutable
@@ -123,7 +123,7 @@ extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> windows::Win32::Foun
         // `PostMessageW` is documented to be safe to call from any thread;
         // failures (e.g. closed window, no message queue) are handled below.
         unsafe {
-            match PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) {
+            match PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) {
                 Ok(()) => state.posted += 1,
                 Err(e) => {
                     eprintln!(
@@ -135,5 +135,5 @@ extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> windows::Win32::Foun
         }
     }
     // Continue enumeration.
-    windows::Win32::Foundation::BOOL(1)
+    windows::core::BOOL(1)
 }
