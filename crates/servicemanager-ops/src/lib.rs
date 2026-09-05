@@ -25,6 +25,9 @@
 mod error;
 mod helpers;
 
+#[cfg(all(test, windows))]
+mod config_test_support;
+
 pub mod edit;
 pub mod install;
 pub mod lifecycle;
@@ -42,9 +45,9 @@ pub use specs::{EditSpec, InstallSpec, RecoverySpec};
 
 pub use edit::edit;
 pub use install::install;
-pub use lifecycle::{continue_service, pause, restart, start, stop};
+pub use lifecycle::{continue_service, pause, restart, restart_with_options, start, stop};
 pub use list::list_services;
-pub use recovery::{read_recovery, save_recovery, validate_exit_action_key};
+pub use recovery::{read_recovery, save_recovery, update_recovery, validate_exit_action_key};
 pub use remove::remove;
 pub use repair::repair_runner;
 pub use rotate::rotate;

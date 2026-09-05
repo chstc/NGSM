@@ -1,6 +1,7 @@
 //! Wire protocol shared by the broker server and any client.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// Build the per-launch pipe name from the owner SID and a public,
 /// launcher-supplied nonce.
@@ -17,7 +18,7 @@ pub fn pipe_name_for(owner_sid: &str, pipe_nonce: &str) -> String {
 
 /// A single broker request. `op` selects the handler; `args` is an
 /// opaque JSON value the handler interprets.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Request {
     #[serde(default)]
     pub id: Option<String>,
@@ -30,6 +31,18 @@ pub struct Request {
     pub op: String,
     #[serde(default)]
     pub args: serde_json::Value,
+}
+
+impl fmt::Debug for Request {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Request")
+            .field("id", &self.id)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("op", &self.op)
+            // Arguments are opaque and can contain rejected password fields.
+            .field("args", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Broker response. `status` is `"ok"` for success and `"error"` for
@@ -108,5 +121,24 @@ mod tests {
             serde_json::from_str(r#"{ "op": "list", "token": "abc", "id": "1" }"#).unwrap();
         assert_eq!(req.token.as_deref(), Some("abc"));
         assert_eq!(req.id.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn request_debug_never_prints_capabilities_or_password_arguments() {
+        let request = Request {
+            id: Some("request-id".into()),
+            token: Some("private-capability-value".into()),
+            op: "install".into(),
+            args: serde_json::json!({
+                "name": "TestSvc",
+                "password": "private-password-value",
+            }),
+        };
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("private-capability-value"));
+        assert!(!debug.contains("private-password-value"));
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("request-id"));
+        assert!(debug.contains("install"));
     }
 }

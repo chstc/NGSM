@@ -2,13 +2,28 @@
 
 All notable changes to NGSM. Versions follow `vMAJOR.MINOR.PATCH`; categories follow [Keep a Changelog](https://keepachangelog.com).
 
-## [Unreleased] — 2026-07-09
+## [Unreleased]
 
-End-to-end hardening and compatibility pass across the CLI, GUI, broker,
-shared ops layer, Win32 wrappers, supervisor event log, and documentation.
+## [v0.3.3] — 2026-09-05
+
+End-to-end quality, stability, and compatibility review across the runtime,
+Windows/registry adapters, management interfaces, desktop UI, and release
+process. This release also ships the native-management hardening merged
+after v0.3.2. Detailed behavioral specifications and remediation tracking
+are in [QUALITY-REVIEW.md](QUALITY-REVIEW.md).
 
 ### Added
 
+- Added a tag-triggered Windows release pipeline, gated on locked
+  default/broker configuration checks with Rust 1.90.0. Releases are
+  staged as drafts for inspection.
+- Added an offline-buildable source archive containing the exact tagged
+  project and vendored dependency sources/licenses, SHA-256 manifests,
+  dependency notices, and source/toolchain build metadata.
+- Added Cargo-derived Windows file/product version resources while
+  retaining the executable icon.
+- Added persistent runtime failure diagnostics and focused regression
+  coverage for the accepted quality-review findings.
 - Added native SCM description, dependency, service account, and
   password update support through the shared ops layer. CLI passwords are
   accepted only via `--password-stdin`; broker requests reject password
@@ -29,6 +44,17 @@ shared ops layer, Win32 wrappers, supervisor event log, and documentation.
 
 ### Changed
 
+- Configuration mutations now coordinate complete read/merge/write and
+  rollback sequences across processes instead of silently overwriting
+  independent edits.
+- `--no-purge-config` is rejected before deletion: Windows SCM removes the
+  service registry subtree regardless of NGSM's own cleanup flag. Export
+  configuration before removal if it must be retained.
+- Imported expandable strings retain their raw registry type and are
+  resolved in the service context rather than the editor's environment.
+- Existing process/stream options are applied where supported, with
+  unsupported or unsafe combinations surfaced instead of silently
+  implying they took effect.
 - Moved install hook/rotation support into shared `servicemanager-ops`
   validation and install specs so CLI and broker use the same path.
 - Changed `servicemanager-ops` errors from string-only results to
@@ -42,6 +68,46 @@ shared ops layer, Win32 wrappers, supervisor event log, and documentation.
 
 ### Fixed
 
+- Fixed stop/exit deadlocks, lost terminal controls, zero-delay retry
+  cancellation, stale pause/continue acknowledgements, and pause intent
+  across child generations. Runner completion no longer depends on a quiet
+  control queue.
+- Fixed mandatory restart-delay handling and child-lifetime accounting
+  around slow hooks; startup no longer confirms a generation already known
+  to have exited.
+- Fixed the `Suicide` terminal path so configured SCM recovery does not
+  depend on the non-crash failure-actions flag.
+- Fixed output-reader lifetime/drainage, rotation reopen recovery,
+  CopyAndTruncate data loss, equivalent-path sink ownership, and
+  recoverable pipe-output failures. Rotation hooks now follow a consistent
+  logical lifecycle across supported rotation modes.
+- Fixed quoted hook command execution, shared event-log synchronization
+  access, and previously inert child priority/affinity settings.
+- Fixed native executable misclassification, persistence of unvalidated
+  runner aliases, omitted volume-root ACL checks, NUL-truncated native
+  values, and service/group dependency ambiguity.
+- Fixed post-create installation cleanup, mixed managed/native edit
+  rollback, path-only edits losing stream options, and destructive
+  force-native restart attempts on disabled services.
+- Fixed empty and malformed multi-string handling, environment
+  backslash/whitespace round trips, case-sensitive hook reconciliation,
+  lossy registry-name decoding, late exit-key validation, and targeted
+  repair being blocked by unrelated optional corruption.
+- Fixed canonical exit-code handling across GUI/CLI/broker/registry,
+  including legacy unsigned DWORD identities and split negative CLI
+  mappings.
+- Fixed stale desktop modal/log/recovery results, unrelated busy-state
+  clearing on queue rejection, cached Recovery Reload, lost accepted
+  mutation outcomes, and routine refreshes hiding operation errors.
+- Fixed false healthy availability with missing history, lost pre-window
+  state, retroactive downtime during pause/transitions, actual
+  Running-supervisor recovery classification, Windows service-name case
+  identity, deterministic timestamp ties, and historical local times.
+- Fixed non-atomic preference writes, unreachable long recovery/event
+  lists, cleared-account ambiguity, and Restart gating for disabled live
+  services.
+- Fixed broker admission versus idle-shutdown races and discarded terminal
+  error frames.
 - Serialized supervisor event-log append/rotation cycles and test
   program-data isolation to make concurrent event logging deterministic.
 - Fixed GUI Recovery validation to accept negative exit codes, matching
@@ -61,6 +127,10 @@ shared ops layer, Win32 wrappers, supervisor event log, and documentation.
 
 ### Documentation
 
+- Added release integrity/rebuild/licensing instructions, explicit
+  asynchronous SCM control semantics, environment encoding guidance,
+  supported argument examples, explicit legacy-option limitations, and the
+  complete quality-review ledger.
 - Updated README, SECURITY, and architecture/build documentation for the
   new command surface, GUI account/password behavior, broker protocol,
   repair/rebind policy, MSRV, release provenance, install location

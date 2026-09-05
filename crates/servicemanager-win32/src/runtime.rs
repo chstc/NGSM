@@ -5,12 +5,16 @@
 //! required by `StartServiceCtrlDispatcherW` and exposes a safe
 //! [`ServiceContext`] handle to the supplied service closure.
 
+use std::cell::RefCell;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
-use servicemanager_core::{Error, Result};
+use servicemanager_core::{validate_service_name, Error, Result};
 use windows::core::{Error as WinError, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{ERROR_RETRY, ERROR_SERVICE_NOT_ACTIVE};
 use windows::Win32::System::Services::{
     RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW,
     SERVICE_ACCEPT_PAUSE_CONTINUE, SERVICE_ACCEPT_POWEREVENT, SERVICE_ACCEPT_SHUTDOWN,
@@ -88,17 +92,16 @@ where
 /// rest of the process so the control handler can never dereference freed
 /// memory.
 struct ContextInner {
-    status_handle: SERVICE_STATUS_HANDLE,
+    status_handle: OnceLock<SERVICE_STATUS_HANDLE>,
     name: String,
-    controls_tx: SyncSender<ServiceControl>,
+    controls_tx: ControlSender,
     checkpoint: Mutex<u32>,
 }
 
 // SAFETY: `SERVICE_STATUS_HANDLE` is an opaque SCM-managed token used only as
 // an argument to `SetServiceStatus`; the SCM itself is thread-safe for that
-// call. `Sender<ServiceControl>` is already `Send + Sync` and `Mutex<u32>`
-// needs no special justification, so the entire `ContextInner` is sound to
-// share across threads.
+// call. OnceLock publishes that handle, ControlSender holds a synchronized
+// channel/atomic state, and checkpoint updates are protected by Mutex.
 unsafe impl Send for ContextInner {}
 // SAFETY: Same reasoning as Send above — all fields are independently
 // thread-safe and no field is mutated without synchronisation.
@@ -107,7 +110,186 @@ unsafe impl Sync for ContextInner {}
 /// Safe handle to the per-service status reporting + control-event stream.
 pub struct ServiceContext {
     inner: &'static ContextInner,
-    controls_rx: Receiver<ServiceControl>,
+    controls_rx: ServiceControlReceiver,
+}
+
+enum ControlMessage {
+    Ordinary(ServiceControl),
+    Wake,
+}
+
+const STOP_REQUESTED: u8 = 1;
+const TERMINAL_COMMITTED: u8 = 2;
+
+struct ControlPending {
+    terminal: AtomicU8,
+    decision: AtomicU8,
+    alive: AtomicBool,
+}
+
+struct ControlSender {
+    tx: SyncSender<ControlMessage>,
+    pending: Arc<ControlPending>,
+}
+
+/// Bounded ordinary controls plus a coalesced, higher-priority Stop/Shutdown.
+/// The receive methods retain the std::mpsc receiver's signatures.
+pub struct ServiceControlReceiver {
+    rx: Receiver<ControlMessage>,
+    pending: Arc<ControlPending>,
+    deferred: RefCell<Option<ServiceControl>>,
+}
+
+fn control_channel() -> (ControlSender, ServiceControlReceiver) {
+    let (tx, rx) = sync_channel(8);
+    let pending = Arc::new(ControlPending {
+        terminal: AtomicU8::new(0),
+        decision: AtomicU8::new(0),
+        alive: AtomicBool::new(true),
+    });
+    (
+        ControlSender {
+            tx,
+            pending: pending.clone(),
+        },
+        ServiceControlReceiver {
+            rx,
+            pending,
+            deferred: RefCell::new(None),
+        },
+    )
+}
+
+impl Drop for ServiceControlReceiver {
+    fn drop(&mut self) {
+        self.pending.alive.store(false, Ordering::Release);
+    }
+}
+
+impl ServiceControlReceiver {
+    fn stop_requested(&self) -> bool {
+        self.pending.decision.load(Ordering::Acquire) & STOP_REQUESTED != 0
+    }
+
+    fn claim_terminal(&self) -> bool {
+        self.pending
+            .decision
+            .fetch_or(TERMINAL_COMMITTED, Ordering::AcqRel)
+            & STOP_REQUESTED
+            != 0
+    }
+
+    fn terminal(&self) -> Option<ServiceControl> {
+        match self.pending.terminal.swap(0, Ordering::AcqRel) {
+            0 => None,
+            bits if bits & 2 != 0 => Some(ServiceControl::Shutdown),
+            _ => Some(ServiceControl::Stop),
+        }
+    }
+
+    fn ready(&self) -> Option<ServiceControl> {
+        self.terminal()
+            .or_else(|| self.deferred.borrow_mut().take())
+    }
+
+    fn deliver(&self, control: ServiceControl) -> ServiceControl {
+        if let Some(terminal) = self.terminal() {
+            *self.deferred.borrow_mut() = Some(control);
+            terminal
+        } else {
+            control
+        }
+    }
+
+    pub fn recv(&self) -> std::result::Result<ServiceControl, std::sync::mpsc::RecvError> {
+        loop {
+            if let Some(control) = self.ready() {
+                return Ok(control);
+            }
+            match self.rx.recv() {
+                Ok(ControlMessage::Ordinary(control)) => return Ok(self.deliver(control)),
+                Ok(ControlMessage::Wake) => {}
+                Err(error) => return self.terminal().ok_or(error),
+            }
+        }
+    }
+
+    pub fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> std::result::Result<ServiceControl, std::sync::mpsc::RecvTimeoutError> {
+        let started = Instant::now();
+        loop {
+            if let Some(control) = self.ready() {
+                return Ok(control);
+            }
+            match self
+                .rx
+                .recv_timeout(timeout.saturating_sub(started.elapsed()))
+            {
+                Ok(ControlMessage::Ordinary(control)) => return Ok(self.deliver(control)),
+                Ok(ControlMessage::Wake) => {}
+                Err(error) => return self.terminal().ok_or(error),
+            }
+        }
+    }
+
+    pub fn try_recv(&self) -> std::result::Result<ServiceControl, std::sync::mpsc::TryRecvError> {
+        loop {
+            if let Some(control) = self.ready() {
+                return Ok(control);
+            }
+            match self.rx.try_recv() {
+                Ok(ControlMessage::Ordinary(control)) => return Ok(self.deliver(control)),
+                Ok(ControlMessage::Wake) => {}
+                Err(error) => return self.terminal().ok_or(error),
+            }
+        }
+    }
+}
+
+fn dispatch_control(sender: &ControlSender, control: ServiceControl) -> u32 {
+    use std::sync::mpsc::TrySendError;
+    if control == ServiceControl::Interrogate {
+        return 0;
+    }
+    if !sender.pending.alive.load(Ordering::Acquire)
+        || sender.pending.decision.load(Ordering::Acquire) & TERMINAL_COMMITTED != 0
+    {
+        return ERROR_SERVICE_NOT_ACTIVE.0;
+    }
+    let message = match control {
+        ServiceControl::Stop | ServiceControl::Shutdown => {
+            // This CAS and claim_terminal share one linearization point: a
+            // successful terminal claim must never be followed by an accepted
+            // Stop, while a Stop that wins forces a clean terminal outcome.
+            if sender
+                .pending
+                .decision
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                    (state & TERMINAL_COMMITTED == 0).then_some(state | STOP_REQUESTED)
+                })
+                .is_err()
+            {
+                return ERROR_SERVICE_NOT_ACTIVE.0;
+            }
+            sender.pending.terminal.fetch_or(
+                if control == ServiceControl::Shutdown {
+                    2
+                } else {
+                    1
+                },
+                Ordering::Release,
+            );
+            ControlMessage::Wake
+        }
+        other => ControlMessage::Ordinary(other),
+    };
+    match sender.tx.try_send(message) {
+        Ok(()) | Err(TrySendError::Full(ControlMessage::Wake)) => 0,
+        Err(TrySendError::Full(_)) => ERROR_RETRY.0,
+        Err(TrySendError::Disconnected(_)) => ERROR_SERVICE_NOT_ACTIVE.0,
+    }
 }
 
 impl ServiceContext {
@@ -115,8 +297,27 @@ impl ServiceContext {
         &self.inner.name
     }
 
-    pub fn controls(&self) -> &Receiver<ServiceControl> {
+    pub fn controls(&self) -> &ServiceControlReceiver {
         &self.controls_rx
+    }
+
+    /// Whether Stop/Shutdown has won acceptance for this lifecycle.
+    /// Published before control delivery and success acknowledgement, and
+    /// never cleared by receiving/coalescing controls. Use at terminal policy
+    /// decisions instead of inferring stop intent from an emptied queue.
+    pub fn stop_requested(&self) -> bool {
+        self.controls_rx.stop_requested()
+    }
+
+    /// Atomically commit to completing this lifecycle. Returns true if an
+    /// accepted Stop/Shutdown won the race, requiring a clean stop rather than
+    /// crash-style recovery. Otherwise commits completion before any later
+    /// Stop/Shutdown can be accepted; HandlerEx rejects those requests.
+    ///
+    /// Call only at the irreversible terminal-policy boundary, not to poll.
+    /// Repeated calls return the same result. Interrogate remains a no-op.
+    pub fn claim_terminal(&self) -> bool {
+        self.controls_rx.claim_terminal()
     }
 
     pub fn report_start_pending(&self, wait_hint_ms: u32) -> Result<()> {
@@ -179,7 +380,12 @@ impl ServiceContext {
         // and is valid for the process lifetime; `status` is a local struct on the
         // stack whose pointer is only used for the duration of this call.
         unsafe {
-            SetServiceStatus(self.inner.status_handle, &status as *const SERVICE_STATUS)
+            let handle = self
+                .inner
+                .status_handle
+                .get()
+                .ok_or_else(|| Error::Scm("service status handle is not initialized".into()))?;
+            SetServiceStatus(*handle, &status as *const SERVICE_STATUS)
                 .map_err(|e: WinError| map_win_error("SetServiceStatus", e))
         }
     }
@@ -215,6 +421,7 @@ static CONTEXT_PTR: OnceLock<usize> = OnceLock::new();
 /// Run the SCM dispatcher for the named service. Blocks until the service
 /// stops. Must be called once per process.
 pub fn run_service_dispatcher<L: ServiceLifecycle>(service_name: &str, lifecycle: L) -> Result<()> {
+    validate_service_name(service_name)?;
     let slot = LIFECYCLE.get_or_init(|| Mutex::new(None));
     {
         let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
@@ -271,17 +478,17 @@ extern "system" fn service_main_thunk(_argc: u32, _argv: *mut PWSTR) {
     // Capacity of 8 is generous for SCM controls (Stop/Pause/Continue are
     // rare and sent one at a time by the SCM). The bounded channel prevents
     // unbounded accumulation if the service loop stalls.
-    let (tx, rx) = sync_channel(8);
+    let (tx, rx) = control_channel();
     // Leak the inner state so the control handler can dereference it for the
     // remainder of the process lifetime. `Box::leak` returns a `&'static mut`,
     // which we downgrade to a shared `&'static` reference.
-    let inner: &'static mut ContextInner = Box::leak(Box::new(ContextInner {
-        status_handle: SERVICE_STATUS_HANDLE::default(),
+    let inner: &'static ContextInner = Box::leak(Box::new(ContextInner {
+        status_handle: OnceLock::new(),
         name,
         controls_tx: tx,
         checkpoint: Mutex::new(0),
     }));
-    let inner_ptr = inner as *mut ContextInner;
+    let inner_ptr = inner as *const ContextInner;
     let _ = CONTEXT_PTR.set(inner_ptr as usize);
 
     // SAFETY: `name_wide` is a null-terminated wide string alive for this call;
@@ -306,8 +513,7 @@ extern "system" fn service_main_thunk(_argc: u32, _argv: *mut PWSTR) {
     };
 
     // Backfill the SCM-issued handle so future status reports go to SCM.
-    inner.status_handle = status_handle;
-    let inner: &'static ContextInner = inner;
+    let _ = inner.status_handle.set(status_handle);
 
     let ctx = ServiceContext {
         inner,
@@ -331,31 +537,219 @@ extern "system" fn control_handler_thunk(
 ) -> u32 {
     let inner = lpcontext as *const ContextInner;
     if inner.is_null() {
-        return 0;
+        return ERROR_SERVICE_NOT_ACTIVE.0;
     }
     // SAFETY: `lpcontext` was set to `inner_ptr` (a Box-leaked ContextInner) in
     // `service_main_thunk` and that pointer is valid for the process lifetime.
-    // We checked above that it is non-null. No mutable alias exists: the only
-    // mutation (status_handle backfill) completed before `lifecycle.run()`.
+    // We checked above that it is non-null. Initialization and pending controls
+    // use synchronized state; registration never exposes a mutable alias.
     let inner = unsafe { &*inner };
     let control = ServiceControl::from_win32(dwcontrol, dwevttype);
-    match inner.controls_tx.try_send(control) {
-        Ok(()) => {}
-        Err(std::sync::mpsc::TrySendError::Full(c)) => {
-            // The service loop has stalled with 8 pending controls — extremely
-            // unlikely. Log and drop; the SCM callback cannot propagate errors.
-            eprintln!("[runtime] dropped SCM control {:?} — channel full", c);
-        }
-        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-            eprintln!("[runtime] dropped SCM control — receiver gone");
-        }
-    }
-    0
+    dispatch_control(&inner.controls_tx, control)
 }
 
 fn strip_trailing_nul(buf: &[u16]) -> &[u16] {
     match buf.iter().position(|&c| c == 0) {
         Some(end) => &buf[..end],
         None => buf,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_claim_rejects_later_stop_and_shutdown() {
+        let (tx, rx) = control_channel();
+        assert!(!rx.claim_terminal());
+        for control in [
+            ServiceControl::Stop,
+            ServiceControl::Shutdown,
+            ServiceControl::Pause,
+        ] {
+            assert_eq!(dispatch_control(&tx, control), ERROR_SERVICE_NOT_ACTIVE.0);
+        }
+        assert_eq!(dispatch_control(&tx, ServiceControl::Interrogate), 0);
+        assert!(!rx.stop_requested());
+        assert!(!rx.claim_terminal());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn accepted_stop_wins_terminal_claim_even_after_delivery() {
+        for control in [ServiceControl::Stop, ServiceControl::Shutdown] {
+            let (tx, rx) = control_channel();
+            assert_eq!(dispatch_control(&tx, control), 0);
+            assert_eq!(rx.recv().unwrap(), control);
+            assert!(rx.claim_terminal());
+            assert!(rx.claim_terminal());
+            assert!(rx.stop_requested());
+            assert_eq!(
+                dispatch_control(&tx, ServiceControl::Stop),
+                ERROR_SERVICE_NOT_ACTIVE.0
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_claim_and_stop_acceptance_have_one_atomic_winner() {
+        for iteration in 0..32 {
+            let (tx, rx) = control_channel();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let sender_barrier = barrier.clone();
+            let sender = std::thread::spawn(move || {
+                sender_barrier.wait();
+                dispatch_control(
+                    &tx,
+                    if iteration % 2 == 0 {
+                        ServiceControl::Stop
+                    } else {
+                        ServiceControl::Shutdown
+                    },
+                )
+            });
+            barrier.wait();
+            let stopped = rx.claim_terminal();
+            let result = sender.join().unwrap();
+            assert_eq!(result == 0, stopped);
+            assert_eq!(rx.stop_requested(), stopped);
+            assert_eq!(rx.claim_terminal(), stopped);
+        }
+    }
+
+    #[test]
+    fn stop_intent_survives_full_queue_delivery_and_drain() {
+        for terminal in [ServiceControl::Stop, ServiceControl::Shutdown] {
+            let (tx, rx) = control_channel();
+            assert!(!rx.stop_requested());
+            for _ in 0..8 {
+                assert_eq!(dispatch_control(&tx, ServiceControl::Other(174)), 0);
+            }
+            assert!(!rx.stop_requested());
+            assert_eq!(dispatch_control(&tx, terminal), 0);
+            assert!(rx.stop_requested());
+            assert_eq!(rx.recv_timeout(Duration::ZERO).unwrap(), terminal);
+            for _ in 0..8 {
+                assert_eq!(rx.try_recv().unwrap(), ServiceControl::Other(174));
+            }
+            assert!(matches!(
+                rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            assert!(rx.stop_requested());
+        }
+    }
+
+    #[test]
+    fn ordinary_and_disconnected_controls_do_not_publish_stop_intent() {
+        let (tx, rx) = control_channel();
+        for control in [
+            ServiceControl::Pause,
+            ServiceControl::Continue,
+            ServiceControl::Interrogate,
+        ] {
+            assert_eq!(dispatch_control(&tx, control), 0);
+            assert!(!rx.stop_requested());
+        }
+        drop(rx);
+        assert_eq!(
+            dispatch_control(&tx, ServiceControl::Stop),
+            ERROR_SERVICE_NOT_ACTIVE.0
+        );
+        assert_eq!(
+            tx.pending.decision.load(Ordering::Acquire) & STOP_REQUESTED,
+            0
+        );
+    }
+
+    #[test]
+    fn waiting_receiver_observes_stop_intent_before_returning_the_control() {
+        let (tx, rx) = control_channel();
+        let waiter = std::thread::spawn(move || {
+            let control = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(rx.stop_requested());
+            control
+        });
+        assert_eq!(dispatch_control(&tx, ServiceControl::Shutdown), 0);
+        assert_eq!(waiter.join().unwrap(), ServiceControl::Shutdown);
+    }
+
+    #[test]
+    fn dispatcher_rejects_invalid_names_before_registering_global_state() {
+        for name in ["", "bad\0name", "bad\\name"] {
+            assert!(matches!(
+                run_service_dispatcher(name, |_: ServiceContext| {}),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
+    }
+    #[test]
+    fn terminal_racing_dequeued_control_preserves_the_ordinary_control() {
+        let (tx, rx) = control_channel();
+        assert_eq!(dispatch_control(&tx, ServiceControl::Stop), 0);
+        assert_eq!(rx.deliver(ServiceControl::Pause), ServiceControl::Stop);
+        assert_eq!(rx.try_recv().unwrap(), ServiceControl::Pause);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn terminal_controls_survive_a_full_ordinary_queue() {
+        for terminal in [ServiceControl::Stop, ServiceControl::Shutdown] {
+            let (tx, rx) = control_channel();
+            for _ in 0..8 {
+                assert_eq!(dispatch_control(&tx, ServiceControl::Other(174)), 0);
+            }
+            assert_eq!(dispatch_control(&tx, ServiceControl::Pause), ERROR_RETRY.0);
+            for _ in 0..100 {
+                assert_eq!(dispatch_control(&tx, terminal), 0);
+            }
+            assert_eq!(rx.recv_timeout(Duration::ZERO).unwrap(), terminal);
+            for _ in 0..8 {
+                assert_eq!(rx.try_recv().unwrap(), ServiceControl::Other(174));
+            }
+            assert!(matches!(
+                rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[test]
+    fn shutdown_coalesces_stop_and_wakes_a_waiting_receiver() {
+        let (tx, rx) = control_channel();
+        assert_eq!(dispatch_control(&tx, ServiceControl::Stop), 0);
+        assert_eq!(dispatch_control(&tx, ServiceControl::Shutdown), 0);
+        assert_eq!(rx.recv().unwrap(), ServiceControl::Shutdown);
+        let waiter = std::thread::spawn(move || rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert_eq!(dispatch_control(&tx, ServiceControl::Stop), 0);
+        assert_eq!(waiter.join().unwrap(), ServiceControl::Stop);
+    }
+
+    #[test]
+    fn interrogate_uses_no_capacity_and_disconnected_controls_fail() {
+        let (tx, rx) = control_channel();
+        for _ in 0..100 {
+            assert_eq!(dispatch_control(&tx, ServiceControl::Interrogate), 0);
+        }
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(rx);
+        for control in [
+            ServiceControl::Stop,
+            ServiceControl::Shutdown,
+            ServiceControl::Pause,
+            ServiceControl::Other(174),
+        ] {
+            assert_eq!(dispatch_control(&tx, control), ERROR_SERVICE_NOT_ACTIVE.0);
+        }
     }
 }

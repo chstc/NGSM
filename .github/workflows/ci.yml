@@ -1,24 +1,24 @@
 name: CI
 
-# Triggered only by pull requests targeting main — we run validation
-# against the integration result without burning cycles on every push
-# to a feature branch. The maintainer's local workflow handles iterative
-# development; CI is the merge gate.
 on:
   pull_request:
     branches: [main]
+  push:
+    branches: [main]
+  workflow_call:
 
-# Cancel any superseded runs on the same PR — when new commits get
-# force-pushed mid-run, the older run is wasted work.
+permissions:
+  contents: read
+
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   windows-checks:
     name: fmt + clippy + test + build (windows-latest)
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     # NGSM is Windows-only by design — the supervisor calls Win32 SCM /
     # registry / job-object APIs directly and `#[cfg(not(windows))]`
@@ -27,13 +27,15 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       # Pin to the workspace's `rust-version = "1.90"` so CI matches the
       # MSRV — drift here is exactly the regression class that lets fmt
       # noise from a newer rustc slip past local validation.
       - name: Install Rust 1.90 (rustfmt, clippy)
-        uses: dtolnay/rust-toolchain@1.90.0
+        uses: dtolnay/rust-toolchain@49fda20b3f489226feadfba7767be1db54e2cee1 # 1.90.0
         with:
           components: rustfmt, clippy
 
@@ -41,10 +43,10 @@ jobs:
       # writes the cache when the PR is from the same repo, so fork PRs
       # benefit from the read but can't poison the cache.
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           shared-key: ngsm-windows
-          save-if: ${{ github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name }}
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name }}
 
       # Run in increasing-cost order so a fast failure surfaces fast.
       # fmt is cheapest; release build is most expensive.
@@ -52,19 +54,25 @@ jobs:
       - name: cargo fmt --all -- --check
         run: cargo fmt --all -- --check
 
-      - name: cargo clippy --workspace --all-targets -- -D warnings
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Lint default and broker configurations
+        run: |
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       # --no-fail-fast surfaces every failing test in one run rather than
       # halting at the first, so reviewers see the full damage profile.
-      - name: cargo test --workspace
-        run: cargo test --workspace --no-fail-fast
+      - name: Test default and broker configurations
+        run: |
+          cargo test --locked --workspace --no-fail-fast
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --workspace --all-features --no-fail-fast
 
       - name: cargo build --workspace
-        run: cargo build --workspace
+        run: cargo build --locked --workspace
 
       # Release-only build catches Slint / generic-monomorphization issues
       # that don't show up in the debug build. ~2 extra minutes; worth it
       # at PR-time even if not at every iteration.
       - name: cargo build --release
-        run: cargo build --release
+        run: cargo build --locked --release -p servicemanager-cli

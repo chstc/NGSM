@@ -11,6 +11,7 @@ export struct ProcessRow {
 // A labelled single-line text field.
 component Field inherits Rectangle {
     in property <string> label;
+    in property <bool> enabled: true;
     in-out property <string> text;
     height: 54px;
     VerticalLayout {
@@ -31,6 +32,7 @@ component Field inherits Rectangle {
                 padding-right: 10px;
                 ti := TextInput {
                     text <=> root.text;
+                    enabled: root.enabled;
                     color: Theme.text;
                     font-size: 13px;
                     single-line: true;
@@ -43,6 +45,7 @@ component Field inherits Rectangle {
 
 component PasswordField inherits Rectangle {
     in property <string> label;
+    in property <bool> enabled: true;
     in-out property <string> text;
     height: 54px;
     VerticalLayout {
@@ -63,6 +66,7 @@ component PasswordField inherits Rectangle {
                 padding-right: 10px;
                 ti := TextInput {
                     text <=> root.text;
+                    enabled: root.enabled;
                     color: Theme.text;
                     font-size: 13px;
                     input-type: InputType.password;
@@ -106,6 +110,7 @@ component ReadField inherits Rectangle {
 // 3-way startup-type picker: 0 Manual, 1 Automatic, 2 Disabled.
 component StartTypePick inherits Rectangle {
     in-out property <int> value;
+    in property <bool> enabled: true;
     height: 54px;
     VerticalLayout {
         spacing: 5px;
@@ -132,6 +137,7 @@ component StartTypePick inherits Rectangle {
                     vertical-alignment: center;
                 }
                 TouchArea {
+                    enabled: root.enabled;
                     mouse-cursor: pointer;
                     clicked => { root.value = i; }
                 }
@@ -188,28 +194,28 @@ export component InstallDialog inherits Rectangle {
                 vertical-stretch: 1;
                 VerticalLayout {
                     spacing: 8px;
-                    Field { label: "Service name"; text <=> root.name; }
-                    Field { label: "Display name"; text <=> root.display-name; }
-                    Field { label: "Description"; text <=> root.description; }
-                    Field { label: "Application"; text <=> root.application; }
+                    Field { label: "Service name"; text <=> root.name; enabled: !root.busy; }
+                    Field { label: "Display name"; text <=> root.display-name; enabled: !root.busy; }
+                    Field { label: "Description"; text <=> root.description; enabled: !root.busy; }
+                    Field { label: "Application"; text <=> root.application; enabled: !root.busy; }
                     HorizontalLayout {
                         alignment: start;
-                        GhostButton { text: "Browse for executable…"; clicked => { root.browse-app(); } }
+                        GhostButton { text: "Browse for executable…"; enabled: !root.busy; clicked => { root.browse-app(); } }
                     }
-                    Field { label: "Arguments"; text <=> root.arguments; }
-                    Field { label: "Working directory"; text <=> root.working-dir; }
-                    Field { label: "stdout log"; text <=> root.stdout-path; }
-                    Field { label: "stderr log"; text <=> root.stderr-path; }
-                    Field { label: "Service account (optional)"; text <=> root.account; }
-                    PasswordField { label: "Password (optional)"; text <=> root.password; }
-                    StartTypePick { value <=> root.start-type; }
+                    Field { label: "Arguments"; text <=> root.arguments; enabled: !root.busy; }
+                    Field { label: "Working directory"; text <=> root.working-dir; enabled: !root.busy; }
+                    Field { label: "stdout log"; text <=> root.stdout-path; enabled: !root.busy; }
+                    Field { label: "stderr log"; text <=> root.stderr-path; enabled: !root.busy; }
+                    Field { label: "Service account (optional)"; text <=> root.account; enabled: !root.busy; }
+                    PasswordField { label: "Password (optional)"; text <=> root.password; enabled: !root.busy; }
+                    StartTypePick { value <=> root.start-type; enabled: !root.busy; }
                 }
             }
             ErrorText { text: root.error; visible: root.error != ""; }
             HorizontalLayout {
                 spacing: 8px;
                 Rectangle { }
-                GhostButton { text: "Cancel"; clicked => { root.cancel(); } }
+                GhostButton { text: "Cancel"; enabled: !root.busy; clicked => { root.cancel(); } }
                 AccentButton { text: "Install"; enabled: !root.busy; clicked => { root.submit(); } }
             }
         }
@@ -259,20 +265,20 @@ export component EditDialog inherits Rectangle {
                 VerticalLayout {
                     spacing: 8px;
                     ReadField { label: "Service name"; value: root.service-name; }
-                    Field { label: "Display name"; text <=> root.display-name; }
-                    Field { label: "Description"; text <=> root.description; }
-                    Field { label: "Application"; text <=> root.application; }
+                    Field { label: "Display name"; text <=> root.display-name; enabled: !root.busy; }
+                    Field { label: "Description"; text <=> root.description; enabled: !root.busy; }
+                    Field { label: "Application"; text <=> root.application; enabled: !root.busy; }
                     HorizontalLayout {
                         alignment: start;
-                        GhostButton { text: "Browse for executable…"; clicked => { root.browse-app(); } }
+                        GhostButton { text: "Browse for executable…"; enabled: !root.busy; clicked => { root.browse-app(); } }
                     }
-                    Field { label: "Arguments"; text <=> root.arguments; }
-                    Field { label: "Working directory"; text <=> root.working-dir; }
-                    Field { label: "stdout log"; text <=> root.stdout-path; }
-                    Field { label: "stderr log"; text <=> root.stderr-path; }
-                    Field { label: "Service account"; text <=> root.account; }
-                    PasswordField { label: "New password (blank = unchanged)"; text <=> root.password; }
-                    StartTypePick { value <=> root.start-type; }
+                    Field { label: "Arguments"; text <=> root.arguments; enabled: !root.busy; }
+                    Field { label: "Working directory"; text <=> root.working-dir; enabled: !root.busy; }
+                    Field { label: "stdout log"; text <=> root.stdout-path; enabled: !root.busy; }
+                    Field { label: "stderr log"; text <=> root.stderr-path; enabled: !root.busy; }
+                    Field { label: "Service account"; text <=> root.account; enabled: !root.busy; }
+                    PasswordField { label: "New password (blank = unchanged)"; text <=> root.password; enabled: !root.busy; }
+                    StartTypePick { value <=> root.start-type; enabled: !root.busy; }
                     Text {
                         text: "Only fields you change are written. Password text is cleared after submit.";
                         color: Theme.text-faint;
@@ -284,7 +290,7 @@ export component EditDialog inherits Rectangle {
             HorizontalLayout {
                 spacing: 8px;
                 Rectangle { }
-                GhostButton { text: "Cancel"; clicked => { root.cancel(); } }
+                GhostButton { text: "Cancel"; enabled: !root.busy; clicked => { root.cancel(); } }
                 AccentButton { text: "Save"; enabled: !root.busy; clicked => { root.submit(); } }
             }
         }
@@ -295,6 +301,7 @@ export component EditDialog inherits Rectangle {
 
 export component RemoveDialog inherits Rectangle {
     in property <string> service-name;
+    in property <string> error;
     callback confirm();
     callback cancel();
 
@@ -303,7 +310,7 @@ export component RemoveDialog inherits Rectangle {
 
     Card {
         width: 460px;
-        height: 220px;
+        height: 260px;
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         VerticalLayout {
@@ -321,6 +328,7 @@ export component RemoveDialog inherits Rectangle {
                 font-size: 13px;
                 wrap: word-wrap;
             }
+            ErrorText { text: root.error; visible: root.error != ""; }
             Rectangle { }
             HorizontalLayout {
                 spacing: 8px;
@@ -337,9 +345,12 @@ export component RemoveDialog inherits Rectangle {
 export component ProcessesDialog inherits Rectangle {
     in property <string> service-name;
     in property <[ProcessRow]> rows;
+    in property <bool> busy;
+    in property <string> error;
     in property <int> sort-column;
     in property <bool> sort-ascending;
     callback close();
+    callback reload();
     callback sort-changed(int);
 
     background: Theme.overlay;
@@ -359,6 +370,12 @@ export component ProcessesDialog inherits Rectangle {
                 font-size: 18px;
                 font-weight: 800;
             }
+            Text {
+                text: root.busy ? "Loading processes…" : root.rows.length + " process(es)";
+                color: Theme.text-faint;
+                font-size: 12px;
+            }
+            ErrorText { text: root.error; visible: root.error != ""; }
             Rectangle { height: 4px; }
             HorizontalLayout {
                 padding-left: 4px;
@@ -403,6 +420,7 @@ export component ProcessesDialog inherits Rectangle {
             }
             HorizontalLayout {
                 Rectangle { }
+                GhostButton { text: "Reload"; enabled: !root.busy; clicked => { root.reload(); } }
                 GhostButton { text: "Close"; clicked => { root.close(); } }
             }
         }
@@ -413,6 +431,8 @@ export component ProcessesDialog inherits Rectangle {
 
 export component WarningsDialog inherits Rectangle {
     in property <[string]> rows;
+    in property <string> heading: "Scan warnings";
+    in property <string> description: "Issues encountered while reading services from the SCM and registry.";
     callback close();
 
     background: Theme.overlay;
@@ -427,13 +447,13 @@ export component WarningsDialog inherits Rectangle {
             padding: 24px;
             spacing: 8px;
             Text {
-                text: "Scan warnings";
+                text: root.heading;
                 color: Theme.text;
                 font-size: 18px;
                 font-weight: 800;
             }
             Text {
-                text: "Issues encountered while reading services from the SCM and registry. Each entry is prefixed with the service name.";
+                text: root.description;
                 color: Theme.text-faint;
                 font-size: 12px;
                 wrap: word-wrap;

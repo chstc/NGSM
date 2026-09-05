@@ -6,6 +6,7 @@
 
 pub mod error;
 pub mod events;
+mod expansion;
 pub mod model;
 pub mod paths;
 pub mod validate;

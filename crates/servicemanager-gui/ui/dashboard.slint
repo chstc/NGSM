@@ -1,5 +1,6 @@
 import { Theme } from "theme.slint";
 import { Card, StatCard, EventRow } from "widgets.slint";
+import { ListView } from "std-widgets.slint";
 
 export struct EventEntry {
     label: string,
@@ -69,9 +70,10 @@ export component DashboardView inherits Rectangle {
 
         // --- recent events ---
         Card {
+            min-height: 0px;
+            vertical-stretch: 1;
             VerticalLayout {
                 padding: 20px;
-                alignment: start;
                 spacing: 0px;
                 Text {
                     text: "Recent Events";
@@ -80,12 +82,16 @@ export component DashboardView inherits Rectangle {
                     font-weight: 800;
                 }
                 Rectangle { height: 10px; }
-                for e in root.events : EventRow {
-                    label: e.label;
-                    time: e.time;
-                    tint: e.kind == 1 ? Theme.amber
-                        : e.kind == 2 ? Theme.cyan
-                        : Theme.green;
+                ListView {
+                    min-height: 0px;
+                    vertical-stretch: 1;
+                    for e in root.events : EventRow {
+                        label: e.label;
+                        time: e.time;
+                        tint: e.kind == 1 ? Theme.amber
+                            : e.kind == 2 ? Theme.cyan
+                            : Theme.green;
+                    }
                 }
             }
         }

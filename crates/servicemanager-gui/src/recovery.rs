@@ -6,7 +6,9 @@
 
 use std::collections::BTreeMap;
 
-use servicemanager_core::{ExitAction, ManagedApplicationConfig};
+use servicemanager_core::ExitAction;
+#[cfg(test)]
+use servicemanager_core::ManagedApplicationConfig;
 
 use crate::data::RecoverySpec;
 
@@ -48,7 +50,31 @@ fn int_to_exit_action(i: i32) -> ExitAction {
 }
 
 impl RecoveryForm {
+    pub fn from_spec(spec: &RecoverySpec) -> Self {
+        Self {
+            service: spec.name.clone(),
+            restart_delay: spec
+                .restart_delay_ms
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
+            throttle: spec
+                .throttle_delay_ms
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
+            default_action: exit_action_to_int(spec.default_action),
+            rows: spec
+                .exit_actions
+                .iter()
+                .map(|(code, action)| RecoveryExitRow {
+                    exit_code: code.clone(),
+                    action: exit_action_to_int(*action),
+                })
+                .collect(),
+        }
+    }
+
     /// Build a form from a service's cached managed config.
+    #[cfg(test)]
     pub fn from_managed(service: &str, cfg: &ManagedApplicationConfig) -> Self {
         let ms_to_string = |v: Option<u32>| v.map(|n| n.to_string()).unwrap_or_default();
         let rows = cfg
@@ -87,15 +113,16 @@ impl RecoveryForm {
             if code.is_empty() {
                 continue;
             }
-            if code.parse::<i32>().is_err() {
-                return Err(format!("Exit code '{code}' is not a valid number."));
-            }
-            if exit_actions.contains_key(code) {
+            let code = code
+                .parse::<i32>()
+                .map_err(|_| format!("Exit code '{code}' is not a valid signed 32-bit number."))?
+                .to_string();
+            if exit_actions.contains_key(&code) {
                 return Err(format!(
                     "Duplicate exit code '{code}' — each exit code may appear only once."
                 ));
             }
-            exit_actions.insert(code.to_string(), int_to_exit_action(row.action));
+            exit_actions.insert(code, int_to_exit_action(row.action));
         }
         Ok(RecoverySpec {
             name: self.service.clone(),
@@ -122,6 +149,79 @@ fn parse_opt_u32(s: &str, label: &str) -> Result<Option<u32>, String> {
 mod tests {
     use super::*;
     use servicemanager_core::{ExitActionPolicy, RestartPolicy};
+
+    #[test]
+    fn numeric_exit_codes_are_canonicalized_before_saving() {
+        for (input, canonical) in [("01", "1"), ("+1", "1"), ("-0", "0")] {
+            let form = RecoveryForm {
+                service: "fixture".into(),
+                rows: vec![RecoveryExitRow {
+                    exit_code: input.into(),
+                    action: 2,
+                }],
+                ..Default::default()
+            };
+            let spec = form.to_spec().unwrap();
+            assert!(
+                spec.exit_actions.contains_key(canonical),
+                "{input} must be stored under the key used by the supervisor"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_aliases_cannot_bypass_duplicate_exit_code_validation() {
+        for (first, alias) in [("1", "01"), ("1", "+1"), ("0", "-0")] {
+            let form = RecoveryForm {
+                service: "fixture".into(),
+                rows: vec![
+                    RecoveryExitRow {
+                        exit_code: first.into(),
+                        action: 1,
+                    },
+                    RecoveryExitRow {
+                        exit_code: alias.into(),
+                        action: 2,
+                    },
+                ],
+                ..Default::default()
+            };
+            assert!(
+                form.to_spec().is_err(),
+                "{first} and {alias} refer to the same exit code"
+            );
+        }
+    }
+
+    #[test]
+    fn exit_codes_preserve_signed_boundaries_and_reject_overflow() {
+        for (input, expected) in [
+            ("-2147483648", "-2147483648"),
+            ("+2147483647", "2147483647"),
+            ("-01", "-1"),
+            ("+0", "0"),
+        ] {
+            let form = RecoveryForm {
+                service: "fixture".into(),
+                rows: vec![RecoveryExitRow {
+                    exit_code: input.into(),
+                    action: 2,
+                }],
+                ..Default::default()
+            };
+            assert!(form.to_spec().unwrap().exit_actions.contains_key(expected));
+        }
+        for input in ["2147483648", "-2147483649", "1.0", "0x1"] {
+            let form = RecoveryForm {
+                rows: vec![RecoveryExitRow {
+                    exit_code: input.into(),
+                    action: 2,
+                }],
+                ..Default::default()
+            };
+            assert!(form.to_spec().is_err(), "{input}");
+        }
+    }
 
     fn config_with(
         restart: RestartPolicy,

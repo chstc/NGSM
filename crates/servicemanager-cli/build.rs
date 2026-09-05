@@ -1,4 +1,4 @@
-// Compile the Windows resource script (icon + future version info).
+// Compile the Windows resource script (icon and Cargo-derived version info).
 //
 // This keys off `CARGO_CFG_WINDOWS` — the *compilation target* — rather than
 // `#[cfg(windows)]`, which only describes the build host. Using the target
@@ -33,7 +33,21 @@ fn main() {
                  resource compiler discovered on PATH — confirm a pinned, trusted toolchain"
             );
         }
-        embed_resource::compile("app.rc", embed_resource::NONE)
+        let [major, minor, patch] = [
+            env!("CARGO_PKG_VERSION_MAJOR"),
+            env!("CARGO_PKG_VERSION_MINOR"),
+            env!("CARGO_PKG_VERSION_PATCH"),
+        ]
+        .map(|component| {
+            component
+                .parse::<u16>()
+                .expect("Windows version components must fit in an unsigned 16-bit integer")
+        });
+        let resource_defines = [
+            format!("NGSM_FILE_VERSION={major},{minor},{patch},0"),
+            format!("NGSM_VERSION_STRING=\"{}\\0\"", env!("CARGO_PKG_VERSION")),
+        ];
+        embed_resource::compile("app.rc", resource_defines)
             .manifest_optional()
             .expect(
                 "failed to compile the Windows resource script `app.rc` \

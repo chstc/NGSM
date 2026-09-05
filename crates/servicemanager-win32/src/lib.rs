@@ -28,9 +28,9 @@ pub use console_ctrl::{ensure_console, send_ctrl_break};
 #[cfg(windows)]
 pub use control::{
     build_run_service_command, control_service, install_service, remove_service,
-    repair_service_runner, start_service, update_native_config, validate_runner_acl_chain,
-    InstallOptions, InstallStartType, ServiceControlSignal, ServiceDependencies,
-    SERVICE_CONTROL_ROTATE,
+    repair_service_runner, start_service, update_native_config, validate_native_update,
+    validate_runner_acl_chain, InstallOptions, InstallStartType, ServiceControlSignal,
+    ServiceDependencies, SERVICE_CONTROL_ROTATE,
 };
 #[cfg(windows)]
 pub use elevation::is_elevated;
@@ -41,7 +41,10 @@ pub use process_tree::{
     enumerate_descendants, resume_process, suspend_process, terminate_process, ProcessInfo,
 };
 #[cfg(windows)]
-pub use runtime::{run_service_dispatcher, ServiceContext, ServiceControl, ServiceLifecycle};
+pub use runtime::{
+    run_service_dispatcher, ServiceContext, ServiceControl, ServiceControlReceiver,
+    ServiceLifecycle,
+};
 #[cfg(windows)]
 pub use scm::{enumerate_services, query_service, NativeService};
 #[cfg(windows)]

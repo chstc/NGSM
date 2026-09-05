@@ -1,5 +1,51 @@
-use servicemanager_core::{IoStream, ServiceDefinition};
+use servicemanager_core::{IoStream, ManagedApplicationConfig, ServiceDefinition};
 use servicemanager_win32::query_service;
+
+use crate::specs::EditSpec;
+
+pub(crate) trait ConfigBackend {
+    fn read_managed(
+        &mut self,
+        name: &str,
+    ) -> servicemanager_core::Result<Option<ManagedApplicationConfig>>;
+    fn write_managed(
+        &mut self,
+        name: &str,
+        config: &ManagedApplicationConfig,
+    ) -> servicemanager_core::Result<()>;
+    fn update_native(&mut self, spec: &EditSpec) -> servicemanager_core::Result<()>;
+}
+
+pub(crate) struct RegistryConfigBackend;
+
+impl ConfigBackend for RegistryConfigBackend {
+    fn read_managed(
+        &mut self,
+        name: &str,
+    ) -> servicemanager_core::Result<Option<ManagedApplicationConfig>> {
+        servicemanager_registry::read_managed_config(name)
+    }
+
+    fn write_managed(
+        &mut self,
+        name: &str,
+        config: &ManagedApplicationConfig,
+    ) -> servicemanager_core::Result<()> {
+        servicemanager_registry::write_managed_config(name, config)
+    }
+
+    fn update_native(&mut self, spec: &EditSpec) -> servicemanager_core::Result<()> {
+        servicemanager_win32::update_native_config(
+            &spec.name,
+            spec.display_name.as_deref(),
+            spec.description.as_deref(),
+            spec.start_type,
+            spec.dependencies.as_ref(),
+            spec.account.as_deref(),
+            spec.password.as_deref(),
+        )
+    }
+}
 
 /// Wrap a log-file path in a plain [`IoStream`] with all optional fields
 /// left at their defaults (share mode, creation disposition, flags, and

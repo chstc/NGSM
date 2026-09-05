@@ -1,362 +1,500 @@
-//! Windows service entrypoint that bridges SCM controls into the supervisor.
-//!
-//! Used by `ngsm.exe run-service <name>`: loads the managed config
-//! from the registry, registers with the SCM, spawns the supervisor on a
-//! background thread, and shuttles SCM `Stop` / `Shutdown` controls into the
-//! supervisor's stop signal.
-
-use std::sync::mpsc::RecvTimeoutError;
-use std::thread;
-use std::time::Duration;
+//! SCM bridge. Controls, generation completion and transition checkpoints are
+//! polled independently; a pending control never guesses the previous state.
 
 use servicemanager_core::{Error, Result};
-
 use servicemanager_supervisor::ExitReason;
-#[cfg(windows)]
-use servicemanager_supervisor::{Supervisor, SupervisorError};
-#[cfg(windows)]
-use servicemanager_win32::{
-    ensure_console, run_service_dispatcher, ServiceContext, ServiceControl,
-};
 
-/// How often the stop path re-checks the supervisor thread and refreshes the
-/// SCM checkpoint while a stop is in progress.
-#[cfg(windows)]
-const STOP_POLL_INTERVAL: Duration = Duration::from_secs(3);
-/// Wait hint reported to SCM during a stop. Must comfortably exceed
-/// [`STOP_POLL_INTERVAL`] so SCM does not flag a hang between checkpoints.
-#[cfg(windows)]
-const STOP_WAIT_HINT_MS: u32 = 8_000;
-/// Hard cap on how long the runner waits for the supervisor to finish a stop
-/// before abandoning it (the process then exits, tearing everything down).
-#[cfg(windows)]
-const STOP_ESCALATION_TIMEOUT: Duration = Duration::from_secs(120);
-/// How often the startup wait re-checks for the child and refreshes the SCM
-/// `START_PENDING` checkpoint.
-#[cfg(windows)]
-const STARTUP_POLL_INTERVAL: Duration = Duration::from_secs(2);
-/// Cap on how long the runner waits for startup confirmation before it
-/// declares the start a failure and reports `SERVICE_STOPPED` to SCM. The
-/// runner never reports `RUNNING` without a confirmed child.
-#[cfg(windows)]
-const STARTUP_MAX_WAIT: Duration = Duration::from_secs(60);
-/// Wait hint reported to SCM while startup is still pending.
-#[cfg(windows)]
-const START_WAIT_HINT_MS: u32 = 6_000;
-/// Wait hint reported to SCM while a pause/continue is being carried out.
-/// Comfortably exceeds the supervisor's pause/continue acknowledgement
-/// timeout so SCM does not flag the transition as hung.
-#[cfg(windows)]
-const PAUSE_WAIT_HINT_MS: u32 = 20_000;
+pub const SUICIDE_FALLBACK_EXIT_CODE: u32 = 1;
+pub const SUPERVISOR_ERROR_EXIT_CODE: u32 = 2;
 
-/// Outcome of waiting for the supervisor to bring up the managed child.
-#[cfg(windows)]
-enum StartupResult {
-    /// The supervisor confirmed the first managed child has started.
-    Running,
-    /// The supervisor thread ended before confirming a child — safe to join.
-    SupervisorExited,
-    /// No confirmation arrived within [`STARTUP_MAX_WAIT`]. The supervisor
-    /// may still be looping on a failing spawn, so its thread must not be
-    /// joined (the join could block forever).
-    TimedOut,
-}
-
-/// Wait for the supervisor to confirm the managed child has actually
-/// started. The SCM `START_PENDING` checkpoint is advanced while waiting so
-/// a slow (but legitimate) startup is not mistaken for a hang.
-#[cfg(windows)]
-fn await_startup(
-    name: &str,
-    startup_rx: &std::sync::mpsc::Receiver<()>,
-    ctx: &ServiceContext,
-) -> StartupResult {
-    let started = std::time::Instant::now();
-    loop {
-        match startup_rx.recv_timeout(STARTUP_POLL_INTERVAL) {
-            Ok(()) => return StartupResult::Running,
-            // The supervisor thread ended (dropping the sender) without ever
-            // signalling a started child.
-            Err(RecvTimeoutError::Disconnected) => return StartupResult::SupervisorExited,
-            Err(RecvTimeoutError::Timeout) => {
-                if started.elapsed() >= STARTUP_MAX_WAIT {
-                    return StartupResult::TimedOut;
-                }
-                report(
-                    name,
-                    "start-pending",
-                    ctx.report_start_pending(START_WAIT_HINT_MS),
-                );
-            }
-        }
+pub fn service_exit_code_for(reason: ExitReason) -> u32 {
+    match reason {
+        ExitReason::Stopped | ExitReason::ChildExited => 0,
+        ExitReason::SpawnFailed => SUPERVISOR_ERROR_EXIT_CODE,
+        ExitReason::Suicide { exit_code } if exit_code > 0 => exit_code as u32,
+        ExitReason::Suicide { .. } => SUICIDE_FALLBACK_EXIT_CODE,
     }
 }
 
-/// Run as a Windows service.
-///
-/// This call blocks until the service exits. It is intended to be invoked
-/// from `main` when the process was launched by the SCM with the
-/// `run-service <name>` arguments.
+#[derive(Debug, PartialEq, Eq)]
+enum Terminal {
+    Stopped(u32),
+    /// No SERVICE_STOPPED report: SCM recovery also works with failureflag=0.
+    Crash(u32),
+}
+
+fn terminal_for(reason: std::result::Result<ExitReason, ()>, explicit_stop: bool) -> Terminal {
+    if explicit_stop {
+        return Terminal::Stopped(0);
+    }
+    match reason {
+        Ok(reason @ ExitReason::Suicide { .. }) => Terminal::Crash(service_exit_code_for(reason)),
+        Ok(reason) => Terminal::Stopped(service_exit_code_for(reason)),
+        Err(()) => Terminal::Stopped(SUPERVISOR_ERROR_EXIT_CODE),
+    }
+}
+
+#[cfg(windows)]
+mod windows_runner {
+    use super::*;
+    use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, Instant};
+
+    use servicemanager_supervisor::{
+        diagnostics, PauseContinueSignal, PowerEventSignal, RotateSignal, StartupStatus,
+        StopSignal, Supervisor, SupervisorError, TerminalGate, Transition, TransitionOutcome,
+    };
+    use servicemanager_win32::{
+        ensure_console, run_service_dispatcher, ServiceContext, ServiceControl,
+    };
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Status {
+        StartPending,
+        Running,
+        PausePending,
+        Paused,
+        ContinuePending,
+        StopPending,
+        Stopped(u32),
+    }
+
+    trait Context {
+        fn recv_timeout(
+            &self,
+            timeout: Duration,
+        ) -> std::result::Result<ServiceControl, RecvTimeoutError>;
+        fn try_recv(&self) -> std::result::Result<ServiceControl, TryRecvError>;
+        fn report(&self, status: Status) -> Result<()>;
+        fn stop_requested(&self) -> bool {
+            false
+        }
+        fn claim_terminal(&self) -> bool {
+            self.stop_requested()
+        }
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+    }
+
+    impl Context for ServiceContext {
+        fn stop_requested(&self) -> bool {
+            ServiceContext::stop_requested(self)
+        }
+        fn claim_terminal(&self) -> bool {
+            ServiceContext::claim_terminal(self)
+        }
+        fn recv_timeout(
+            &self,
+            timeout: Duration,
+        ) -> std::result::Result<ServiceControl, RecvTimeoutError> {
+            self.controls().recv_timeout(timeout)
+        }
+        fn try_recv(&self) -> std::result::Result<ServiceControl, TryRecvError> {
+            self.controls().try_recv()
+        }
+        fn report(&self, status: Status) -> Result<()> {
+            match status {
+                Status::StartPending => self.report_start_pending(6_000),
+                Status::Running => self.report_running(),
+                Status::PausePending => self.report_pause_pending(20_000),
+                Status::Paused => self.report_paused(),
+                Status::ContinuePending => self.report_continue_pending(20_000),
+                Status::StopPending => self.report_stop_pending(8_000),
+                Status::Stopped(code) => self.report_stopped(code),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct Timing {
+        poll: Duration,
+        checkpoint: Duration,
+        startup: Duration,
+        transition: Duration,
+        stop: Duration,
+    }
+    impl Default for Timing {
+        fn default() -> Self {
+            Self {
+                poll: Duration::from_millis(250),
+                checkpoint: Duration::from_secs(2),
+                startup: Duration::from_secs(60),
+                transition: Duration::from_secs(15),
+                stop: Duration::from_secs(120),
+            }
+        }
+    }
+
+    struct Signals {
+        stop: StopSignal,
+        rotate: RotateSignal,
+        pause: PauseContinueSignal,
+        power: PowerEventSignal,
+        terminal: TerminalGate,
+    }
+    impl Signals {
+        fn for_supervisor(supervisor: &mut Supervisor) -> Self {
+            Self {
+                stop: supervisor.stop_signal(),
+                rotate: supervisor.rotate_signal(),
+                pause: supervisor.pause_continue_signal(),
+                power: supervisor.power_event_signal(),
+                terminal: supervisor.terminal_gate(),
+            }
+        }
+    }
+
+    struct Pending {
+        request: Transition,
+        pause: bool,
+        started: Instant,
+    }
+
+    struct BridgeExit {
+        terminal: Terminal,
+        force_exit: bool,
+    }
+
+    fn report(context: &impl Context, name: &str, status: Status) {
+        if let Err(error) = context.report(status) {
+            diagnostics::report(name, "SCM status", format!("{status:?}: {error}"));
+        }
+    }
+
+    fn bridge(
+        name: &str,
+        context: &impl Context,
+        startup: Receiver<StartupStatus>,
+        handle: JoinHandle<std::result::Result<ExitReason, SupervisorError>>,
+        signals: Signals,
+        timing: Timing,
+    ) -> BridgeExit {
+        let started = context.now();
+        let mut handle = Some(handle);
+        let mut checkpoint = started;
+        let mut running = false;
+        let mut paused = false;
+        let mut stopping = None;
+        let mut explicit_stop = false;
+        let mut failure_code = None;
+        let mut pending: Option<Pending> = None;
+        let mut deferred = None;
+        let mut first_control = None;
+        let mut terminal_claimed = false;
+        report(context, name, Status::StartPending);
+
+        loop {
+            let mut controls = Vec::new();
+            if let Some(control) = first_control.take() {
+                controls.push(control);
+            }
+            for _ in 0..32 {
+                match context.try_recv() {
+                    Ok(control) => controls.push(control),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        explicit_stop = true;
+                        break;
+                    }
+                }
+            }
+            explicit_stop |= context.stop_requested()
+                || controls.iter().any(|control| {
+                    matches!(control, ServiceControl::Stop | ServiceControl::Shutdown)
+                });
+            if !terminal_claimed && signals.terminal.is_ready() {
+                explicit_stop |= context.claim_terminal();
+                if explicit_stop {
+                    signals.stop.stop();
+                }
+                // Publish Stop before release; the supervisor rechecks it before
+                // returning and still owns its hook/environment context.
+                signals.terminal.release();
+                terminal_claimed = true;
+                if let Some(pending) = pending.take() {
+                    pending.request.cancel();
+                }
+                deferred = None;
+                if stopping.is_none() {
+                    stopping = Some(context.now());
+                    report(context, name, Status::StopPending);
+                    checkpoint = context.now();
+                }
+            }
+            if explicit_stop && stopping.is_none() {
+                stopping = Some(context.now());
+                signals.stop.stop();
+                if let Some(pending) = pending.take() {
+                    pending.request.cancel();
+                }
+                deferred = None;
+                report(context, name, Status::StopPending);
+                checkpoint = context.now();
+            }
+
+            // Completion is not conditional on a quiet control channel.
+            if handle.as_ref().is_some_and(|handle| handle.is_finished()) {
+                let result = match handle.take().unwrap().join() {
+                    Ok(Ok(reason)) => Ok(reason),
+                    Ok(Err(error)) => {
+                        diagnostics::report(name, "supervisor terminal failure", error);
+                        Err(())
+                    }
+                    Err(_) => {
+                        diagnostics::report(name, "supervisor terminal failure", "thread panicked");
+                        Err(())
+                    }
+                };
+                let accepted_stop = explicit_stop || context.stop_requested();
+                let failed = result.is_err();
+                let terminal = if accepted_stop {
+                    Terminal::Stopped(0)
+                } else if let Some(code) = failure_code {
+                    Terminal::Stopped(code)
+                } else {
+                    terminal_for(result, false)
+                };
+                return BridgeExit {
+                    terminal,
+                    force_exit: failed,
+                };
+            }
+
+            if !running && stopping.is_none() {
+                if let Ok(status) = startup.try_recv() {
+                    if status == StartupStatus::Quiesced {
+                        diagnostics::report(
+                            name,
+                            "startup",
+                            "initial Ignore policy: host is intentionally quiesced without a child",
+                        );
+                    }
+                    running = true;
+                    report(context, name, Status::Running);
+                    checkpoint = context.now();
+                } else if context.now().saturating_duration_since(started) >= timing.startup {
+                    diagnostics::report(
+                        name,
+                        "startup",
+                        "no confirmed live/quiesced startup before deadline",
+                    );
+                    failure_code = Some(3);
+                    stopping = Some(context.now());
+                    signals.stop.stop();
+                    report(context, name, Status::StopPending);
+                    checkpoint = context.now();
+                }
+            }
+
+            if stopping.is_none() {
+                for control in controls {
+                    match control {
+                        ServiceControl::Pause if running => deferred = Some(true),
+                        ServiceControl::Continue if running => deferred = Some(false),
+                        ServiceControl::PowerEvent(event) => signals.power.power_event(event),
+                        ServiceControl::Other(code)
+                            if code == servicemanager_win32::SERVICE_CONTROL_ROTATE =>
+                        {
+                            signals.rotate.rotate()
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(transition) = &pending {
+                    if context.now().saturating_duration_since(transition.started)
+                        >= timing.transition
+                    {
+                        transition.request.cancel();
+                    }
+                    if let Some(outcome) = transition.request.outcome() {
+                        match outcome {
+                            TransitionOutcome::Applied => paused = transition.pause,
+                            TransitionOutcome::Cancelled | TransitionOutcome::Rejected(_) => {
+                                diagnostics::report(
+                                    name,
+                                    "pause/continue",
+                                    format!("{outcome:?}; previous state restored"),
+                                );
+                            }
+                            TransitionOutcome::Degraded(error) => {
+                                diagnostics::report(
+                                    name,
+                                    "pause/continue",
+                                    format!("fail-stop: {error}"),
+                                );
+                                failure_code = Some(SUPERVISOR_ERROR_EXIT_CODE);
+                                stopping = Some(context.now());
+                            }
+                        }
+                        pending = None;
+                        if stopping.is_none() {
+                            report(
+                                context,
+                                name,
+                                if paused {
+                                    Status::Paused
+                                } else {
+                                    Status::Running
+                                },
+                            );
+                        } else {
+                            report(context, name, Status::StopPending);
+                        }
+                        checkpoint = context.now();
+                    } else if context.now().saturating_duration_since(transition.started)
+                        >= timing.stop
+                    {
+                        diagnostics::report(
+                            name,
+                            "pause/continue",
+                            "executing transition exceeded the hard deadline",
+                        );
+                        failure_code = Some(SUPERVISOR_ERROR_EXIT_CODE);
+                        stopping = Some(context.now());
+                        signals.stop.stop();
+                        report(context, name, Status::StopPending);
+                    }
+                }
+                if pending.is_none() && stopping.is_none() {
+                    if let Some(pause) = deferred.take() {
+                        let request = if pause {
+                            signals.pause.request_pause()
+                        } else {
+                            signals.pause.request_resume()
+                        };
+                        pending = Some(Pending {
+                            request,
+                            pause,
+                            started: context.now(),
+                        });
+                        report(
+                            context,
+                            name,
+                            if pause {
+                                Status::PausePending
+                            } else {
+                                Status::ContinuePending
+                            },
+                        );
+                        checkpoint = context.now();
+                    }
+                }
+            }
+
+            if let Some(stopped_at) = stopping {
+                if context.now().saturating_duration_since(stopped_at) >= timing.stop {
+                    diagnostics::report(
+                        name,
+                        "stop",
+                        "supervisor did not finish; terminating the service host",
+                    );
+                    return BridgeExit {
+                        terminal: Terminal::Stopped(if explicit_stop || context.stop_requested() {
+                            0
+                        } else {
+                            failure_code.unwrap_or(SUPERVISOR_ERROR_EXIT_CODE)
+                        }),
+                        force_exit: true,
+                    };
+                }
+            }
+            if context.now().saturating_duration_since(checkpoint) >= timing.checkpoint {
+                let status = if stopping.is_some() {
+                    Some(Status::StopPending)
+                } else if let Some(transition) = &pending {
+                    Some(if transition.pause {
+                        Status::PausePending
+                    } else {
+                        Status::ContinuePending
+                    })
+                } else if !running {
+                    Some(Status::StartPending)
+                } else {
+                    None
+                };
+                if let Some(status) = status {
+                    report(context, name, status);
+                }
+                checkpoint = context.now();
+            }
+            match context.recv_timeout(timing.poll) {
+                Ok(control) => first_control = Some(control),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => explicit_stop = true,
+            }
+        }
+    }
+
+    fn service_main(name: &str, context: &ServiceContext) -> Result<()> {
+        if let Err(error) = ensure_console() {
+            diagnostics::report(name, "console", format!("CTRL+BREAK unavailable: {error}"));
+        }
+        let config = servicemanager_registry::read_managed_config(name)?.ok_or_else(|| {
+            Error::InvalidConfig(format!("no managed config for service '{name}'"))
+        })?;
+        let mut supervisor = Supervisor::new(name.to_string(), config);
+        let startup = supervisor.startup_receiver();
+        let signals = Signals::for_supervisor(&mut supervisor);
+        let handle = thread::spawn(move || supervisor.run());
+        let outcome = bridge(name, context, startup, handle, signals, Timing::default());
+        finish(context, name, outcome);
+        Ok(())
+    }
+
+    fn finish(context: &impl Context, name: &str, mut outcome: BridgeExit) {
+        if context.claim_terminal() {
+            outcome.terminal = Terminal::Stopped(0);
+        }
+        match outcome.terminal {
+            Terminal::Stopped(code) => {
+                report(context, name, Status::Stopped(code));
+                if outcome.force_exit {
+                    servicemanager_win32::process_tree::terminate_current_process(code);
+                }
+            }
+            Terminal::Crash(code) => {
+                diagnostics::report(
+                    name,
+                    "Suicide",
+                    format!("deliberate crash-style host exit {code} after cleanup"),
+                );
+                diagnostics::reporter().flush(Duration::from_millis(250));
+                // Do not report SERVICE_STOPPED: failureflag=0 recovery requires this path.
+                servicemanager_win32::process_tree::terminate_current_process(code);
+            }
+        }
+    }
+
+    pub(super) fn run(service_name: &str) -> Result<()> {
+        let name = service_name.to_owned();
+        run_service_dispatcher(service_name, move |context: ServiceContext| {
+            if let Err(error) = service_main(&name, &context) {
+                diagnostics::report(&name, "startup failure", error);
+                let code = if context.claim_terminal() {
+                    0
+                } else {
+                    SUPERVISOR_ERROR_EXIT_CODE
+                };
+                report(&context, &name, Status::Stopped(code));
+            }
+        })
+    }
+
+    #[cfg(test)]
+    #[path = "windows_tests.rs"]
+    mod tests;
+}
+
 #[cfg(windows)]
 pub fn run(service_name: &str) -> Result<()> {
-    let name = service_name.to_string();
-    run_service_dispatcher(service_name, move |ctx: ServiceContext| {
-        if let Err(e) = service_main(&name, &ctx) {
-            eprintln!("[runner:{name}] fatal: {e}");
-            // `service_main` failed before it could report a terminal state
-            // (e.g. missing managed config, before `report_running`). Report
-            // STOPPED with a failure code so SCM does not leave the service
-            // stuck in START_PENDING until the wait hint expires.
-            report(&name, "stopped", ctx.report_stopped(2));
-        }
-    })
+    windows_runner::run(service_name)
 }
 
 #[cfg(not(windows))]
 pub fn run(_service_name: &str) -> Result<()> {
     Err(Error::other("service runner requires Windows"))
-}
-
-/// Fallback exit code reported to SCM when `ExitAction::Suicide` fires and
-/// the child's own exit code was zero. NSSM convention: any non-zero value
-/// will do — SCM only checks `!= 0` to decide whether to run recovery
-/// actions — and `1` is the canonical "deliberate failure" sentinel.
-pub const SUICIDE_FALLBACK_EXIT_CODE: u32 = 1;
-/// Generic non-zero code reported when the supervisor errored out or
-/// panicked (i.e. the runner never got a clean `ExitReason`). Kept distinct
-/// from the suicide fallback so log triage can tell them apart.
-pub const SUPERVISOR_ERROR_EXIT_CODE: u32 = 2;
-
-/// Translate the supervisor's exit reason into the service exit code we
-/// report to SCM via `SetServiceStatus(dwWin32ExitCode = …)`.
-///
-/// SCM treats a non-zero exit code as a failure and may run the configured
-/// recovery actions (`sc.exe failure …`); a zero code is a clean stop and
-/// suppresses recovery. The mapping therefore has to distinguish:
-///
-/// - `Stopped` / `ChildExited` → `0`. The supervisor was asked to stop, or
-///   `ExitAction::Exit` fired (NSSM-equivalent "give up cleanly"). SCM
-///   should not run recovery.
-/// - `SpawnFailed` → `SUPERVISOR_ERROR_EXIT_CODE`. The supervisor never
-///   produced a working child; matches the legacy behaviour of the
-///   `is_finished` poll path that flipped `exit_code` to `2`.
-/// - `Suicide { exit_code }` → child's code when non-zero, otherwise
-///   `SUICIDE_FALLBACK_EXIT_CODE`. This is the bug fix: previously Suicide
-///   reached the runner as `ChildExited` and reported `0`, which made SCM
-///   skip recovery for what was supposed to be a deliberate failure.
-pub fn service_exit_code_for(reason: ExitReason) -> u32 {
-    match reason {
-        ExitReason::Stopped | ExitReason::ChildExited => 0,
-        ExitReason::SpawnFailed => SUPERVISOR_ERROR_EXIT_CODE,
-        ExitReason::Suicide { exit_code } => {
-            // Preserve the child's own code where it is meaningful (non-
-            // zero and representable as u32); fall back to `1` for the
-            // zero-or-negative case so SCM still sees a failure.
-            if exit_code > 0 {
-                exit_code as u32
-            } else {
-                SUICIDE_FALLBACK_EXIT_CODE
-            }
-        }
-    }
-}
-
-/// Log (but do not abort on) a failed SCM status report. A dropped status
-/// update is worth a diagnostic even though the runner cannot do much else
-/// about it.
-#[cfg(windows)]
-fn report(name: &str, what: &str, result: Result<()>) {
-    if let Err(e) = result {
-        eprintln!("[runner:{name}] failed to report '{what}' to SCM: {e}");
-    }
-}
-
-#[cfg(windows)]
-fn service_main(name: &str, ctx: &ServiceContext) -> Result<()> {
-    // Allocate a console before spawning the supervised child so the child
-    // inherits it and we can dispatch CTRL+BREAK on stop. Without this the
-    // child gets no console and `GenerateConsoleCtrlEvent` cannot reach it.
-    if let Err(e) = ensure_console() {
-        eprintln!("[runner:{name}] ensure_console failed: {e} — graceful stop will not work");
-    }
-
-    let cfg = servicemanager_registry::read_managed_config(name)?
-        .ok_or_else(|| Error::InvalidConfig(format!("no managed config for service '{name}'")))?;
-
-    let mut supervisor = Supervisor::new(name.to_string(), cfg);
-    let startup_rx = supervisor.startup_receiver();
-    let stop_signal = supervisor.stop_signal();
-    let rotate_signal = supervisor.rotate_signal();
-    let pause_continue = supervisor.pause_continue_signal();
-    let power_signal = supervisor.power_event_signal();
-
-    let supervisor_handle = thread::spawn(move || supervisor.run());
-    let mut handle = Some(supervisor_handle);
-
-    // Report RUNNING only after the supervisor confirms the managed child is
-    // actually up — SCM and dependent services must not see RUNNING while
-    // the application is still starting (or about to fail).
-    match await_startup(name, &startup_rx, ctx) {
-        StartupResult::Running => report(name, "running", ctx.report_running()),
-        StartupResult::SupervisorExited => {
-            eprintln!("[runner:{name}] supervisor exited before the managed child started");
-            if let Some(h) = handle.take() {
-                match h.join() {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => eprintln!("[runner:{name}] supervisor error: {e}"),
-                    Err(_) => eprintln!("[runner:{name}] supervisor thread panicked"),
-                }
-            }
-            report(name, "stopped", ctx.report_stopped(2));
-            return Ok(());
-        }
-        StartupResult::TimedOut => {
-            eprintln!(
-                "[runner:{name}] managed child not confirmed running within {} s — \
-                 reporting startup failure to SCM",
-                STARTUP_MAX_WAIT.as_secs()
-            );
-            // The supervisor may still be retrying a failing spawn, so its
-            // thread must not be joined here. Signal it to stop and abandon
-            // the handle — the process exit below tears down the job object
-            // (and any suspended child) regardless.
-            stop_signal.stop();
-            let _ = handle.take();
-            report(name, "stopped", ctx.report_stopped(3));
-            return Ok(());
-        }
-    }
-
-    // Forward SCM controls into the supervisor and poll for the supervisor
-    // thread finishing on its own (e.g. spawn failure with `Exit` policy).
-    let poll_interval = Duration::from_millis(250);
-    let mut exit_code: u32 = 0;
-    loop {
-        match ctx.controls().recv_timeout(poll_interval) {
-            Ok(ServiceControl::Stop) | Ok(ServiceControl::Shutdown) => {
-                report(
-                    name,
-                    "stop-pending",
-                    ctx.report_stop_pending(STOP_WAIT_HINT_MS),
-                );
-                stop_signal.stop();
-                if let Some(h) = handle.take() {
-                    exit_code = await_supervisor_stop(name, h, ctx);
-                }
-                break;
-            }
-            Ok(ServiceControl::Other(code))
-                if code == servicemanager_win32::SERVICE_CONTROL_ROTATE =>
-            {
-                rotate_signal.rotate();
-            }
-            Ok(ServiceControl::Pause) => {
-                // Announce the transition, then report the final state only
-                // after the supervisor confirms the tree was actually
-                // suspended — never report PAUSED on a best-effort guess.
-                report(
-                    name,
-                    "pause-pending",
-                    ctx.report_pause_pending(PAUSE_WAIT_HINT_MS),
-                );
-                match pause_continue.pause() {
-                    Ok(()) => report(name, "paused", ctx.report_paused()),
-                    Err(e) => {
-                        eprintln!("[runner:{name}] pause failed: {e} — staying RUNNING");
-                        report(name, "running", ctx.report_running());
-                    }
-                }
-            }
-            Ok(ServiceControl::Continue) => {
-                report(
-                    name,
-                    "continue-pending",
-                    ctx.report_continue_pending(PAUSE_WAIT_HINT_MS),
-                );
-                match pause_continue.resume() {
-                    Ok(()) => report(name, "running", ctx.report_running()),
-                    Err(e) => {
-                        eprintln!("[runner:{name}] continue failed: {e} — staying PAUSED");
-                        report(name, "paused", ctx.report_paused());
-                    }
-                }
-            }
-            Ok(ServiceControl::PowerEvent(ev)) => {
-                power_signal.power_event(ev);
-            }
-            Ok(_) => { /* interrogate / other unknown — no-op */ }
-            Err(RecvTimeoutError::Timeout) => {
-                if handle.as_ref().is_some_and(|h| h.is_finished()) {
-                    report(name, "stop-pending", ctx.report_stop_pending(2_000));
-                    if let Some(h) = handle.take() {
-                        match h.join() {
-                            Ok(Ok(reason)) => {
-                                // ExitAction::Suicide reaches us here too;
-                                // the helper picks the right SCM exit code
-                                // so SCM runs recovery for Suicide but not
-                                // for a clean ChildExited / Stopped.
-                                exit_code = service_exit_code_for(reason);
-                            }
-                            Ok(Err(e)) => {
-                                eprintln!("[runner:{name}] supervisor error: {e}");
-                                exit_code = SUPERVISOR_ERROR_EXIT_CODE;
-                            }
-                            Err(_) => {
-                                eprintln!("[runner:{name}] supervisor thread panicked");
-                                exit_code = SUPERVISOR_ERROR_EXIT_CODE;
-                            }
-                        }
-                    }
-                    break;
-                }
-            }
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-    }
-
-    report(name, "stopped", ctx.report_stopped(exit_code));
-    Ok(())
-}
-
-/// Wait for the supervisor thread to finish stopping. Stop hooks and the
-/// graceful-shutdown grace periods can run well past a single SCM wait hint,
-/// so the checkpoint is advanced on every poll — SCM only treats a stop as
-/// hung when checkpoints stop moving. Returns the runner exit code.
-#[cfg(windows)]
-fn await_supervisor_stop(
-    name: &str,
-    handle: thread::JoinHandle<std::result::Result<ExitReason, SupervisorError>>,
-    ctx: &ServiceContext,
-) -> u32 {
-    let started = std::time::Instant::now();
-    loop {
-        if handle.is_finished() {
-            return match handle.join() {
-                Ok(Ok(_)) => 0,
-                Ok(Err(e)) => {
-                    eprintln!("[runner:{name}] supervisor error: {e}");
-                    1
-                }
-                Err(_) => {
-                    eprintln!("[runner:{name}] supervisor thread panicked");
-                    1
-                }
-            };
-        }
-        if started.elapsed() >= STOP_ESCALATION_TIMEOUT {
-            eprintln!(
-                "[runner:{name}] supervisor did not finish stopping within {} s — abandoning it",
-                STOP_ESCALATION_TIMEOUT.as_secs()
-            );
-            return 1;
-        }
-        thread::sleep(STOP_POLL_INTERVAL);
-        report(
-            name,
-            "stop-pending",
-            ctx.report_stop_pending(STOP_WAIT_HINT_MS),
-        );
-    }
 }
 
 #[cfg(test)]
@@ -365,50 +503,30 @@ mod tests {
 
     #[test]
     fn stopped_reason_maps_to_zero_service_exit_code() {
-        // ExitReason::Stopped means SCM asked us to stop — a clean exit
-        // that must NOT trigger SCM recovery actions.
         assert_eq!(service_exit_code_for(ExitReason::Stopped), 0);
     }
-
     #[test]
     fn child_exited_reason_maps_to_zero_service_exit_code() {
-        // ExitAction::Exit ("give up cleanly, no recovery") reaches the
-        // runner as ChildExited and must report 0 — Suicide is the
-        // failure-style sibling, Exit is the clean one.
         assert_eq!(service_exit_code_for(ExitReason::ChildExited), 0);
     }
-
     #[test]
     fn spawn_failed_reason_maps_to_nonzero_service_exit_code() {
-        // SpawnFailed signals the supervisor never got a working child;
-        // a non-zero code is required so SCM treats it as a failed start.
         assert_eq!(
             service_exit_code_for(ExitReason::SpawnFailed),
             SUPERVISOR_ERROR_EXIT_CODE
         );
-        assert_ne!(service_exit_code_for(ExitReason::SpawnFailed), 0);
     }
-
     #[test]
     fn suicide_reason_maps_to_nonzero_service_exit_code() {
-        // The bug this regression test pins: pre-fix, Suicide rode the
-        // same arm as Exit and reported 0 to SCM, silently suppressing
-        // recovery. Post-fix, every Suicide payload must yield a non-zero
-        // code — that's what makes SCM run the configured failure actions.
         for code in [-1, 0, 1, 42, 200] {
-            let mapped = service_exit_code_for(ExitReason::Suicide { exit_code: code });
             assert_ne!(
-                mapped, 0,
-                "Suicide{{exit_code: {code}}} mapped to 0 — SCM would skip recovery"
+                service_exit_code_for(ExitReason::Suicide { exit_code: code }),
+                0
             );
         }
     }
-
     #[test]
     fn suicide_preserves_meaningful_child_exit_code() {
-        // When the child's own exit code is a meaningful non-zero value,
-        // the runner forwards it as-is so monitoring tools see the same
-        // exit code in SCM that the child reported.
         assert_eq!(
             service_exit_code_for(ExitReason::Suicide { exit_code: 42 }),
             42
@@ -418,20 +536,33 @@ mod tests {
             1
         );
     }
-
     #[test]
     fn suicide_falls_back_when_child_exit_code_is_not_positive() {
-        // A child that exited with code 0 (or with no resolvable code, i.e.
-        // exit_code_of returned -1) still gets Suicide reported as a
-        // failure to SCM — we substitute the fallback so the recovery
-        // policy fires regardless of the child's reported value.
         assert_eq!(
             service_exit_code_for(ExitReason::Suicide { exit_code: 0 }),
-            SUICIDE_FALLBACK_EXIT_CODE
+            1
         );
         assert_eq!(
             service_exit_code_for(ExitReason::Suicide { exit_code: -1 }),
-            SUICIDE_FALLBACK_EXIT_CODE
+            1
         );
+    }
+    #[test]
+    fn suicide_is_crash_style_before_and_after_startup_but_explicit_stop_wins() {
+        for code in [-1, 0, 7, 42] {
+            assert!(matches!(
+                terminal_for(Ok(ExitReason::Suicide { exit_code: code }), false),
+                Terminal::Crash(_)
+            ));
+            assert_eq!(
+                terminal_for(Ok(ExitReason::Suicide { exit_code: code }), true),
+                Terminal::Stopped(0)
+            );
+        }
+        assert_eq!(
+            terminal_for(Ok(ExitReason::ChildExited), false),
+            Terminal::Stopped(0)
+        );
+        assert_eq!(terminal_for(Err(()), true), Terminal::Stopped(0));
     }
 }

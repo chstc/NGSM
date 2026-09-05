@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  quality:
+    uses: ./.github/workflows/ci.yml
+
+  package:
+    name: Build and stage Windows x64 release
+    needs: quality
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust 1.90
+        uses: dtolnay/rust-toolchain@49fda20b3f489226feadfba7767be1db54e2cee1 # 1.90.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: ngsm-windows
+
+      - name: Build from bundled source and prepare assets
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: .\scripts\package-release.ps1 -Tag $env:RELEASE_TAG
+
+      - name: Preserve release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ngsm-${{ github.ref_name }}-windows-x64
+          path: target\dist\*
+          if-no-files-found: error
+
+      - name: Create draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $assets = @(
+            '.\target\dist\ngsm.exe',
+            ".\target\dist\ngsm-$env:RELEASE_TAG-source.tar.gz",
+            '.\target\dist\SHA256SUMS.txt',
+            '.\target\dist\BUILD-INFO.json',
+            '.\target\dist\DEPENDENCIES.txt',
+            '.\target\dist\THIRD-PARTY-NOTICES.md',
+            '.\target\dist\LICENSE.txt',
+            '.\target\dist\GPL-3.0.txt'
+          )
+          gh release create $env:RELEASE_TAG @assets --verify-tag --draft `
+            --title "NGSM $env:RELEASE_TAG" --notes-file '.\target\dist\RELEASE-NOTES.md'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

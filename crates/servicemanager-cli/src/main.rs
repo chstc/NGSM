@@ -60,8 +60,8 @@ enum Command {
     Remove {
         /// Service name.
         name: String,
-        /// Keep the NGSM-managed registry config when removing the service.
-        /// By default, `remove` scrubs the registry config too.
+        /// Unsupported: SCM deletion removes the whole service registry subtree.
+        /// This flag is rejected; export or back up the configuration first.
         #[arg(long)]
         no_purge_config: bool,
         /// Allow removing a service that is NOT NGSM/NSSM-managed. Without
@@ -359,7 +359,7 @@ struct RecoverySetArgs {
 
     /// Per-exit-code action. Format: `<code>=<action>`, e.g. `0=ignore`.
     /// May be repeated.
-    #[arg(long = "exit-action")]
+    #[arg(long = "exit-action", allow_hyphen_values = true)]
     exit_actions: Vec<String>,
 
     /// Drop all existing per-exit-code entries before applying
@@ -896,68 +896,11 @@ fn cmd_control(name: &str, action: ServiceAction, force_native: bool, json: bool
 }
 
 fn cmd_restart(name: &str, timeout_ms: u32, force_native: bool, json: bool) -> Result<()> {
-    if force_native {
-        // Bypass the NGSM-managed check — run the restart loop locally.
-        cmd_restart_force_native(name, timeout_ms, json)
-    } else {
-        let msg = servicemanager_ops::restart(name, timeout_ms as u64)?;
-        if json {
-            println!("{}", serde_json::json!({ "restarted": name }));
-        } else {
-            println!("{msg}");
-        }
-        Ok(())
-    }
-}
-
-/// Restart implementation for `--force-native`: bypasses NGSM-managed check
-/// and uses the CLI's configurable `timeout_ms` stop-wait deadline.
-fn cmd_restart_force_native(name: &str, timeout_ms: u32, json: bool) -> Result<()> {
-    use servicemanager_core::ServiceState;
-    use std::thread::sleep;
-    use std::time::{Duration, Instant};
-
-    let already_stopped = |e: &servicemanager_core::Error| {
-        if let servicemanager_core::Error::Scm(msg) = e {
-            msg.contains("0x80070426") || msg.contains("has not been started")
-        } else {
-            false
-        }
-    };
-
-    let snapshot = query_service(name)?;
-    let initial_state = snapshot.runtime.as_ref().map(|r| r.state);
-    let needs_stop = !matches!(initial_state, Some(ServiceState::Stopped) | None);
-
-    if needs_stop {
-        match control_service(name, ServiceControlSignal::Stop) {
-            Ok(_) => {}
-            Err(e) if already_stopped(&e) => {}
-            Err(e) => return Err(e),
-        }
-
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
-        loop {
-            let snapshot = query_service(name)?;
-            let state = snapshot.runtime.as_ref().map(|r| r.state);
-            if matches!(state, Some(ServiceState::Stopped)) {
-                break;
-            }
-            if Instant::now() >= deadline {
-                return Err(servicemanager_core::Error::other(format!(
-                    "service '{name}' did not stop within {timeout_ms} ms (last state: {state:?})"
-                )));
-            }
-            sleep(Duration::from_millis(200));
-        }
-        sleep(Duration::from_millis(250));
-    }
-
-    start_service(name)?;
+    let msg = servicemanager_ops::restart_with_options(name, timeout_ms as u64, force_native)?;
     if json {
         println!("{}", serde_json::json!({ "restarted": name }));
     } else {
-        println!("Restarted '{name}'.");
+        println!("{msg}");
     }
     Ok(())
 }
@@ -1301,11 +1244,9 @@ fn cmd_recovery_show(name: &str, json: bool) -> Result<()> {
 }
 
 fn cmd_recovery_set(name: &str, args: &RecoverySetArgs, json: bool) -> Result<()> {
-    // Read the current spec so we can merge in-place when --clear-exit-actions
-    // is not set.
-    let current = servicemanager_ops::read_recovery(name)?;
-    let spec = merge_recovery_args(name, &current, args)?;
-    let msg = servicemanager_ops::save_recovery(spec)?;
+    let msg = servicemanager_ops::update_recovery(name, |current| {
+        merge_recovery_args(name, current, args)
+    })?;
     if json {
         println!("{}", serde_json::json!({ "saved": name }));
     } else {
@@ -1499,6 +1440,99 @@ mod tests {
     fn parse_exit_action_rejects_unknown() {
         assert!(parse_exit_action("reboot").is_err());
         assert!(parse_exit_action("").is_err());
+    }
+
+    #[test]
+    fn recovery_parses_negative_mapping_values_and_following_flags() {
+        let cli = Cli::try_parse_from([
+            "ngsm",
+            "recovery",
+            "TestSvc",
+            "set",
+            "--exit-action",
+            "-1=exit",
+            "--exit-action",
+            "-2147483648=ignore",
+            "--restart-delay-ms",
+            "350",
+            "--clear-exit-actions",
+        ])
+        .unwrap();
+        let Some(Command::Recovery(RecoveryArgs {
+            action: Some(RecoveryAction::Set(args)),
+            ..
+        })) = cli.command
+        else {
+            panic!("expected recovery set");
+        };
+        let merged = merge_recovery_args("TestSvc", &recovery_spec_baseline(), &args).unwrap();
+        assert_eq!(merged.restart_delay_ms, Some(350));
+        assert_eq!(merged.exit_actions.len(), 2);
+        assert_eq!(merged.exit_actions["-1"], ExitAction::Exit);
+        assert_eq!(merged.exit_actions["-2147483648"], ExitAction::Ignore);
+
+        let cli = Cli::try_parse_from([
+            "ngsm",
+            "recovery",
+            "TestSvc",
+            "set",
+            "--exit-action=-1=exit",
+            "--exit-action=0=ignore",
+        ])
+        .unwrap();
+        let Some(Command::Recovery(RecoveryArgs {
+            action: Some(RecoveryAction::Set(args)),
+            ..
+        })) = cli.command
+        else {
+            panic!("expected recovery set");
+        };
+        let merged = merge_recovery_args("TestSvc", &recovery_spec_baseline(), &args).unwrap();
+        assert_eq!(merged.exit_actions["-1"], ExitAction::Exit);
+        assert_eq!(merged.exit_actions["0"], ExitAction::Ignore);
+    }
+
+    #[test]
+    fn negative_mapping_syntax_does_not_bypass_semantic_validation() {
+        for value in [
+            "-2147483649=exit",
+            "-1=unknown",
+            "-1",
+            "--clear-exit-actions",
+        ] {
+            let cli =
+                Cli::try_parse_from(["ngsm", "recovery", "TestSvc", "set", "--exit-action", value])
+                    .unwrap();
+            let Some(Command::Recovery(RecoveryArgs {
+                action: Some(RecoveryAction::Set(args)),
+                ..
+            })) = cli.command
+            else {
+                panic!("expected recovery set");
+            };
+            assert!(merge_recovery_args("TestSvc", &recovery_spec_baseline(), &args).is_err());
+        }
+    }
+
+    #[test]
+    fn restart_keeps_native_override_and_custom_timeout() {
+        let cli = Cli::try_parse_from([
+            "ngsm",
+            "restart",
+            "TestSvc",
+            "--force-native",
+            "--timeout-ms",
+            "350",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Restart {
+                timeout_ms: 350,
+                force_native: true,
+                ..
+            })
+        ));
     }
 
     #[test]

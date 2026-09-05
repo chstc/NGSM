@@ -9,6 +9,7 @@ compile_error!("servicemanager-gui builds only for Windows targets.");
 
 mod adapter;
 mod app;
+mod bounded_log;
 mod config;
 mod data;
 mod elevation;
@@ -16,6 +17,7 @@ pub mod event_log_reader;
 mod forms;
 mod metrics;
 mod recovery;
+mod requests;
 
 slint::include_modules!();
 

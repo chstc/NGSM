@@ -1,105 +1,14 @@
-use servicemanager_core::{
-    validate_absolute_path, validate_hook_component, LogRotationConfig, ManagedApplicationConfig,
-};
+use servicemanager_core::{LogRotationConfig, ManagedApplicationConfig};
 
 use crate::error::{message_error, Result};
-use crate::recovery::validate_exit_action_key;
 
-/// Pure pre-validation of a [`ManagedApplicationConfig`] that mirrors every
-/// reject-the-config check `servicemanager_registry::create_managed_config`
-/// performs *before* it touches the registry.
+/// Shared, non-mutating registry preflight for a complete managed config.
 ///
-/// This exists so install can fail fast — *before* an SCM service is created
-/// — when a config would be rejected by the registry writer anyway. Without
-/// this pre-check a doomed config would still create the SCM service, hit
-/// the registry-layer error, and rely on rollback to clean up the orphan;
-/// if rollback also fails (rare but possible), the user is left with an
-/// orphaned, unconfigured SCM entry.
-///
-/// The registry-layer checks remain in place as defense-in-depth — there are
-/// registry-only invariants (e.g. service-name shape, post-synthesis
-/// `AppExit` `i32` parsing) that this layer cannot reproduce without
-/// touching the registry. So pre-validating here narrows the failure window
-/// but does not replace the writer's own checks.
-///
-/// Returns `Err(message)` naming the first offending field, suitable for
-/// surfacing directly to the user.
+/// Install uses this before SCM creation. Unlike newly entered per-code
+/// recovery keys, a complete config may carry the registry's default-action
+/// mirror and raw REG_EXPAND_SZ type metadata.
 pub fn validate_managed_config(cfg: &ManagedApplicationConfig) -> Result<()> {
-    // 1. Application must be present and non-empty — without it the
-    //    registry writer would reject the config as unmanaged.
-    match cfg.application.as_deref() {
-        Some(app) if !app.trim().is_empty() => {}
-        _ => {
-            return Err(message_error(
-                "managed config requires a non-empty Application value",
-            ))
-        }
-    }
-
-    // 2. Absolute-path checks mirror the registry writer's path validation
-    //    (Application, AppDirectory, stdio paths). `validate_absolute_path`
-    //    also rejects NUL / control characters, so these calls double as
-    //    NUL prechecks for the path-valued fields.
-    if let Some(app) = &cfg.application {
-        validate_absolute_path("Application", app)?;
-    }
-    if let Some(dir) = cfg.app_directory.as_deref().filter(|d| !d.is_empty()) {
-        validate_absolute_path("AppDirectory", dir)?;
-    }
-    if let Some(s) = &cfg.io.stdin {
-        validate_absolute_path("AppStdin", &s.path)?;
-    }
-    if let Some(s) = &cfg.io.stdout {
-        validate_absolute_path("AppStdout", &s.path)?;
-    }
-    if let Some(s) = &cfg.io.stderr {
-        validate_absolute_path("AppStderr", &s.path)?;
-    }
-
-    // 3. Hook event/action names must be usable as registry subkey / value
-    //    names. Mirrors `validate_hook_component` calls in `write_into_key`.
-    for hook in &cfg.hooks {
-        validate_hook_component(&hook.event, "event")?;
-        validate_hook_component(&hook.action, "action")?;
-        // The registry writer's NUL precheck covers the hook command field
-        // too. Mirror it here so a NUL in `command` is caught before the
-        // SCM service is created.
-        if hook.command.contains('\0') {
-            return Err(message_error(format!(
-                "AppEvents\\{}\\{} (command) contains an embedded NUL — \
-                 registry strings cannot carry NULs",
-                hook.event, hook.action
-            )));
-        }
-    }
-
-    // 4. Per-exit-code action keys must be `i32`s — `"default"`, whitespace,
-    //    `=`, NUL, and non-numeric keys are all rejected. Re-uses the same
-    //    validator the recovery editor funnels every caller through.
-    for code in cfg.exit_actions.keys() {
-        validate_exit_action_key(code)
-            .map_err(|e| message_error(format!("AppExit\\{code}: {e}")))?;
-    }
-
-    // 5. NUL precheck for the remaining REG_SZ / REG_MULTI_SZ string fields
-    //    that are not path-typed (so `validate_absolute_path` above did not
-    //    already cover them). Mirrors `precheck_no_embedded_nuls` in the
-    //    registry writer so a NUL in (say) `AppParameters` cannot reach the
-    //    SCM-creation step.
-    if let Some(v) = &cfg.app_parameters {
-        check_no_nul("AppParameters", v)?;
-    }
-    if let Some(v) = &cfg.affinity {
-        check_no_nul("AppAffinity", v)?;
-    }
-    for (i, v) in cfg.environment.iter().enumerate() {
-        check_no_nul(&format!("AppEnvironment[{i}]"), v)?;
-    }
-    for (i, v) in cfg.environment_extra.iter().enumerate() {
-        check_no_nul(&format!("AppEnvironmentExtra[{i}]"), v)?;
-    }
-
-    Ok(())
+    servicemanager_registry::validate_managed_config(cfg)
 }
 
 /// Install-specific validation that is stricter than the registry writer's
@@ -183,18 +92,29 @@ fn supported_hook_points_pretty() -> String {
         .join(", ")
 }
 
-fn check_no_nul(field: &str, value: &str) -> Result<()> {
-    if value.contains('\0') {
-        return Err(message_error(format!(
-            "{field} contains an embedded NUL — registry strings cannot carry NULs"
-        )));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_environment_entries_fail_before_service_creation() {
+        for extra in [false, true] {
+            let mut config = ManagedApplicationConfig {
+                application: Some("C:\\fixture\\app.exe".into()),
+                ..Default::default()
+            };
+            let entries = vec!["FIRST=1".into(), String::new(), "LAST=2".into()];
+            if extra {
+                config.environment_extra = entries;
+            } else {
+                config.environment = entries;
+            }
+            assert!(
+                validate_managed_config(&config).is_err(),
+                "an interior empty REG_MULTI_SZ entry cannot be represented"
+            );
+        }
+    }
     use servicemanager_core::{ExitAction, ExitActionPolicy, HookConfig, IoStream};
 
     fn minimal_valid_config() -> ManagedApplicationConfig {
@@ -259,17 +179,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_exit_action_key() {
+    fn complete_config_accepts_the_registry_default_action_mirror() {
         let mut cfg = minimal_valid_config();
+        cfg.restart.default_action = Some(ExitAction::Restart);
         cfg.exit_actions.insert(
             "default".into(),
             ExitActionPolicy {
                 action: ExitAction::Restart,
             },
         );
-        let err = validate_managed_config(&cfg).unwrap_err().to_string();
-        assert!(err.contains("default"), "got: {err}");
-        assert!(err.contains("AppExit"), "got: {err}");
+        validate_managed_config(&cfg).expect("default is valid in a complete registry config");
     }
 
     #[test]
@@ -282,7 +201,8 @@ mod tests {
             },
         );
         let err = validate_managed_config(&cfg).unwrap_err().to_string();
-        assert!(err.contains("AppExit\\abc"), "got: {err}");
+        assert!(err.contains("AppExit"), "got: {err}");
+        assert!(err.contains("abc"), "got: {err}");
     }
 
     #[test]
@@ -362,13 +282,13 @@ mod tests {
     fn install_rejects_invalid_exit_action_key_before_touching_scm() {
         let mut cfg = minimal_valid_config();
         cfg.exit_actions.insert(
-            "default".into(),
+            "not-an-exit-code".into(),
             ExitActionPolicy {
                 action: ExitAction::Restart,
             },
         );
         let err = validate_managed_config(&cfg).unwrap_err().to_string();
-        assert!(err.contains("default"), "got: {err}");
+        assert!(err.contains("not-an-exit-code"), "got: {err}");
     }
 
     #[test]

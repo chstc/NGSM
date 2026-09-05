@@ -14,39 +14,49 @@ use std::thread;
 use servicemanager_core::{Error as CoreError, Result as CoreResult, ServiceDefinition};
 use servicemanager_win32::{enumerate_descendants, query_service, ProcessInfo};
 
+use crate::requests::{LogTarget, ModalTarget, RecoveryTarget, Request};
+
 // Re-export the canonical spec types from ops so that other GUI modules that
 // import `crate::data::InstallSpec` / `EditSpec` / `RecoverySpec` keep working
 // without touching their import paths.
 pub use servicemanager_ops::{EditSpec, InstallSpec, RecoverySpec};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionKind {
+    Start,
+    Stop,
+    Restart,
+    Pause,
+    Continue,
+    Rotate,
+    Remove,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionTarget {
+    pub service: String,
+    pub kind: ActionKind,
+}
+
 /// A unit of work the UI hands to the worker thread.
 pub enum Job {
     Refresh,
-    /// `token` identifies the modal operation that submitted this install so
-    /// the UI can drop a stale result whose modal was cancelled or replaced.
     Install {
         spec: InstallSpec,
-        token: u64,
+        request: Request<ModalTarget>,
     },
-    /// `token` identifies the modal operation that submitted this edit so the
-    /// UI can drop a stale result whose modal was cancelled or replaced.
     Edit {
         spec: EditSpec,
-        token: u64,
+        request: Request<ModalTarget>,
     },
-    Start(String),
-    Stop(String),
-    Restart(String),
-    Pause(String),
-    Continue(String),
-    Rotate(String),
-    Remove(String),
-    Processes(String),
-    ReadLog {
-        service: String,
-        stderr: bool,
+    Action(Request<ActionTarget>),
+    Processes(Request<ModalTarget>),
+    ReadLog(Request<LogTarget>),
+    ReadRecovery(Request<RecoveryTarget>),
+    SaveRecovery {
+        spec: RecoverySpec,
+        request: Request<RecoveryTarget>,
     },
-    SaveRecovery(RecoverySpec),
 }
 
 /// A result the worker posts back to the UI.
@@ -64,37 +74,40 @@ pub enum JobResult {
         metrics: crate::metrics::DashboardMetrics,
     },
     Processes {
-        service: String,
-        processes: Vec<ProcessInfo>,
+        request: Request<ModalTarget>,
+        result: CoreResult<Vec<ProcessInfo>>,
     },
     /// A privileged action ran (e.g. `Install`). Stash the success message;
     /// the UI shows it in the status bar.
-    Acted(String),
+    Acted {
+        request: Request<ActionTarget>,
+        result: CoreResult<String>,
+    },
     /// A tail of a service's stdout/stderr log.
     Log {
-        service: String,
-        stderr: bool,
+        request: Request<LogTarget>,
         status: String,
         lines: Vec<String>,
     },
     /// Outcome of a `SaveRecovery` job — routed to the Recovery view's own
     /// status line. `Ok` carries the success message, `Err` the failure.
-    RecoverySaved(CoreResult<String>),
-    /// Outcome of an `Install` job — routed back to the Install dialog. The
-    /// `token` echoes the submitting modal's operation id so a stale result
-    /// (cancelled / replaced before the worker finished) can be dropped.
+    RecoverySaved {
+        request: Request<RecoveryTarget>,
+        result: CoreResult<String>,
+    },
+    RecoveryLoaded {
+        request: Request<RecoveryTarget>,
+        result: CoreResult<RecoverySpec>,
+    },
     Installed {
-        token: u64,
+        request: Request<ModalTarget>,
         result: CoreResult<String>,
     },
-    /// Outcome of an `Edit` job — routed back to the Edit dialog. The
-    /// `token` echoes the submitting modal's operation id so a stale result
-    /// (cancelled / replaced before the worker finished) can be dropped.
     Edited {
-        token: u64,
+        request: Request<ModalTarget>,
         result: CoreResult<String>,
     },
-    Error(CoreError),
+    ScanError(CoreError),
 }
 
 /// Maximum number of jobs held in the worker queue. 16 is plenty for any
@@ -179,6 +192,18 @@ pub fn spawn_worker(result_tx: Sender<JobResult>, wake: Box<dyn Fn() + Send>) ->
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_channel(capacity: usize) -> (JobSender, Receiver<Job>) {
+    let (inner, receiver) = std::sync::mpsc::sync_channel(capacity);
+    (
+        JobSender {
+            inner,
+            pending_refresh: Arc::new(AtomicBool::new(false)),
+        },
+        receiver,
+    )
+}
+
 fn worker_loop(
     rx: Receiver<Job>,
     tx: Sender<JobResult>,
@@ -243,7 +268,15 @@ mod job_sender_tests {
         };
 
         // Fill the channel with one non-Refresh job.
-        sender.send(Job::Start("svc".into())).unwrap();
+        sender
+            .send(Job::Action(Request {
+                id: 1,
+                target: ActionTarget {
+                    service: "svc".into(),
+                    kind: ActionKind::Start,
+                },
+            }))
+            .unwrap();
 
         // Refresh should fail Full and leave pending=false.
         let err = sender.send(Job::Refresh).unwrap_err();
@@ -285,76 +318,63 @@ fn execute(job: Job) -> JobResult {
                     metrics,
                 }
             }
-            Err(e) => JobResult::Error(CoreError::other(format!("enumerate: {e}"))),
+            Err(e) => JobResult::ScanError(CoreError::other(format!("enumerate: {e}"))),
         },
-        Job::Install { spec, token } => JobResult::Installed {
-            token,
+        Job::Install { spec, request } => JobResult::Installed {
+            request,
             result: servicemanager_ops::install(spec),
         },
-        Job::Edit { spec, token } => JobResult::Edited {
-            token,
+        Job::Edit { spec, request } => JobResult::Edited {
+            request,
             result: servicemanager_ops::edit(spec),
         },
-        Job::Start(n) => match servicemanager_ops::start(&n) {
-            Ok(msg) => JobResult::Acted(msg),
-            Err(e) => JobResult::Error(CoreError::other(format!("{n}: {e}"))),
-        },
-        Job::Stop(n) => match servicemanager_ops::stop(&n) {
-            Ok(msg) => JobResult::Acted(msg),
-            Err(e) => JobResult::Error(CoreError::other(format!("{n}: {e}"))),
-        },
-        Job::Pause(n) => match servicemanager_ops::pause(&n) {
-            Ok(msg) => JobResult::Acted(msg),
-            Err(e) => JobResult::Error(CoreError::other(format!("{n}: {e}"))),
-        },
-        Job::Continue(n) => match servicemanager_ops::continue_service(&n) {
-            Ok(msg) => JobResult::Acted(msg),
-            Err(e) => JobResult::Error(CoreError::other(format!("{n}: {e}"))),
-        },
-        Job::Rotate(n) => match servicemanager_ops::rotate(&n) {
-            Ok(msg) => JobResult::Acted(msg),
-            Err(e) => JobResult::Error(e),
-        },
-        Job::Restart(n) => match servicemanager_ops::restart(&n, 30_000) {
-            Ok(msg) => JobResult::Acted(msg),
-            Err(e) => JobResult::Error(e),
-        },
-        // GUI always purges managed config and never force-natives.
-        Job::Remove(n) => match servicemanager_ops::remove(&n, false, true) {
-            Ok(msg) => JobResult::Acted(msg),
-            Err(e) => JobResult::Error(e),
-        },
-        Job::Processes(n) => match processes(&n) {
-            Ok(r) => r,
-            Err(e) => JobResult::Error(e),
-        },
-        Job::ReadLog { service, stderr } => read_log(&service, stderr),
-        Job::SaveRecovery(spec) => {
-            JobResult::RecoverySaved(servicemanager_ops::save_recovery(spec))
+        Job::Action(request) => {
+            let name = &request.target.service;
+            let result = match request.target.kind {
+                ActionKind::Start => servicemanager_ops::start(name),
+                ActionKind::Stop => servicemanager_ops::stop(name),
+                ActionKind::Restart => servicemanager_ops::restart(name, 30_000),
+                ActionKind::Pause => servicemanager_ops::pause(name),
+                ActionKind::Continue => servicemanager_ops::continue_service(name),
+                ActionKind::Rotate => servicemanager_ops::rotate(name),
+                // GUI always purges managed config and never force-natives.
+                ActionKind::Remove => servicemanager_ops::remove(name, false, true),
+            };
+            JobResult::Acted { request, result }
         }
+        Job::Processes(request) => {
+            let result = processes(&request.target.service);
+            JobResult::Processes { request, result }
+        }
+        Job::ReadLog(request) => read_log(request),
+        Job::ReadRecovery(request) => {
+            let result = servicemanager_ops::read_recovery(&request.target.service);
+            JobResult::RecoveryLoaded { request, result }
+        }
+        Job::SaveRecovery { spec, request } => JobResult::RecoverySaved {
+            request,
+            result: servicemanager_ops::save_recovery(spec),
+        },
     }
 }
 
-fn processes(name: &str) -> CoreResult<JobResult> {
+fn processes(name: &str) -> CoreResult<Vec<ProcessInfo>> {
     let snap = query_service(name)?;
     let pid = snap
         .runtime
         .as_ref()
         .and_then(|r| r.pid)
         .ok_or_else(|| CoreError::other(format!("service '{name}' is not running")))?;
-    let descendants = enumerate_descendants(pid)?;
-    Ok(JobResult::Processes {
-        service: name.to_string(),
-        processes: descendants,
-    })
+    enumerate_descendants(pid)
 }
 
 /// Read the tail of a managed service's stdout or stderr log file.
-fn read_log(service: &str, stderr: bool) -> JobResult {
+fn read_log(request: Request<LogTarget>) -> JobResult {
+    let service = request.target.service.as_str();
+    let stderr = request.target.stderr;
     let which = if stderr { "stderr" } else { "stdout" };
     let log = |status: String, lines: Vec<String>| JobResult::Log {
-        service: service.to_string(),
-        stderr,
+        request: request.clone(),
         status,
         lines,
     };
@@ -379,12 +399,73 @@ fn read_log(service: &str, stderr: bool) -> JobResult {
             Vec::new(),
         );
     };
+    let field = if stderr { "AppStderr" } else { "AppStdout" };
+    if log_needs_service_environment(&cfg, field, &path) {
+        return log(
+            format!(
+                "{which} uses service-environment references. The GUI cannot safely \
+                 resolve another service account's environment; open the resolved \
+                 log path instead. Configured path: {path}"
+            ),
+            Vec::new(),
+        );
+    }
     match tail_file(&path) {
         Ok(lines) => log(
             format!("{which}  ·  {path}  ·  {} lines", lines.len()),
             lines,
         ),
         Err(e) => log(format!("Cannot read {which} log '{path}': {e}"), Vec::new()),
+    }
+}
+
+fn log_needs_service_environment(
+    config: &servicemanager_core::ManagedApplicationConfig,
+    field: &str,
+    path: &str,
+) -> bool {
+    if !config.is_expandable_string(field) {
+        return false;
+    }
+    let mut signs = path.match_indices('%');
+    while let Some((start, _)) = signs.next() {
+        if let Some((end, _)) = signs.next() {
+            if end > start + 1 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod log_context_tests {
+    use super::*;
+
+    #[test]
+    fn only_marked_paths_with_real_references_require_the_service_environment() {
+        let config = servicemanager_core::ManagedApplicationConfig {
+            expandable_strings: ["AppStdout".into()].into(),
+            ..Default::default()
+        };
+        assert!(log_needs_service_environment(
+            &config,
+            "AppStdout",
+            r"%HOME%\out.log"
+        ));
+        assert!(!log_needs_service_environment(
+            &config,
+            "AppStderr",
+            r"%HOME%\out.log"
+        ));
+        for path in [
+            r"C:\logs\out.log",
+            r"C:\100%ready.log",
+            r"C:\100%%.log",
+            r"C:\%%prefix%tail",
+        ] {
+            assert!(!log_needs_service_environment(&config, "AppStdout", path));
+        }
     }
 }
 
@@ -395,40 +476,32 @@ fn read_log(service: &str, stderr: bool) -> JobResult {
 /// appropriate endianness, aligned to the BOM. A UTF-8 BOM
 /// (`EF BB BF`) is recognised but does not change behavior.
 fn tail_file(path: &str) -> std::io::Result<Vec<String>> {
-    use std::io::{Read, Seek, SeekFrom};
-    const TAIL: u64 = 64 * 1024;
     let mut f = std::fs::File::open(path)?;
     let len = f.metadata()?.len();
+    tail_reader(&mut f, len)
+}
 
-    // Peek the first 4 bytes to detect a BOM. Encoding is determined
-    // by what we find at byte 0.
-    let mut head = [0u8; 4];
-    let head_read = {
-        let n_to_read = (len.min(4)) as usize;
-        if n_to_read > 0 {
-            f.seek(SeekFrom::Start(0))?;
-            f.read_exact(&mut head[..n_to_read])?;
-        }
-        n_to_read
-    };
-    let encoding = detect_encoding(&head[..head_read]);
+fn tail_reader(
+    reader: &mut (impl std::io::Read + std::io::Seek),
+    len: u64,
+) -> std::io::Result<Vec<String>> {
+    use std::io::{Read, SeekFrom};
+    const TAIL: u64 = 64 * 1024;
+    reader.seek(SeekFrom::Start(0))?;
+    let mut head = Vec::new();
+    reader.by_ref().take(len.min(4)).read_to_end(&mut head)?;
+    let encoding = detect_encoding(&head);
+    let tail = crate::bounded_log::read_tail(
+        reader,
+        len,
+        TAIL,
+        matches!(encoding, TailEncoding::Utf16Le | TailEncoding::Utf16Be),
+    )?;
 
-    // Compute the tail start. For UTF-16 align to a 2-byte boundary
-    // (relative to the file start) so we don't slice mid-code-unit.
-    let mut tail_start = len.saturating_sub(TAIL);
-    if matches!(encoding, TailEncoding::Utf16Le | TailEncoding::Utf16Be) && tail_start % 2 != 0 {
-        tail_start += 1;
-    }
-    let partial = tail_start > 0;
-
-    f.seek(SeekFrom::Start(tail_start))?;
-    let mut buf = Vec::with_capacity(TAIL as usize);
-    f.read_to_end(&mut buf)?;
-
-    let text = decode_tail(&buf, encoding);
+    let text = decode_tail(&tail.bytes, encoding);
     let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     // A mid-file seek leaves the first line truncated — drop it.
-    if partial && !lines.is_empty() {
+    if tail.partial && !lines.is_empty() {
         lines.remove(0);
     }
     let extra = lines.len().saturating_sub(400);
@@ -484,7 +557,7 @@ mod tail_tests {
     use std::io::Write;
 
     fn write_temp(bytes: &[u8]) -> tempfile::NamedTempFile {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
+        let mut f = tempfile::NamedTempFile::new_in(".").unwrap();
         f.write_all(bytes).unwrap();
         f.flush().unwrap();
         f
@@ -544,5 +617,55 @@ mod tail_tests {
             lines.iter().any(|l| l.contains("hi")),
             "expected 'hi' in {lines:?}"
         );
+    }
+
+    #[test]
+    fn application_tail_is_bounded_for_growing_unterminated_input() {
+        for len in [10, 128 * 1024] {
+            let mut reader = crate::bounded_log::tests::GrowingReader::default();
+            let lines = tail_reader(&mut reader, len).unwrap();
+            assert_eq!(reader.read, len.min(4) + len.min(64 * 1024));
+            assert!(lines.len() <= 1);
+        }
+    }
+
+    #[test]
+    fn application_tail_handles_empty_truncated_and_four_hundred_lines() {
+        use std::io::Cursor;
+        assert!(tail_reader(&mut Cursor::new(b""), 0).unwrap().is_empty());
+        assert_eq!(
+            tail_reader(&mut Cursor::new(b"short\n"), 40).unwrap(),
+            ["short"]
+        );
+        let bytes = (0..600)
+            .map(|i| format!("line {i}\n"))
+            .collect::<String>()
+            .into_bytes();
+        let len = bytes.len() as u64;
+        let lines = tail_reader(&mut Cursor::new(bytes), len).unwrap();
+        assert_eq!(lines.len(), 400);
+        assert_eq!(lines[0], "line 200");
+        assert_eq!(lines[399], "line 599");
+    }
+
+    #[test]
+    fn large_utf16_tail_preserves_code_unit_alignment() {
+        use std::io::Cursor;
+        for encoding in [TailEncoding::Utf16Le, TailEncoding::Utf16Be] {
+            let mut bytes = match encoding {
+                TailEncoding::Utf16Le => vec![0xff, 0xfe],
+                _ => vec![0xfe, 0xff],
+            };
+            for unit in ("prefix\n".repeat(10_000) + "last \u{1f600}\n").encode_utf16() {
+                bytes.extend_from_slice(&match encoding {
+                    TailEncoding::Utf16Le => unit.to_le_bytes(),
+                    _ => unit.to_be_bytes(),
+                });
+            }
+            let len = bytes.len() as u64;
+            let lines = tail_reader(&mut Cursor::new(bytes), len).unwrap();
+            assert_eq!(lines.last().unwrap(), "last \u{1f600}");
+            assert_eq!(lines.len(), 400);
+        }
     }
 }

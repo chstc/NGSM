@@ -13,12 +13,17 @@
 #![cfg_attr(not(windows), allow(dead_code, unused_imports))]
 
 #[cfg(windows)]
+mod config_lock;
+#[cfg(windows)]
 mod imp;
+#[cfg(windows)]
+pub use config_lock::{lock_service_config, ServiceConfigGuard};
 
 #[cfg(windows)]
 pub use imp::{
     create_managed_config, delete_managed_config, get_value, nssm_keys, read_managed_config,
-    set_value, unset_value, write_managed_config, ManagedValueKind, ValueRecord,
+    set_value, unset_value, validate_managed_config, write_managed_config, ManagedValueKind,
+    ValueRecord,
 };
 
 #[cfg(not(windows))]
@@ -27,6 +32,18 @@ mod stub {
 
     fn unsupported(op: &str) -> Error {
         Error::other(format!("registry operation '{op}' requires Windows"))
+    }
+
+    pub struct ServiceConfigGuard(std::marker::PhantomData<std::rc::Rc<()>>);
+
+    impl ServiceConfigGuard {
+        pub fn was_abandoned(&self) -> bool {
+            false
+        }
+    }
+
+    pub fn lock_service_config(_name: &str) -> Result<ServiceConfigGuard> {
+        Err(unsupported("lock_service_config"))
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +72,10 @@ mod stub {
 
     pub fn write_managed_config(_service: &str, _cfg: &ManagedApplicationConfig) -> Result<()> {
         Err(unsupported("write_managed_config"))
+    }
+
+    pub fn validate_managed_config(_cfg: &ManagedApplicationConfig) -> Result<()> {
+        Err(unsupported("validate_managed_config"))
     }
 
     pub fn delete_managed_config(_service: &str) -> Result<()> {
@@ -111,6 +132,7 @@ mod stub {
 
 #[cfg(not(windows))]
 pub use stub::{
-    create_managed_config, delete_managed_config, get_value, nssm_keys, read_managed_config,
-    set_value, unset_value, write_managed_config, ManagedValueKind, ValueRecord,
+    create_managed_config, delete_managed_config, get_value, lock_service_config, nssm_keys,
+    read_managed_config, set_value, unset_value, validate_managed_config, write_managed_config,
+    ManagedValueKind, ServiceConfigGuard, ValueRecord,
 };

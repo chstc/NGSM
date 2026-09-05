@@ -40,6 +40,7 @@ pub fn install(spec: InstallSpec) -> OpResult {
     validate_install_config(&managed)?;
 
     let binary_path = build_run_service_command(&spec.name)?;
+    let _guard = servicemanager_registry::lock_service_config(&spec.name)?;
 
     install_service(&InstallOptions {
         name: spec.name.clone(),

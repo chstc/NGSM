@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, HashSet};
-use std::ffi::OsString;
-use std::os::windows::ffi::OsStringExt;
+use crate::config_lock::windows_name_key;
+use crate::lock_service_config;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use servicemanager_core::{
     validate_absolute_path, validate_hook_component, validate_service_name, Error, ExitAction,
@@ -71,12 +71,17 @@ pub fn read_managed_config(service: &str) -> Result<Option<ManagedApplicationCon
         Err(Error::NotFound(_)) => return Ok(None),
         Err(e) => return Err(e),
     };
+    read_managed_from_key(&key, service)
+}
 
+fn read_managed_from_key(key: &RegKey, service: &str) -> Result<Option<ManagedApplicationConfig>> {
+    let mut expandable_strings = BTreeSet::new();
     // The defining marker of an NSSM/NGSM-managed service is a
     // non-empty `Application` value under `Parameters`. Many native Windows
     // services have a `Parameters` subkey of their own; without the marker
     // we treat them as native.
-    let application = match opt_string(&key, nssm_keys::APPLICATION)? {
+    let application = match opt_config_string(key, nssm_keys::APPLICATION, &mut expandable_strings)?
+    {
         Some(v) if !v.trim().is_empty() => v,
         // Present but empty/whitespace: a corrupt managed config, *not* a
         // native service. Surface it rather than silently classify the
@@ -91,52 +96,53 @@ pub fn read_managed_config(service: &str) -> Result<Option<ManagedApplicationCon
         None => return Ok(None),
     };
 
-    let rotate_low = opt_u32(&key, nssm_keys::APP_ROTATE_BYTES_LOW)?;
-    let rotate_high = opt_u32(&key, nssm_keys::APP_ROTATE_BYTES_HIGH)?;
+    let rotate_low = opt_u32(key, nssm_keys::APP_ROTATE_BYTES_LOW)?;
+    let rotate_high = opt_u32(key, nssm_keys::APP_ROTATE_BYTES_HIGH)?;
     let rotate_bytes = match (rotate_low, rotate_high) {
         (None, None) => None,
         (lo, hi) => Some(((hi.unwrap_or(0) as u64) << 32) | lo.unwrap_or(0) as u64),
     };
 
-    let exit_actions = read_exit_actions(&key)?;
+    let exit_actions = read_exit_actions(key)?;
     let default_action = exit_actions.get("default").map(|p| p.action);
 
     let cfg = ManagedApplicationConfig {
         application: Some(application),
-        app_parameters: opt_string(&key, nssm_keys::APP_PARAMETERS)?,
-        app_directory: opt_string(&key, nssm_keys::APP_DIRECTORY)?,
-        environment: opt_multi_string(&key, nssm_keys::APP_ENVIRONMENT)?.unwrap_or_default(),
-        environment_extra: opt_multi_string(&key, nssm_keys::APP_ENVIRONMENT_EXTRA)?
+        app_parameters: opt_config_string(key, nssm_keys::APP_PARAMETERS, &mut expandable_strings)?,
+        app_directory: opt_config_string(key, nssm_keys::APP_DIRECTORY, &mut expandable_strings)?,
+        environment: opt_multi_string(key, nssm_keys::APP_ENVIRONMENT)?.unwrap_or_default(),
+        environment_extra: opt_multi_string(key, nssm_keys::APP_ENVIRONMENT_EXTRA)?
             .unwrap_or_default(),
-        priority: opt_u32(&key, nssm_keys::APP_PRIORITY)?,
-        affinity: opt_string(&key, nssm_keys::APP_AFFINITY)?,
+        priority: opt_u32(key, nssm_keys::APP_PRIORITY)?,
+        affinity: opt_config_string(key, nssm_keys::APP_AFFINITY, &mut expandable_strings)?,
         restart: RestartPolicy {
-            restart_delay_ms: opt_u32(&key, nssm_keys::APP_RESTART_DELAY)?,
-            throttle_delay_ms: opt_u32(&key, nssm_keys::APP_THROTTLE)?,
+            restart_delay_ms: opt_u32(key, nssm_keys::APP_RESTART_DELAY)?,
+            throttle_delay_ms: opt_u32(key, nssm_keys::APP_THROTTLE)?,
             default_action,
         },
         shutdown: ShutdownPolicy {
-            stop_method_skip: opt_u32(&key, nssm_keys::APP_STOP_METHOD_SKIP)?,
-            kill_console_grace_ms: opt_u32(&key, nssm_keys::APP_KILL_CONSOLE_GRACE)?,
-            kill_window_grace_ms: opt_u32(&key, nssm_keys::APP_KILL_WINDOW_GRACE)?,
-            kill_threads_grace_ms: opt_u32(&key, nssm_keys::APP_KILL_THREADS_GRACE)?,
-            kill_process_tree: opt_u32(&key, nssm_keys::APP_KILL_PROCESS_TREE)?.map(|v| v != 0),
+            stop_method_skip: opt_u32(key, nssm_keys::APP_STOP_METHOD_SKIP)?,
+            kill_console_grace_ms: opt_u32(key, nssm_keys::APP_KILL_CONSOLE_GRACE)?,
+            kill_window_grace_ms: opt_u32(key, nssm_keys::APP_KILL_WINDOW_GRACE)?,
+            kill_threads_grace_ms: opt_u32(key, nssm_keys::APP_KILL_THREADS_GRACE)?,
+            kill_process_tree: opt_u32(key, nssm_keys::APP_KILL_PROCESS_TREE)?.map(|v| v != 0),
         },
         io: IoRedirectionConfig {
-            stdin: read_io_stream(&key, nssm_keys::APP_STDIN)?,
-            stdout: read_io_stream(&key, nssm_keys::APP_STDOUT)?,
-            stderr: read_io_stream(&key, nssm_keys::APP_STDERR)?,
-            timestamp_log: opt_u32(&key, nssm_keys::APP_TIMESTAMP_LOG)?.map(|v| v != 0),
+            stdin: read_io_stream(key, nssm_keys::APP_STDIN, &mut expandable_strings)?,
+            stdout: read_io_stream(key, nssm_keys::APP_STDOUT, &mut expandable_strings)?,
+            stderr: read_io_stream(key, nssm_keys::APP_STDERR, &mut expandable_strings)?,
+            timestamp_log: opt_u32(key, nssm_keys::APP_TIMESTAMP_LOG)?.map(|v| v != 0),
         },
         rotation: LogRotationConfig {
-            enabled: opt_u32(&key, nssm_keys::APP_ROTATE)?.map(|v| v != 0),
-            online: opt_u32(&key, nssm_keys::APP_ROTATE_ONLINE)?,
-            seconds: opt_u32(&key, nssm_keys::APP_ROTATE_SECONDS)?,
+            enabled: opt_u32(key, nssm_keys::APP_ROTATE)?.map(|v| v != 0),
+            online: opt_u32(key, nssm_keys::APP_ROTATE_ONLINE)?,
+            seconds: opt_u32(key, nssm_keys::APP_ROTATE_SECONDS)?,
             bytes: rotate_bytes,
-            delay_ms: opt_u32(&key, nssm_keys::APP_ROTATE_DELAY)?,
+            delay_ms: opt_u32(key, nssm_keys::APP_ROTATE_DELAY)?,
         },
         exit_actions,
-        hooks: read_hooks(&key)?,
+        hooks: read_hooks(key, &mut expandable_strings)?,
+        expandable_strings,
     };
     Ok(Some(cfg))
 }
@@ -147,14 +153,37 @@ pub fn read_managed_config(service: &str) -> Result<Option<ManagedApplicationCon
 /// named `Default` value (in any case) means exactly the same thing — both
 /// map to the internal `"default"` key. A specific exit code (e.g. `"1"`)
 /// passes through unchanged.
-fn normalize_exit_action_name(name: &str) -> String {
+fn normalize_exit_action_name(name: &str) -> Result<String> {
     if name.is_empty() || name.eq_ignore_ascii_case("default") {
-        "default".to_string()
+        Ok("default".to_string())
     } else {
-        name.to_string()
+        let code = name
+            .parse::<i32>()
+            .or_else(|_| name.parse::<u32>().map(|code| code as i32))
+            .map_err(|_| {
+                Error::InvalidConfig(format!("AppExit key '{name}' is not a 32-bit exit code"))
+            })?;
+        Ok(code.to_string())
     }
 }
 
+fn insert_exit_action(
+    out: &mut BTreeMap<String, ExitActionPolicy>,
+    name: &str,
+    action: ExitAction,
+) -> Result<()> {
+    let canonical = normalize_exit_action_name(name)?;
+    if let Some(previous) = out.get(&canonical) {
+        if previous.action != action {
+            return Err(Error::InvalidConfig(format!(
+                "conflicting AppExit aliases for '{canonical}'"
+            )));
+        }
+    } else {
+        out.insert(canonical, ExitActionPolicy { action });
+    }
+    Ok(())
+}
 fn parse_exit_action(value: &str) -> Option<ExitAction> {
     match value.trim().to_ascii_lowercase().as_str() {
         "restart" => Some(ExitAction::Restart),
@@ -165,8 +194,12 @@ fn parse_exit_action(value: &str) -> Option<ExitAction> {
     }
 }
 
-fn read_io_stream(parent: &RegKey, value_name: &str) -> Result<Option<IoStream>> {
-    let path = match opt_string(parent, value_name)? {
+fn read_io_stream(
+    parent: &RegKey,
+    value_name: &str,
+    marked: &mut BTreeSet<String>,
+) -> Result<Option<IoStream>> {
+    let path = match opt_config_string(parent, value_name, marked)? {
         Some(p) if !p.is_empty() => p,
         _ => return Ok(None),
     };
@@ -200,10 +233,10 @@ fn read_exit_actions(parent: &RegKey) -> Result<BTreeMap<String, ExitActionPolic
     };
     let mut out = BTreeMap::new();
     for (name, value) in enumerate_string_values(&exit_key)? {
-        let action_name = normalize_exit_action_name(&name);
+        let action_name = normalize_exit_action_name(&name)?;
         match parse_exit_action(&value) {
             Some(action) => {
-                out.insert(action_name, ExitActionPolicy { action });
+                insert_exit_action(&mut out, &action_name, action)?;
             }
             // Corrupt config: surface it rather than silently dropping the
             // entry, which a later reconcile write would then scrub for good.
@@ -217,7 +250,7 @@ fn read_exit_actions(parent: &RegKey) -> Result<BTreeMap<String, ExitActionPolic
     Ok(out)
 }
 
-fn read_hooks(parent: &RegKey) -> Result<Vec<HookConfig>> {
+fn read_hooks(parent: &RegKey, marked: &mut BTreeSet<String>) -> Result<Vec<HookConfig>> {
     let events_key = match open_subkey(parent.0, nssm_keys::APP_EVENTS, KEY_READ) {
         Ok(k) => k,
         Err(Error::NotFound(_)) => return Ok(Vec::new()),
@@ -225,12 +258,19 @@ fn read_hooks(parent: &RegKey) -> Result<Vec<HookConfig>> {
     };
     let mut out = Vec::new();
     for event in enumerate_subkey_names(&events_key)? {
+        validate_hook_component(&event, "event")?;
         let event_key = match open_subkey(events_key.0, &event, KEY_READ) {
             Ok(k) => k,
             Err(Error::NotFound(_)) => continue,
             Err(e) => return Err(e),
         };
-        for (action, command) in enumerate_string_values(&event_key)? {
+        for (action, command, kind) in enumerate_typed_string_values(&event_key)? {
+            validate_hook_component(&action, "action")?;
+            if kind == REG_EXPAND_SZ {
+                marked.insert(ManagedApplicationConfig::hook_expansion_key(
+                    &event, &action,
+                ));
+            }
             out.push(HookConfig {
                 event: event.clone(),
                 action,
@@ -431,7 +471,7 @@ fn bytes_to_wide_multi(bytes: &[u8]) -> Result<Vec<String>> {
             if i == start {
                 // Empty string == the block terminator. Anything after it
                 // is trailing garbage.
-                if i + 1 != words.len() {
+                if words[i + 1..].iter().any(|&word| word != 0) {
                     return Err(Error::Registry(
                         "REG_MULTI_SZ value has data after its block terminator".to_string(),
                     ));
@@ -452,13 +492,33 @@ fn bytes_to_wide_multi(bytes: &[u8]) -> Result<Vec<String>> {
 }
 
 fn read_string(key: &RegKey, name: &str) -> Result<String> {
+    read_typed_string(key, name).map(|(value, _)| value)
+}
+
+fn read_typed_string(key: &RegKey, name: &str) -> Result<(String, REG_VALUE_TYPE)> {
     let (ty, bytes) = query_value_raw(key, name)?;
     if ty != REG_SZ && ty != REG_EXPAND_SZ {
         return Err(Error::Registry(format!("value {name} is not REG_SZ")));
     }
-    bytes_to_wide_string(&bytes)
+    Ok((bytes_to_wide_string(&bytes)?, ty))
 }
 
+fn opt_config_string(
+    key: &RegKey,
+    name: &str,
+    marked: &mut BTreeSet<String>,
+) -> Result<Option<String>> {
+    match read_typed_string(key, name) {
+        Ok((value, kind)) => {
+            if kind == REG_EXPAND_SZ {
+                marked.insert(name.to_string());
+            }
+            Ok(Some(value))
+        }
+        Err(Error::NotFound(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
 fn read_multi_string(key: &RegKey, name: &str) -> Result<Vec<String>> {
     let (ty, bytes) = query_value_raw(key, name)?;
     if ty != REG_MULTI_SZ {
@@ -536,6 +596,13 @@ fn opt_u32(key: &RegKey, name: &str) -> Result<Option<u32>> {
 }
 
 fn enumerate_string_values(key: &RegKey) -> Result<Vec<(String, String)>> {
+    Ok(enumerate_typed_string_values(key)?
+        .into_iter()
+        .map(|(name, value, _)| (name, value))
+        .collect())
+}
+
+fn enumerate_typed_string_values(key: &RegKey) -> Result<Vec<(String, String, REG_VALUE_TYPE)>> {
     let mut out = Vec::new();
     let mut index = 0u32;
     let mut name_cap = 256usize;
@@ -588,9 +655,7 @@ fn enumerate_string_values(key: &RegKey) -> Result<Vec<(String, String)>> {
             )));
         }
 
-        let name = OsString::from_wide(&name_buf[..name_len as usize])
-            .to_string_lossy()
-            .into_owned();
+        let name = decode_registry_name(&name_buf[..name_len as usize])?;
         value_buf.truncate(value_len as usize);
         let ty = REG_VALUE_TYPE(value_type);
         // This helper is only used on NGSM-owned subtrees (`AppExit`,
@@ -601,7 +666,7 @@ fn enumerate_string_values(key: &RegKey) -> Result<Vec<(String, String)>> {
                 "registry value '{name}' (index {index}) is not a string (REG type {value_type})"
             )));
         }
-        out.push((name, bytes_to_wide_string(&value_buf)?));
+        out.push((name, bytes_to_wide_string(&value_buf)?, ty));
         index += 1;
     }
     Ok(out)
@@ -650,14 +715,83 @@ fn enumerate_subkey_names(key: &RegKey) -> Result<Vec<String>> {
             )));
         }
 
-        out.push(
-            OsString::from_wide(&name_buf[..name_len as usize])
-                .to_string_lossy()
-                .into_owned(),
-        );
+        out.push(decode_registry_name(&name_buf[..name_len as usize])?);
         index += 1;
     }
     Ok(out)
+}
+
+fn decode_registry_name(words: &[u16]) -> Result<String> {
+    let name = String::from_utf16(words)
+        .map_err(|_| Error::Registry("owned registry name contains invalid UTF-16".into()))?;
+    if name.contains('\0') {
+        return Err(Error::Registry(
+            "owned registry name contains an embedded NUL".into(),
+        ));
+    }
+    Ok(name)
+}
+
+fn enumerate_value_names(key: &RegKey) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut capacity = 256;
+    let mut index = 0;
+    loop {
+        let mut buffer = vec![0u16; capacity];
+        let mut length = buffer.len() as u32;
+        // SAFETY: the counted name buffer is live; unused data/type outputs
+        // are null so malformed payloads can still be explicitly repaired.
+        let status = unsafe {
+            RegEnumValueW(
+                key.0,
+                index,
+                Some(PWSTR(buffer.as_mut_ptr())),
+                &mut length,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        if status == ERROR_NO_MORE_ITEMS {
+            return Ok(out);
+        }
+        if status == ERROR_MORE_DATA && capacity < 64 * 1024 {
+            capacity *= 2;
+            continue;
+        }
+        status
+            .ok()
+            .map_err(|error| map_reg_error("RegEnumValue(names)", error))?;
+        out.push(decode_registry_name(&buffer[..length as usize])?);
+        index += 1;
+    }
+}
+
+fn check_existing_names(key: &RegKey) -> Result<()> {
+    match open_subkey(key.0, nssm_keys::APP_EXIT, KEY_READ) {
+        Ok(exit) => {
+            enumerate_value_names(&exit)?;
+        }
+        Err(Error::NotFound(_)) => {}
+        Err(error) => return Err(error),
+    }
+    match open_subkey(key.0, nssm_keys::APP_EVENTS, KEY_READ) {
+        Ok(events) => {
+            for name in enumerate_subkey_names(&events)? {
+                match open_subkey(events.0, &name, KEY_READ) {
+                    Ok(event) => {
+                        enumerate_value_names(&event)?;
+                    }
+                    Err(Error::NotFound(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Err(Error::NotFound(_)) => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
 }
 
 // -- Set / Get / Unset by NSSM value name ---------------------------------
@@ -692,29 +826,24 @@ fn join_multi_value(entries: &[String]) -> String {
 
 /// Inverse of [`join_multi_value`]: split a comma-separated string into
 /// `REG_MULTI_SZ` entries, honoring `\\` and `\,` escapes. Each entry is
-/// trimmed, and empty entries are dropped — `REG_MULTI_SZ` cannot represent
+/// preserved verbatim, and empty entries are dropped — `REG_MULTI_SZ` cannot represent
 /// an empty string (it doubles as the block terminator).
+/// UNC paths must also escape each backslash: `\\\\server\\share` represents
+/// `\\server\share`. [`join_multi_value`] always emits this canonical notation.
 fn split_multi_value(value: &str) -> Vec<String> {
     let mut entries: Vec<String> = Vec::new();
     let mut current = String::new();
-    let mut chars = value.chars();
+    let mut chars = value.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            // `\` escapes the next character; a trailing lone `\` is literal.
-            '\\' => match chars.next() {
-                Some(next) => current.push(next),
-                None => current.push('\\'),
-            },
+            '\\' if matches!(chars.peek(), Some(',' | '\\')) => current.push(chars.next().unwrap()),
+            '\\' => current.push('\\'),
             ',' => entries.push(std::mem::take(&mut current)),
             other => current.push(other),
         }
     }
     entries.push(current);
-    entries
-        .into_iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
+    entries.into_iter().filter(|s| !s.is_empty()).collect()
 }
 
 /// True for the NSSM value names that hold a filesystem path the service
@@ -735,6 +864,13 @@ fn is_path_value(canonical: &str) -> bool {
 /// names return [`Error::InvalidConfig`].
 pub fn set_value(service: &str, name: &str, value: &str) -> Result<()> {
     validate_service_name(service)?;
+    let _guard = lock_service_config(service)?;
+    let path = format!("SYSTEM\\CurrentControlSet\\Services\\{service}\\Parameters");
+    let key = open_subkey(HKEY_LOCAL_MACHINE, &path, KEY_READ | KEY_WRITE)?;
+    set_value_in_key(&key, name, value)
+}
+
+fn set_value_in_key(key: &RegKey, name: &str, value: &str) -> Result<()> {
     let (canonical, kind) = lookup_kind(name)?;
     // `Application` is the managed-service marker; setting it empty would make
     // the service read back as native. Reject that here.
@@ -752,8 +888,7 @@ pub fn set_value(service: &str, name: &str, value: &str) -> Result<()> {
     }
     // `set` mutates an existing managed config; it must not be able to mark a
     // native service as managed by creating the marker from scratch.
-    require_managed(service)?;
-    let key = create_parameters_key(service)?;
+    require_managed_marker(key)?;
     match kind {
         ManagedValueKind::String => {
             // For path-valued fields other than the required `Application`
@@ -767,16 +902,16 @@ pub fn set_value(service: &str, name: &str, value: &str) -> Result<()> {
                 && canonical != nssm_keys::APPLICATION
                 && value.trim().is_empty()
             {
-                clear_path_value(&key, &canonical)?;
+                clear_path_value(key, &canonical)?;
             } else {
-                write_string(&key, &canonical, value)?;
+                write_string(key, &canonical, value)?;
             }
         }
         ManagedValueKind::MultiString => {
             // Comma-separated input, with `\,` / `\\` escapes so an entry
             // that genuinely contains a comma round-trips through `get`.
             let parts = split_multi_value(value);
-            write_multi_string(&key, &canonical, &parts)?;
+            write_multi_string(key, &canonical, &parts)?;
         }
         ManagedValueKind::Number => {
             let parsed: u32 = value.parse().map_err(|_| {
@@ -784,7 +919,7 @@ pub fn set_value(service: &str, name: &str, value: &str) -> Result<()> {
                     "{canonical} expects a numeric value, got '{value}'"
                 ))
             })?;
-            write_u32(&key, &canonical, parsed)?;
+            write_u32(key, &canonical, parsed)?;
         }
     }
     Ok(())
@@ -874,6 +1009,13 @@ pub fn get_value(service: &str, name: &str) -> Result<Option<ValueRecord>> {
 /// inherit stale attributes from the old path.
 pub fn unset_value(service: &str, name: &str) -> Result<()> {
     validate_service_name(service)?;
+    let _guard = lock_service_config(service)?;
+    let path = format!("SYSTEM\\CurrentControlSet\\Services\\{service}\\Parameters");
+    let key = open_subkey(HKEY_LOCAL_MACHINE, &path, KEY_READ | KEY_WRITE)?;
+    unset_value_in_key(&key, name)
+}
+
+fn unset_value_in_key(key: &RegKey, name: &str) -> Result<()> {
     let (canonical, _) = lookup_kind(name)?;
     // Removing `Application` would silently turn the service unmanaged.
     // Removing the marker is `delete_managed_config`'s job, not `unset`'s.
@@ -885,20 +1027,14 @@ pub fn unset_value(service: &str, name: &str) -> Result<()> {
         ));
     }
     // Only mutate the config of a service that is actually managed.
-    require_managed(service)?;
-    let path = format!("SYSTEM\\CurrentControlSet\\Services\\{service}\\Parameters");
-    let key = match open_subkey(HKEY_LOCAL_MACHINE, &path, KEY_WRITE) {
-        Ok(k) => k,
-        Err(Error::NotFound(_)) => return Ok(()),
-        Err(e) => return Err(e),
-    };
+    require_managed_marker(key)?;
     // Route stdio path fields through `clear_path_value` so the
     // associated attribute values go with them; other fields delete
     // through the bare canonical path (no attribute family to cascade).
     if is_stdio_path_value(&canonical) {
-        clear_path_value(&key, &canonical)
+        clear_path_value(key, &canonical)
     } else {
-        ignore_missing(delete_value(&key, &canonical))
+        ignore_missing(delete_value(key, &canonical))
     }
 }
 
@@ -940,16 +1076,14 @@ fn lookup_kind(name: &str) -> Result<(String, ManagedValueKind)> {
     )))
 }
 
-/// Require that `service` already has managed configuration. `set`/`unset`
-/// only *mutate* an existing managed config — they must not be able to
-/// create the managed-service marker on an arbitrary native service.
-fn require_managed(service: &str) -> Result<()> {
-    if read_managed_config(service)?.is_none() {
-        return Err(Error::InvalidConfig(format!(
-            "'{service}' has no managed configuration; create one with `install` first"
-        )));
+fn require_managed_marker(key: &RegKey) -> Result<()> {
+    match opt_string(key, nssm_keys::APPLICATION)? {
+        Some(value) if !value.trim().is_empty() => Ok(()),
+        _ => Err(Error::InvalidConfig(
+            "a valid nonempty Application marker is required; native services cannot be modified"
+                .into(),
+        )),
     }
-    Ok(())
 }
 
 const MANAGED_VALUE_KINDS: &[(&str, ManagedValueKind)] = &[
@@ -989,9 +1123,11 @@ const MANAGED_VALUE_KINDS: &[(&str, ManagedValueKind)] = &[
 /// reconciled, so the result reflects exactly `cfg`.
 pub fn create_managed_config(service: &str, cfg: &ManagedApplicationConfig) -> Result<()> {
     validate_service_name(service)?;
-    require_application(cfg)?;
-    let key = create_parameters_key(service)?;
-    write_into_key(&key, cfg)
+    validate_managed_config(cfg)?;
+    let _guard = lock_service_config(service)?;
+    let service_path = format!("SYSTEM\\CurrentControlSet\\Services\\{service}");
+    let service_key = open_subkey(HKEY_LOCAL_MACHINE, &service_path, KEY_WRITE | KEY_READ)?;
+    create_managed_under_service(&service_key, cfg)
 }
 
 /// A managed config must carry a non-empty `Application`; without it the
@@ -1011,9 +1147,12 @@ fn require_application(cfg: &ManagedApplicationConfig) -> Result<()> {
 /// Returns [`Error::NotFound`] if the service's `Parameters` key does not exist.
 pub fn write_managed_config(service: &str, cfg: &ManagedApplicationConfig) -> Result<()> {
     validate_service_name(service)?;
+    validate_managed_config(cfg)?;
+    let _guard = lock_service_config(service)?;
     require_application(cfg)?;
     let path = format!("SYSTEM\\CurrentControlSet\\Services\\{service}\\Parameters");
     let key = open_subkey(HKEY_LOCAL_MACHINE, &path, parameters_rw_sam())?;
+    require_managed_marker(&key)?;
     write_into_key(&key, cfg)
 }
 
@@ -1027,6 +1166,7 @@ pub fn write_managed_config(service: &str, cfg: &ManagedApplicationConfig) -> Re
 /// returned error rather than the caller being told the purge succeeded.
 pub fn delete_managed_config(service: &str) -> Result<()> {
     validate_service_name(service)?;
+    let _guard = lock_service_config(service)?;
     let path = format!("SYSTEM\\CurrentControlSet\\Services\\{service}\\Parameters");
     let key = match open_subkey(HKEY_LOCAL_MACHINE, &path, parameters_rw_sam()) {
         Ok(k) => k,
@@ -1036,13 +1176,13 @@ pub fn delete_managed_config(service: &str) -> Result<()> {
     scrub_managed(&key)
 }
 
-/// Open the service's key (which must exist) and create `Parameters` under
-/// it. Refusing to create the service key itself is what prevents
-/// orphan service-like keys appearing from typos or bad input.
-fn create_parameters_key(service: &str) -> Result<RegKey> {
-    let service_path = format!("SYSTEM\\CurrentControlSet\\Services\\{service}");
-    let service_key = open_subkey(HKEY_LOCAL_MACHINE, &service_path, KEY_WRITE | KEY_READ)?;
-    create_subkey_under(&service_key, "Parameters")
+fn create_managed_under_service(
+    service_key: &RegKey,
+    cfg: &ManagedApplicationConfig,
+) -> Result<()> {
+    validate_managed_config(cfg)?;
+    let key = create_subkey_under(service_key, "Parameters")?;
+    write_into_key(&key, cfg)
 }
 
 /// Names of every value NGSM may have written under `Parameters`,
@@ -1193,37 +1333,122 @@ fn precheck_no_embedded_nuls(cfg: &ManagedApplicationConfig) -> Result<()> {
 /// written *before* any delete happens. A failure partway through can leave
 /// a few stale values behind, but it can never erase the previous working
 /// `Application`/IO/restart config — which a delete-then-write order would.
-fn write_into_key(key: &RegKey, cfg: &ManagedApplicationConfig) -> Result<()> {
+/// Shared, non-mutating preflight for full managed writes. Installers and
+/// editors can use the identical validation before their first mutation.
+pub fn validate_managed_config(cfg: &ManagedApplicationConfig) -> Result<()> {
+    preflight_config(cfg).map(|_| ())
+}
+
+fn preflight_config(cfg: &ManagedApplicationConfig) -> Result<BTreeMap<String, ExitActionPolicy>> {
+    require_application(cfg)?;
+    for marked in &cfg.expandable_strings {
+        let scalar = [
+            "Application",
+            "AppParameters",
+            "AppDirectory",
+            "AppAffinity",
+            "AppStdin",
+            "AppStdout",
+            "AppStderr",
+        ]
+        .iter()
+        .any(|name| marked.eq_ignore_ascii_case(name));
+        if !scalar {
+            let components: Vec<&str> = marked.split('\\').collect();
+            if components.len() != 3 || !components[0].eq_ignore_ascii_case("AppEvents") {
+                return Err(Error::InvalidConfig(
+                    "unknown expandable string metadata key".into(),
+                ));
+            }
+            validate_hook_component(components[1], "event")?;
+            validate_hook_component(components[2], "action")?;
+        }
+    }
     // Reject any embedded NUL up front, before any registry mutation —
     // otherwise a NUL in (say) `AppParameters` would only be caught
     // after `Application` and earlier fields have already been written,
     // leaving the registry half-mutated.
     precheck_no_embedded_nuls(cfg)?;
+    for (name, values) in [
+        (nssm_keys::APP_ENVIRONMENT, &cfg.environment),
+        (nssm_keys::APP_ENVIRONMENT_EXTRA, &cfg.environment_extra),
+    ] {
+        if values.iter().any(String::is_empty) {
+            return Err(Error::InvalidConfig(format!(
+                "{name} cannot contain an empty REG_MULTI_SZ entry"
+            )));
+        }
+    }
+    let mut hooks = BTreeMap::new();
     // Validate hook names up front, before mutating the registry at all.
     for hook in &cfg.hooks {
         validate_hook_component(&hook.event, "event")?;
         validate_hook_component(&hook.action, "action")?;
+        let identity = (
+            windows_name_key(&hook.event)?,
+            windows_name_key(&hook.action)?,
+        );
+        if let Some(previous) = hooks.insert(identity, &hook.command) {
+            if previous != &hook.command {
+                return Err(Error::InvalidConfig(
+                    "conflicting case-insensitive hook definitions".into(),
+                ));
+            }
+        }
     }
     // Every configured filesystem path must be absolute — a relative
     // application path would resolve through the service account's PATH /
     // working directory (search-path confusion), and relative log paths are
     // ambiguous. Checked before any registry mutation.
     if let Some(app) = &cfg.application {
-        validate_absolute_path("Application", app)?;
+        validate_raw_path(cfg, "Application", app)?;
     }
     if let Some(dir) = cfg.app_directory.as_deref().filter(|d| !d.is_empty()) {
-        validate_absolute_path("AppDirectory", dir)?;
+        validate_raw_path(cfg, "AppDirectory", dir)?;
     }
     if let Some(s) = &cfg.io.stdin {
-        validate_absolute_path("AppStdin", &s.path)?;
+        validate_raw_path(cfg, "AppStdin", &s.path)?;
     }
     if let Some(s) = &cfg.io.stdout {
-        validate_absolute_path("AppStdout", &s.path)?;
+        validate_raw_path(cfg, "AppStdout", &s.path)?;
     }
     if let Some(s) = &cfg.io.stderr {
-        validate_absolute_path("AppStderr", &s.path)?;
+        validate_raw_path(cfg, "AppStderr", &s.path)?;
     }
+    let mut exit_actions = BTreeMap::new();
+    for (name, policy) in &cfg.exit_actions {
+        insert_exit_action(&mut exit_actions, name, policy.action)?;
+    }
+    if let Some(action) = cfg.restart.default_action {
+        insert_exit_action(&mut exit_actions, "default", action)?;
+    }
+    Ok(exit_actions)
+}
 
+fn validate_raw_path(cfg: &ManagedApplicationConfig, name: &str, value: &str) -> Result<()> {
+    if cfg.is_expandable_string(name) {
+        if value.chars().any(char::is_control) {
+            return Err(Error::InvalidConfig(format!(
+                "{name} contains a control character"
+            )));
+        }
+        // A variable can supply a drive/UNC prefix. Only the service account
+        // can resolve it; runtime validates the effective path before use.
+        if value
+            .split('%')
+            .enumerate()
+            .any(|(index, part)| index % 2 == 1 && !part.is_empty())
+            && value.matches('%').count() >= 2
+        {
+            return Ok(());
+        }
+    }
+    validate_absolute_path(name, value)
+}
+
+fn write_into_key(key: &RegKey, cfg: &ManagedApplicationConfig) -> Result<()> {
+    let exit_actions = preflight_config(cfg)?;
+    check_existing_names(key)?;
     // --- Phase 1: write every scalar value present in `cfg`. ---
     let mut written: HashSet<String> = HashSet::new();
     macro_rules! put {
@@ -1236,19 +1461,19 @@ fn write_into_key(key: &RegKey, cfg: &ManagedApplicationConfig) -> Result<()> {
     if let Some(v) = &cfg.application {
         put!(
             nssm_keys::APPLICATION,
-            write_string(key, nssm_keys::APPLICATION, v)?
+            write_config_string(key, cfg, nssm_keys::APPLICATION, v)?
         );
     }
     if let Some(v) = &cfg.app_parameters {
         put!(
             nssm_keys::APP_PARAMETERS,
-            write_string(key, nssm_keys::APP_PARAMETERS, v)?
+            write_config_string(key, cfg, nssm_keys::APP_PARAMETERS, v)?
         );
     }
     if let Some(v) = &cfg.app_directory {
         put!(
             nssm_keys::APP_DIRECTORY,
-            write_string(key, nssm_keys::APP_DIRECTORY, v)?
+            write_config_string(key, cfg, nssm_keys::APP_DIRECTORY, v)?
         );
     }
     if let Some(v) = cfg.priority {
@@ -1260,7 +1485,7 @@ fn write_into_key(key: &RegKey, cfg: &ManagedApplicationConfig) -> Result<()> {
     if let Some(v) = &cfg.affinity {
         put!(
             nssm_keys::APP_AFFINITY,
-            write_string(key, nssm_keys::APP_AFFINITY, v)?
+            write_config_string(key, cfg, nssm_keys::APP_AFFINITY, v)?
         );
     }
     if !cfg.environment.is_empty() {
@@ -1361,13 +1586,13 @@ fn write_into_key(key: &RegKey, cfg: &ManagedApplicationConfig) -> Result<()> {
             write_u32(key, nssm_keys::APP_TIMESTAMP_LOG, v as u32)?
         );
     }
-    for name in write_io_stream(key, nssm_keys::APP_STDIN, &cfg.io.stdin)? {
+    for name in write_io_stream(key, cfg, nssm_keys::APP_STDIN, &cfg.io.stdin)? {
         written.insert(name);
     }
-    for name in write_io_stream(key, nssm_keys::APP_STDOUT, &cfg.io.stdout)? {
+    for name in write_io_stream(key, cfg, nssm_keys::APP_STDOUT, &cfg.io.stdout)? {
         written.insert(name);
     }
-    for name in write_io_stream(key, nssm_keys::APP_STDERR, &cfg.io.stderr)? {
+    for name in write_io_stream(key, cfg, nssm_keys::APP_STDERR, &cfg.io.stderr)? {
         written.insert(name);
     }
 
@@ -1376,12 +1601,6 @@ fn write_into_key(key: &RegKey, cfg: &ManagedApplicationConfig) -> Result<()> {
     // entry. If a caller set it without also populating `exit_actions`, the
     // default action would otherwise be silently dropped on write — so
     // synthesize the "default" entry from it when one is not already present.
-    let mut exit_actions = cfg.exit_actions.clone();
-    if let Some(action) = cfg.restart.default_action {
-        exit_actions
-            .entry("default".to_string())
-            .or_insert(ExitActionPolicy { action });
-    }
     if exit_actions.is_empty() {
         ignore_missing(delete_subtree(key, nssm_keys::APP_EXIT))?;
     } else {
@@ -1410,7 +1629,7 @@ fn write_into_key(key: &RegKey, cfg: &ManagedApplicationConfig) -> Result<()> {
             write_string(&exit_key, registry_name, exit_action_str(policy.action))?;
             wanted.insert(registry_name.to_string());
         }
-        for (existing, _) in enumerate_string_values(&exit_key)? {
+        for existing in enumerate_value_names(&exit_key)? {
             if !wanted.contains(&existing) {
                 ignore_missing(delete_value(&exit_key, &existing))?;
             }
@@ -1422,19 +1641,27 @@ fn write_into_key(key: &RegKey, cfg: &ManagedApplicationConfig) -> Result<()> {
         ignore_missing(delete_subtree(key, nssm_keys::APP_EVENTS))?;
     } else {
         let events_key = create_subkey_under(key, nssm_keys::APP_EVENTS)?;
-        let mut wanted: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+        let mut wanted: BTreeMap<Vec<u16>, HashSet<Vec<u16>>> = BTreeMap::new();
         for hook in &cfg.hooks {
             // Layout matches the reader: `AppEvents\<event>` is a subkey
             // and each `<action>` is a named REG_SZ value under it.
             let event_key = create_subkey_under(&events_key, &hook.event)?;
-            write_string(&event_key, &hook.action, &hook.command)?;
+            let kind = if registry_is_expandable(
+                cfg,
+                &ManagedApplicationConfig::hook_expansion_key(&hook.event, &hook.action),
+            )? {
+                REG_EXPAND_SZ
+            } else {
+                REG_SZ
+            };
+            write_string_typed(&event_key, &hook.action, &hook.command, kind)?;
             wanted
-                .entry(hook.event.clone())
+                .entry(windows_name_key(&hook.event)?)
                 .or_default()
-                .insert(hook.action.clone());
+                .insert(windows_name_key(&hook.action)?);
         }
         for existing_event in enumerate_subkey_names(&events_key)? {
-            match wanted.get(&existing_event) {
+            match wanted.get(&windows_name_key(&existing_event)?) {
                 None => {
                     ignore_missing(delete_subtree(&events_key, &existing_event))?;
                 }
@@ -1445,8 +1672,8 @@ fn write_into_key(key: &RegKey, cfg: &ManagedApplicationConfig) -> Result<()> {
                             Err(Error::NotFound(_)) => continue,
                             Err(e) => return Err(e),
                         };
-                    for (existing_action, _) in enumerate_string_values(&event_key)? {
-                        if !wanted_actions.contains(&existing_action) {
+                    for existing_action in enumerate_value_names(&event_key)? {
+                        if !wanted_actions.contains(&windows_name_key(&existing_action)?) {
                             ignore_missing(delete_value(&event_key, &existing_action))?;
                         }
                     }
@@ -1467,12 +1694,17 @@ fn write_into_key(key: &RegKey, cfg: &ManagedApplicationConfig) -> Result<()> {
 /// Write an optional redirected stream and return the names of every value
 /// it wrote (the base name plus any per-stream attribute values) so the
 /// caller can reconcile which owned values are now stale.
-fn write_io_stream(parent: &RegKey, base: &str, stream: &Option<IoStream>) -> Result<Vec<String>> {
+fn write_io_stream(
+    parent: &RegKey,
+    cfg: &ManagedApplicationConfig,
+    base: &str,
+    stream: &Option<IoStream>,
+) -> Result<Vec<String>> {
     let Some(stream) = stream else {
         return Ok(Vec::new());
     };
     let mut names = vec![base.to_string()];
-    write_string(parent, base, &stream.path)?;
+    write_config_string(parent, cfg, base, &stream.path)?;
     if let Some(v) = stream.share_mode {
         let n = format!("{base}{}", nssm_keys::APP_STDIO_SHARING);
         write_u32(parent, &n, v)?;
@@ -1525,6 +1757,38 @@ fn create_subkey_under(parent: &RegKey, name: &str) -> Result<RegKey> {
 }
 
 fn write_string(key: &RegKey, name: &str, value: &str) -> Result<()> {
+    write_string_typed(key, name, value, REG_SZ)
+}
+
+fn write_config_string(
+    key: &RegKey,
+    cfg: &ManagedApplicationConfig,
+    name: &str,
+    value: &str,
+) -> Result<()> {
+    write_string_typed(
+        key,
+        name,
+        value,
+        if registry_is_expandable(cfg, name)? {
+            REG_EXPAND_SZ
+        } else {
+            REG_SZ
+        },
+    )
+}
+
+fn registry_is_expandable(cfg: &ManagedApplicationConfig, name: &str) -> Result<bool> {
+    let identity = windows_name_key(name)?;
+    for marked in &cfg.expandable_strings {
+        if windows_name_key(marked)? == identity {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn write_string_typed(key: &RegKey, name: &str, value: &str, kind: REG_VALUE_TYPE) -> Result<()> {
     // An embedded NUL would read back truncated at the first NUL — reject it
     // up front rather than silently storing an unrecoverable value.
     if value.contains('\0') {
@@ -1542,7 +1806,7 @@ fn write_string(key: &RegKey, name: &str, value: &str) -> Result<()> {
             key.0,
             PCWSTR::from_raw(wide_name.as_ptr()),
             Some(0),
-            REG_SZ,
+            kind,
             Some(&bytes),
         )
         .ok()
@@ -1553,9 +1817,9 @@ fn write_string(key: &RegKey, name: &str, value: &str) -> Result<()> {
 
 fn write_multi_string(key: &RegKey, name: &str, values: &[String]) -> Result<()> {
     // An embedded NUL in any entry would split or truncate it on read-back.
-    if values.iter().any(|v| v.contains('\0')) {
+    if values.iter().any(|v| v.contains('\0') || v.is_empty()) {
         return Err(Error::Registry(format!(
-            "value '{name}' has an entry containing an embedded NUL and cannot be \
+            "value '{name}' has an empty or NUL-containing entry and cannot be \
              stored as REG_MULTI_SZ"
         )));
     }
@@ -1667,15 +1931,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn standard_empty_double_nul_multisz_is_readable() {
+        assert_eq!(
+            bytes_to_wide_multi(&[0, 0, 0, 0]).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn environment_codec_preserves_ordinary_windows_path_backslashes() {
+        let entry = r"PATH=C:\Tools\bin";
+        assert_eq!(split_multi_value(entry), vec![entry.to_string()]);
+    }
+
+    #[test]
+    fn environment_codec_round_trips_significant_trailing_whitespace() {
+        let entries = vec![
+            "FIRST=ends in a space ".to_string(),
+            "SECOND=ends in a tab\t".to_string(),
+        ];
+        assert_eq!(split_multi_value(&join_multi_value(&entries)), entries);
+    }
+
+    #[test]
     fn exit_action_names_normalize_default() {
         // The unnamed value and a named `Default` (any case) all collapse to
         // the internal "default" key; specific exit codes pass through.
-        assert_eq!(normalize_exit_action_name(""), "default");
-        assert_eq!(normalize_exit_action_name("Default"), "default");
-        assert_eq!(normalize_exit_action_name("DEFAULT"), "default");
-        assert_eq!(normalize_exit_action_name("default"), "default");
-        assert_eq!(normalize_exit_action_name("0"), "0");
-        assert_eq!(normalize_exit_action_name("1"), "1");
+        assert_eq!(normalize_exit_action_name("").unwrap(), "default");
+        assert_eq!(normalize_exit_action_name("Default").unwrap(), "default");
+        assert_eq!(normalize_exit_action_name("DEFAULT").unwrap(), "default");
+        assert_eq!(normalize_exit_action_name("default").unwrap(), "default");
+        assert_eq!(normalize_exit_action_name("0").unwrap(), "0");
+        assert_eq!(normalize_exit_action_name("1").unwrap(), "1");
     }
 
     #[test]
@@ -1835,6 +2122,441 @@ mod tests {
 
     use windows::Win32::System::Registry::HKEY_CURRENT_USER;
 
+    struct Fixture {
+        key: RegKey,
+        name: String,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let name = format!(
+                "platform_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let key = create_subkey(
+                HKEY_CURRENT_USER,
+                &format!("Software\\NgsmTests\\{name}"),
+                parameters_rw_sam(),
+            )
+            .unwrap();
+            Self { key, name }
+        }
+    }
+
+    impl std::ops::Deref for Fixture {
+        type Target = RegKey;
+        fn deref(&self) -> &RegKey {
+            &self.key
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            if let Ok(parent) = open_subkey(
+                HKEY_CURRENT_USER,
+                "Software\\NgsmTests",
+                parameters_rw_sam(),
+            ) {
+                let _ = delete_subtree(&parent, &self.name);
+            }
+        }
+    }
+
+    fn snapshot(key: &RegKey) -> BTreeMap<String, (u32, Vec<u8>)> {
+        fn collect(key: &RegKey, prefix: &str, out: &mut BTreeMap<String, (u32, Vec<u8>)>) {
+            out.insert(format!("K:{prefix}"), (0, Vec::new()));
+            for name in enumerate_value_names(key).unwrap() {
+                let (kind, bytes) = query_value_raw(key, &name).unwrap();
+                out.insert(format!("V:{prefix}\\{name}"), (kind.0, bytes));
+            }
+            for name in enumerate_subkey_names(key).unwrap() {
+                let child = open_subkey(key.0, &name, KEY_READ).unwrap();
+                collect(&child, &format!("{prefix}\\{name}"), out);
+            }
+        }
+        let mut out = BTreeMap::new();
+        collect(key, "", &mut out);
+        out
+    }
+
+    fn valid_config() -> ManagedApplicationConfig {
+        ManagedApplicationConfig {
+            application: Some(r"C:\old\app.exe".into()),
+            app_parameters: Some("before".into()),
+            environment: vec!["A=1".into()],
+            hooks: vec![HookConfig {
+                event: "Start".into(),
+                action: "Pre".into(),
+                command: "before".into(),
+            }],
+            exit_actions: [(
+                "1".into(),
+                ExitActionPolicy {
+                    action: ExitAction::Exit,
+                },
+            )]
+            .into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn invalid_complete_configs_leave_exact_registry_bytes_unchanged() {
+        let fixture = Fixture::new();
+        let original = valid_config();
+        write_into_key(&fixture, &original).unwrap();
+        write_string(&fixture, "NotOwned", "keep me").unwrap();
+        let before = snapshot(&fixture);
+        let mut invalid = Vec::new();
+        for entries in [
+            vec!["".into(), "A=1".into()],
+            vec!["A=1".into(), "".into()],
+            vec!["A=1".into(), "".into(), "B=2".into()],
+            vec!["".into()],
+        ] {
+            let mut cfg = original.clone();
+            cfg.environment = entries.clone();
+            invalid.push(cfg);
+            let mut cfg = original.clone();
+            cfg.environment_extra = entries;
+            invalid.push(cfg);
+        }
+        for key in ["bogus", "4294967296", "-2147483649", "1\0hidden"] {
+            let mut cfg = original.clone();
+            cfg.exit_actions.insert(
+                key.into(),
+                ExitActionPolicy {
+                    action: ExitAction::Restart,
+                },
+            );
+            invalid.push(cfg);
+        }
+        let mut cfg = original.clone();
+        cfg.exit_actions.insert(
+            "+1".into(),
+            ExitActionPolicy {
+                action: ExitAction::Restart,
+            },
+        );
+        invalid.push(cfg);
+        let mut cfg = original.clone();
+        cfg.exit_actions.insert(
+            "default".into(),
+            ExitActionPolicy {
+                action: ExitAction::Exit,
+            },
+        );
+        cfg.restart.default_action = Some(ExitAction::Restart);
+        invalid.push(cfg);
+        let mut cfg = original.clone();
+        cfg.hooks.push(HookConfig {
+            event: "start".into(),
+            action: "pre".into(),
+            command: "conflict".into(),
+        });
+        invalid.push(cfg);
+        for bad in ["bad\\event", "bad\0event", ""] {
+            let mut cfg = original.clone();
+            cfg.hooks[0].event = bad.into();
+            invalid.push(cfg);
+        }
+        let mut cfg = original.clone();
+        cfg.hooks[0].command = "bad\0command".into();
+        invalid.push(cfg);
+        for mut cfg in invalid {
+            cfg.application = Some(r"C:\new\app.exe".into());
+            cfg.app_parameters = Some("after".into());
+            assert!(write_into_key(&fixture, &cfg).is_err());
+            assert_eq!(snapshot(&fixture), before);
+        }
+    }
+
+    #[test]
+    fn invalid_new_config_does_not_create_parameters() {
+        let fixture = Fixture::new();
+        let before = snapshot(&fixture);
+        let mut cfg = valid_config();
+        cfg.environment = vec!["".into()];
+        assert!(create_managed_under_service(&fixture, &cfg).is_err());
+        assert_eq!(snapshot(&fixture), before);
+        assert!(matches!(
+            open_subkey(fixture.0, "Parameters", KEY_READ),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn hooks_reconcile_windows_case_identity_without_losing_updated_values() {
+        let fixture = Fixture::new();
+        let mut cfg = valid_config();
+        cfg.hooks.push(HookConfig {
+            event: "Start".into(),
+            action: "Post".into(),
+            command: "post".into(),
+        });
+        cfg.hooks.push(HookConfig {
+            event: "Stop".into(),
+            action: "Pre".into(),
+            command: "stale".into(),
+        });
+        write_into_key(&fixture, &cfg).unwrap();
+        cfg.hooks.truncate(2);
+        cfg.hooks[0] = HookConfig {
+            event: "start".into(),
+            action: "pre".into(),
+            command: "updated".into(),
+        };
+        cfg.hooks[1].event = "START".into();
+        write_into_key(&fixture, &cfg).unwrap();
+        let hooks = read_managed_from_key(&fixture, "fixture")
+            .unwrap()
+            .unwrap()
+            .hooks;
+        assert_eq!(hooks.len(), 2);
+        assert!(hooks
+            .iter()
+            .any(|hook| hook.action.eq_ignore_ascii_case("pre") && hook.command == "updated"));
+        assert!(hooks
+            .iter()
+            .any(|hook| hook.action.eq_ignore_ascii_case("post") && hook.command == "post"));
+        cfg.hooks = vec![
+            HookConfig {
+                event: "Événement".into(),
+                action: "Pré".into(),
+                command: "%CMD%".into(),
+            },
+            HookConfig {
+                event: "événement".into(),
+                action: "PRÉ".into(),
+                command: "%CMD%".into(),
+            },
+        ];
+        cfg.expandable_strings
+            .insert("AppEvents\\ÉVÉNEMENT\\PRÉ".into());
+        write_into_key(&fixture, &cfg).unwrap();
+        let loaded = read_managed_from_key(&fixture, "fixture").unwrap().unwrap();
+        assert_eq!(loaded.hooks.len(), 1);
+        assert_eq!(loaded.hooks[0].command, "%CMD%");
+        assert_eq!(
+            loaded
+                .resolve_expandable_strings(|name| {
+                    (name == "CMD").then(|| "Unicode command".into())
+                })
+                .unwrap()
+                .hooks[0]
+                .command,
+            "Unicode command"
+        );
+    }
+
+    #[test]
+    fn targeted_repairs_ignore_unrelated_corrupt_optional_values() {
+        let fixture = Fixture::new();
+        write_string(&fixture, nssm_keys::APPLICATION, r"C:\app.exe").unwrap();
+        write_string(&fixture, nssm_keys::APP_PRIORITY, "wrong type").unwrap();
+        write_string(&fixture, nssm_keys::APP_ENVIRONMENT_EXTRA, "wrong type").unwrap();
+        assert!(read_managed_from_key(&fixture, "fixture").is_err());
+        set_value_in_key(&fixture, "AppPriority", "32").unwrap();
+        assert_eq!(read_u32(&fixture, "AppPriority").unwrap(), 32);
+        unset_value_in_key(&fixture, "AppEnvironmentExtra").unwrap();
+        assert!(read_managed_from_key(&fixture, "fixture").is_ok());
+        write_string(&fixture, nssm_keys::APP_PRIORITY, "bad again").unwrap();
+        unset_value_in_key(&fixture, "AppPriority").unwrap();
+        assert!(read_managed_from_key(&fixture, "fixture").is_ok());
+        assert!(unset_value_in_key(&fixture, "Application").is_err());
+    }
+
+    #[test]
+    fn targeted_repairs_never_create_or_replace_a_bad_native_marker() {
+        let fixture = Fixture::new();
+        for marker in [None, Some(""), Some("   ")] {
+            let _ = delete_value(&fixture, nssm_keys::APPLICATION);
+            if let Some(value) = marker {
+                write_string(&fixture, nssm_keys::APPLICATION, value).unwrap();
+            }
+            let before = snapshot(&fixture);
+            assert!(set_value_in_key(&fixture, "Application", r"C:\app.exe").is_err());
+            assert!(set_value_in_key(&fixture, "AppPriority", "32").is_err());
+            assert!(unset_value_in_key(&fixture, "AppPriority").is_err());
+            assert_eq!(snapshot(&fixture), before);
+        }
+        write_u32(&fixture, nssm_keys::APPLICATION, 1).unwrap();
+        assert!(set_value_in_key(&fixture, "AppPriority", "32").is_err());
+        assert!(unset_value_in_key(&fixture, "AppPriority").is_err());
+        let marker = to_wide(nssm_keys::APPLICATION);
+        // SAFETY: writing deliberately invalid UTF-16 data only to this test's
+        // marker verifies that strict marker ownership cannot be bypassed.
+        unsafe {
+            RegSetValueExW(
+                fixture.0,
+                PCWSTR(marker.as_ptr()),
+                Some(0),
+                REG_SZ,
+                Some(&[0, 0xd8, 0, 0]),
+            )
+            .ok()
+            .unwrap();
+        }
+        let before = snapshot(&fixture);
+        assert!(set_value_in_key(&fixture, "AppPriority", "32").is_err());
+        assert!(unset_value_in_key(&fixture, "AppPriority").is_err());
+        assert_eq!(snapshot(&fixture), before);
+    }
+
+    #[test]
+    fn legacy_exit_codes_and_defaults_normalize_and_conflicts_fail() {
+        let fixture = Fixture::new();
+        write_string(&fixture, nssm_keys::APPLICATION, r"C:\app.exe").unwrap();
+        let exit = create_subkey_under(&fixture, nssm_keys::APP_EXIT).unwrap();
+        for (key, action) in [
+            ("", "Restart"),
+            ("Default", "Restart"),
+            ("01", "Ignore"),
+            ("+1", "Ignore"),
+            ("3221225477", "Suicide"),
+            ("-0", "Exit"),
+        ] {
+            write_string(&exit, key, action).unwrap();
+        }
+        let cfg = read_managed_from_key(&fixture, "fixture").unwrap().unwrap();
+        assert_eq!(cfg.exit_actions["1"].action, ExitAction::Ignore);
+        assert_eq!(cfg.exit_actions["0"].action, ExitAction::Exit);
+        assert_eq!(cfg.exit_actions["-1073741819"].action, ExitAction::Suicide);
+        assert_eq!(cfg.restart.default_action, Some(ExitAction::Restart));
+        write_into_key(&fixture, &cfg).unwrap();
+        let mut names = enumerate_value_names(&exit).unwrap();
+        names.sort();
+        assert_eq!(names, vec!["", "-1073741819", "0", "1"]);
+        write_string(&exit, "01", "Exit").unwrap();
+        assert!(read_exit_actions(&fixture).is_err());
+        delete_value(&exit, "01").unwrap();
+        write_string(&exit, "DEFAULT", "Exit").unwrap();
+        assert!(read_exit_actions(&fixture).is_err());
+        for (raw, expected) in [
+            ("2147483648", "-2147483648"),
+            ("4294967295", "-1"),
+            ("+1", "1"),
+            ("-0", "0"),
+            ("2147483647", "2147483647"),
+        ] {
+            assert_eq!(normalize_exit_action_name(raw).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn environment_codec_preserves_escaped_unc_and_all_significant_data() {
+        assert_eq!(
+            split_multi_value(r"PATH=\\\\server\\share\\bin"),
+            vec![r"PATH=\\server\share\bin"]
+        );
+        let entries = vec![
+            r"PATH=\\server\share\bin".into(),
+            r"LOCAL=C:\Tools\bin".into(),
+            "EMPTY=".into(),
+            " leading=data ".into(),
+            "TAB=value\t".into(),
+            "COMMA=a,b".into(),
+            "BACKSLASH=value\\".into(),
+        ];
+        assert_eq!(split_multi_value(&join_multi_value(&entries)), entries);
+        assert_eq!(split_multi_value(r"KEY=a\qb"), vec![r"KEY=a\qb"]);
+        assert!(write_multi_string(&Fixture::new(), "Env", &["".into()]).is_err());
+    }
+
+    #[test]
+    fn strict_name_decode_preserves_valid_replacement_characters() {
+        assert!(decode_registry_name(&[0xd800]).is_err());
+        assert!(decode_registry_name(&[97, 0, 98]).is_err());
+        assert_eq!(decode_registry_name(&[0xfffd]).unwrap(), "\u{fffd}");
+        let fixture = Fixture::new();
+        let mut cfg = valid_config();
+        cfg.hooks[0].event = "\u{fffd}".into();
+        write_into_key(&fixture, &cfg).unwrap();
+        assert_eq!(
+            read_managed_from_key(&fixture, "fixture")
+                .unwrap()
+                .unwrap()
+                .hooks[0]
+                .event,
+            "\u{fffd}"
+        );
+    }
+
+    #[test]
+    fn malformed_utf16_subkey_is_not_aliased_or_mutated() {
+        let fixture = Fixture::new();
+        let cfg = valid_config();
+        write_into_key(&fixture, &cfg).unwrap();
+        let events = open_subkey(fixture.0, nssm_keys::APP_EVENTS, parameters_rw_sam()).unwrap();
+        let replacement = create_subkey_under(&events, "\u{fffd}").unwrap();
+        write_string(&replacement, "Pre", "neighbor").unwrap();
+        let bad_name = [0xd800u16, 0];
+        let mut bad = HKEY::default();
+        // SAFETY: this deliberate malformed UTF-16 fixture is a valid counted
+        // allocation for RegCreateKeyEx; only our unique HKCU key is affected.
+        unsafe {
+            RegCreateKeyExW(
+                events.0,
+                PCWSTR(bad_name.as_ptr()),
+                Some(0),
+                PCWSTR::null(),
+                REG_OPTION_NON_VOLATILE,
+                parameters_rw_sam(),
+                None,
+                &mut bad,
+                None,
+            )
+            .ok()
+            .unwrap();
+        }
+        let _bad = RegKey(bad);
+        assert!(read_managed_from_key(&fixture, "fixture").is_err());
+        let before = query_value_raw(&fixture, nssm_keys::APP_PARAMETERS).unwrap();
+        let mut changed = cfg;
+        changed.app_parameters = Some("after".into());
+        assert!(write_into_key(&fixture, &changed).is_err());
+        assert_eq!(
+            query_value_raw(&fixture, nssm_keys::APP_PARAMETERS).unwrap(),
+            before
+        );
+        assert_eq!(read_string(&replacement, "Pre").unwrap(), "neighbor");
+    }
+
+    #[test]
+    fn malformed_utf16_value_name_fails_before_reconciliation_writes() {
+        let fixture = Fixture::new();
+        let mut cfg = valid_config();
+        write_into_key(&fixture, &cfg).unwrap();
+        let exit = open_subkey(fixture.0, nssm_keys::APP_EXIT, parameters_rw_sam()).unwrap();
+        let bad_name = [0xd800u16, 0];
+        let data = wide_to_bytes(&"Restart\0".encode_utf16().collect::<Vec<_>>());
+        // SAFETY: both buffers live through the call and the malformed name
+        // is confined to a unique test fixture.
+        unsafe {
+            RegSetValueExW(
+                exit.0,
+                PCWSTR(bad_name.as_ptr()),
+                Some(0),
+                REG_SZ,
+                Some(&data),
+            )
+            .ok()
+            .unwrap();
+        }
+        assert!(read_exit_actions(&fixture).is_err());
+        let before = query_value_raw(&fixture, nssm_keys::APP_PARAMETERS).unwrap();
+        cfg.app_parameters = Some("after".into());
+        assert!(write_into_key(&fixture, &cfg).is_err());
+        assert_eq!(
+            query_value_raw(&fixture, nssm_keys::APP_PARAMETERS).unwrap(),
+            before
+        );
+    }
+
     /// Create a fresh, empty temporary key under HKCU for an I/O test.
     /// The key is scrubbed first so a prior aborted run cannot leak state in.
     fn make_test_key(name: &str) -> RegKey {
@@ -1858,6 +2580,56 @@ mod tests {
         ) {
             let _ = ignore_missing(delete_subtree(&parent, name));
         }
+    }
+
+    #[test]
+    fn expandable_metadata_round_trips_raw_registry_strings() {
+        let key = Fixture::new();
+        write_string_typed(
+            &key,
+            nssm_keys::APPLICATION,
+            r"%ROOT%\app.exe",
+            REG_EXPAND_SZ,
+        )
+        .unwrap();
+        write_string_typed(&key, nssm_keys::APP_PARAMETERS, "%ARG%", REG_SZ).unwrap();
+        let events = create_subkey_under(&key, nssm_keys::APP_EVENTS).unwrap();
+        let start = create_subkey_under(&events, "Start").unwrap();
+        write_string_typed(&start, "Pre", "%HOOK%", REG_EXPAND_SZ).unwrap();
+        let mut cfg = read_managed_from_key(&key, "fixture").unwrap().unwrap();
+        assert!(cfg.is_expandable_string("Application"));
+        assert!(cfg.is_expandable_string("AppEvents\\Start\\Pre"));
+        assert!(!cfg.is_expandable_string("AppParameters"));
+        cfg.restart.restart_delay_ms = Some(123);
+        write_into_key(&key, &cfg).unwrap();
+        assert_eq!(
+            read_typed_string(&key, nssm_keys::APPLICATION).unwrap(),
+            (r"%ROOT%\app.exe".to_string(), REG_EXPAND_SZ)
+        );
+        assert_eq!(
+            read_typed_string(&key, nssm_keys::APP_PARAMETERS).unwrap(),
+            ("%ARG%".to_string(), REG_SZ)
+        );
+        assert_eq!(
+            read_typed_string(&start, "Pre").unwrap(),
+            ("%HOOK%".into(), REG_EXPAND_SZ)
+        );
+        let resolved = cfg
+            .resolve_expandable_strings(|name| match name {
+                "ROOT" => Some(r"C:\ServiceAccount".into()),
+                "HOOK" => Some("echo ok".into()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            resolved.application.as_deref(),
+            Some(r"C:\ServiceAccount\app.exe")
+        );
+        assert_eq!(resolved.app_parameters.as_deref(), Some("%ARG%"));
+        assert_eq!(resolved.hooks[0].command, "echo ok");
+        drop(start);
+        drop(events);
+        drop(key);
     }
 
     /// True if `name` is absent under `key` (RegQueryValueExW returns

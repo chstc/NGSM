@@ -17,6 +17,7 @@ export component MainWindow inherits Window {
     min-height: 700px;
 
     in-out property <int> view: 0;
+    callback view-changed(int);
 
     in property <bool> elevated: false;
     in property <[ServiceRow]> services;
@@ -36,6 +37,8 @@ export component MainWindow inherits Window {
     in property <string> stat-availability-area: "";
     in property <[EventEntry]> events;
     in property <string> status-text;
+    in property <bool> status-has-details;
+    in property <[string]> status-details;
     in property <[string]> warnings;
     callback view-warnings();
     callback refresh();
@@ -81,6 +84,7 @@ export component MainWindow inherits Window {
     callback logs-set-stderr(bool);
 
     in property <bool> recovery-available;
+    in property <bool> recovery-busy;
     in property <string> recovery-service;
     in property <string> recovery-placeholder;
     in-out property <string> recovery-restart-delay;
@@ -157,11 +161,11 @@ export component MainWindow inherits Window {
                 }
                 Rectangle { height: 18px; }
 
-                NavItem { label: "Dashboard"; icon: "dashboard"; active: root.view == 0; clicked => { root.view = 0; root.refresh(); } }
-                NavItem { label: "Services";  icon: "services";  active: root.view == 1; clicked => { root.view = 1; } }
-                NavItem { label: "Logs";      icon: "logs";      active: root.view == 2; clicked => { root.view = 2; root.logs-reload(); } }
-                NavItem { label: "Recovery";  icon: "recovery";  active: root.view == 3; clicked => { root.view = 3; root.recovery-reload(); } }
-                NavItem { label: "Settings";  icon: "settings";  active: root.view == 4; clicked => { root.view = 4; } }
+                NavItem { label: "Dashboard"; icon: "dashboard"; active: root.view == 0; clicked => { root.view = 0; root.view-changed(0); root.refresh(); } }
+                NavItem { label: "Services";  icon: "services";  active: root.view == 1; clicked => { root.view = 1; root.view-changed(1); } }
+                NavItem { label: "Logs";      icon: "logs";      active: root.view == 2; clicked => { root.view = 2; root.view-changed(2); root.logs-reload(); } }
+                NavItem { label: "Recovery";  icon: "recovery";  active: root.view == 3; clicked => { root.view = 3; root.view-changed(3); root.recovery-reload(); } }
+                NavItem { label: "Settings";  icon: "settings";  active: root.view == 4; clicked => { root.view = 4; root.view-changed(4); } }
 
                 Rectangle { }
 
@@ -324,6 +328,7 @@ export component MainWindow inherits Window {
                     }
                     if root.view == 3 : RecoveryView {
                         available: root.recovery-available;
+                        busy: root.recovery-busy;
                         service-name: root.recovery-service;
                         placeholder: root.recovery-placeholder;
                         restart-delay <=> root.recovery-restart-delay;
@@ -353,13 +358,15 @@ export component MainWindow inherits Window {
                     height: 18px;
                     Text {
                         x: 0px;
+                        width: parent.width;
+                        overflow: elide;
                         text: root.status-text;
                         color: root.warnings.length > 0 ? Theme.amber : Theme.text-faint;
                         font-size: 12px;
                         vertical-alignment: center;
                     }
                     TouchArea {
-                        enabled: root.warnings.length > 0;
+                        enabled: root.status-has-details;
                         mouse-cursor: pointer;
                         clicked => { root.view-warnings(); }
                     }
@@ -406,19 +413,25 @@ export component MainWindow inherits Window {
     }
     if root.active-modal == 3 : RemoveDialog {
         service-name: root.modal-service-name;
+        error: root.modal-error;
         confirm => { root.modal-remove-confirm(); }
         cancel => { root.modal-cancel(); }
     }
     if root.active-modal == 4 : ProcessesDialog {
         service-name: root.modal-service-name;
         rows: root.modal-processes;
+        busy: root.modal-busy;
+        error: root.modal-error;
         sort-column: root.modal-sort-column;
         sort-ascending: root.modal-sort-ascending;
         close => { root.modal-cancel(); }
+        reload => { root.action("processes", root.modal-service-name); }
         sort-changed(c) => { root.modal-sort-changed(c); }
     }
     if root.active-modal == 5 : WarningsDialog {
-        rows: root.warnings;
+        heading: "Status details";
+        description: "Last operation, pending work, and scan warnings.";
+        rows: root.status-details;
         close => { root.modal-cancel(); }
     }
 }

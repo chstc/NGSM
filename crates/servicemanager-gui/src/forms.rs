@@ -167,6 +167,11 @@ impl EditForm {
             (t != orig).then(|| t.to_string())
         };
         let account_trimmed = self.account.trim();
+        if account_trimmed.is_empty() && !self.orig_account.trim().is_empty() {
+            return Err(
+                "Service account must not be empty. Enter an account or LocalSystem.".into(),
+            );
+        }
         let password = password_to_none(&self.password);
         if password.is_some() && account_trimmed.is_empty() {
             return Err("Password requires a service account.".into());
@@ -391,5 +396,36 @@ mod tests {
         let err = f.to_spec().unwrap_err();
         assert!(err.contains("account"), "got: {err}");
         assert!(!err.contains(&password), "error must not echo password");
+    }
+
+    #[test]
+    fn edit_rejects_clearing_an_existing_account_without_exposing_password() {
+        for password in ["", "private-password"] {
+            let form = EditForm {
+                application: "C:\\app.exe".into(),
+                orig_account: ".\\service-user".into(),
+                account: "  ".into(),
+                description: "Another change must not hide the invalid account".into(),
+                password: password.into(),
+                ..Default::default()
+            };
+            let error = form.to_spec().unwrap_err();
+            assert!(error.contains("LocalSystem"));
+            assert!(!error.contains("private-password"));
+        }
+    }
+
+    #[test]
+    fn edit_accepts_an_explicit_local_system_account() {
+        let form = EditForm {
+            application: "C:\\app.exe".into(),
+            orig_account: ".\\service-user".into(),
+            account: "LocalSystem".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            form.to_spec().unwrap().account.as_deref(),
+            Some("LocalSystem")
+        );
     }
 }

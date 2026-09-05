@@ -327,54 +327,8 @@ fn op_stop(args: &Value) -> CoreResult<Value> {
 
 fn op_restart(args: &Value) -> CoreResult<Value> {
     let a: LifecycleArgs = parse_args(args)?;
-    if a.force_native {
-        // Bypass NGSM-managed check — implement restart loop locally.
-        op_restart_force_native(&a.name)?;
-    } else {
-        servicemanager_ops::restart(&a.name, 30_000)?;
-    }
+    servicemanager_ops::restart_with_options(&a.name, 30_000, a.force_native)?;
     Ok(json!({ "restarted": a.name }))
-}
-
-/// Restart implementation for `force_native: true`: bypasses the NGSM-managed
-/// check and uses a fixed 30-second stop-wait deadline.
-fn op_restart_force_native(name: &str) -> CoreResult<()> {
-    use servicemanager_core::ServiceState;
-    use std::thread::sleep;
-    use std::time::{Duration, Instant};
-
-    let snapshot = query_service(name)?;
-    let initial = snapshot.runtime.as_ref().map(|r| r.state);
-    let needs_stop = !matches!(initial, Some(ServiceState::Stopped) | None);
-    if needs_stop {
-        match control_service(name, ServiceControlSignal::Stop) {
-            Ok(_) => {}
-            Err(e) => {
-                let msg = e.to_string();
-                if !(msg.contains("0x80070426") || msg.contains("has not been started")) {
-                    return Err(e);
-                }
-            }
-        }
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let snap = query_service(name)?;
-            if matches!(
-                snap.runtime.as_ref().map(|r| r.state),
-                Some(ServiceState::Stopped)
-            ) {
-                break;
-            }
-            if Instant::now() >= deadline {
-                return Err(CoreError::other(format!(
-                    "'{name}' did not stop within 30 s"
-                )));
-            }
-            sleep(Duration::from_millis(200));
-        }
-        sleep(Duration::from_millis(250));
-    }
-    start_service(name)
 }
 
 fn op_edit(args: &Value) -> CoreResult<Value> {

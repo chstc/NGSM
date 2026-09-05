@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A fully-resolved managed service definition.
 ///
@@ -86,6 +86,11 @@ pub struct ManagedApplicationConfig {
     pub exit_actions: BTreeMap<String, ExitActionPolicy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hooks: Vec<HookConfig>,
+    /// NSSM value names stored as REG_EXPAND_SZ, including
+    /// `AppEvents\<event>\<action>` for hook commands. Text remains unexpanded
+    /// until the service resolves an effective copy using its own environment.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub expandable_strings: BTreeSet<String>,
 }
 
 impl ManagedApplicationConfig {
@@ -263,50 +268,8 @@ impl ServiceDefinition {
                 return true;
             }
         }
-        // Fallback: image_path_exe_name splits an unquoted path at the first
-        // whitespace, so an unquoted SCM image path like
-        //   C:\Program Files\NGSM\ngsm.exe run-service Foo
-        // yields the basename "Program", which does not match the runner.
-        // Win32's CommandLineToArgvW resolves this by trying progressively
-        // longer prefixes, which we cannot replicate without touching the
-        // filesystem. Instead, scan for a token-boundary occurrence of the
-        // runner basename — preceded by `\` or `/`, followed by whitespace
-        // or end-of-string — which catches the unquoted-spaces case without
-        // matching directory names or argument substrings that merely
-        // contain "ngsm.exe" / "nssm.exe".
-        image_path_contains_runner_token(&self.native.image_path)
+        false
     }
-}
-
-/// Return true if `image_path` contains an `ngsm.exe` or `nssm.exe` runner
-/// token: an occurrence (case-insensitive) preceded by `\` or `/` and
-/// followed by whitespace or end-of-string.
-///
-/// This is a secondary check used only when the primary
-/// [`image_path_exe_name`] split has failed to identify the runner —
-/// principally because an unquoted SCM image path contains spaces in the
-/// directory (e.g. `C:\Program Files\NGSM\ngsm.exe ...`).
-///
-/// The token-boundary requirement is what keeps the negative cases in
-/// `is_managed_matches_executable_basename_not_substring` rejected: a
-/// directory like `C:\nssm.exe-backup\realservice.exe` has `nssm.exe`
-/// followed by `-`, not whitespace, so it is not a token; an argument like
-/// `--label ngsm.exe` is not preceded by `\` or `/`, so it is not a token.
-fn image_path_contains_runner_token(image_path: &str) -> bool {
-    let lower = image_path.to_ascii_lowercase();
-    for needle in ["\\ngsm.exe", "/ngsm.exe", "\\nssm.exe", "/nssm.exe"] {
-        let mut offset = 0usize;
-        while let Some(idx) = lower[offset..].find(needle) {
-            let abs = offset + idx;
-            let end = abs + needle.len();
-            let next = lower[end..].chars().next();
-            if next.is_none_or(|c| c.is_whitespace()) {
-                return true;
-            }
-            offset = abs + 1;
-        }
-    }
-    false
 }
 
 /// Extract the executable's file name from an SCM image path.
@@ -317,11 +280,47 @@ fn image_path_contains_runner_token(image_path: &str) -> bool {
 fn image_path_exe_name(image_path: &str) -> Option<&str> {
     let trimmed = image_path.trim_start();
     let exe = if let Some(rest) = trimmed.strip_prefix('"') {
-        // Quoted: the executable runs up to the closing quote.
-        rest.split('"').next()?
+        rest.split_once('"')?.0
     } else {
-        // Unquoted: the executable runs up to the first whitespace.
-        trimmed.split_whitespace().next()?
+        // CreateProcess can probe progressively longer unquoted prefixes;
+        // CommandLineToArgvW does not. Never scan beyond the first .exe
+        // boundary, which could already identify an unrelated native binary.
+        let end = trimmed
+            .char_indices()
+            .filter_map(|(index, ch)| ch.is_whitespace().then_some(index))
+            .chain(std::iter::once(trimmed.len()))
+            .find(|&end| trimmed[..end].to_ascii_lowercase().ends_with(".exe"))?;
+        let candidate = &trimmed[..end];
+        if candidate.chars().any(char::is_whitespace) {
+            // The conventional Program Files prefix is the one supported
+            // legacy ambiguity. Extra whitespace later could separate a
+            // native command from a runner-looking argument; fail closed.
+            let normalized = candidate.replace('/', "\\").to_ascii_lowercase();
+            let rooted = normalized
+                .as_bytes()
+                .get(0..3)
+                .is_some_and(|prefix| prefix[0].is_ascii_alphabetic() && prefix[1..] == *b":\\");
+            if !rooted {
+                return None;
+            }
+            let tail = normalized[3..]
+                .strip_prefix("program files\\")
+                .or_else(|| normalized[3..].strip_prefix("program files (x86)\\"))?;
+            if tail.chars().any(char::is_whitespace) {
+                return None;
+            }
+        }
+        let remainder = trimmed[end..].trim_start();
+        // For legacy unquoted runners accept only an empty argument list or
+        // NGSM's known binding shape. Other suffixes might be path fragments.
+        if !remainder.is_empty()
+            && !remainder
+                .strip_prefix("run-service")
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+        {
+            return None;
+        }
+        candidate
     };
     let name = exe.rsplit(['\\', '/']).next()?;
     if name.is_empty() {
@@ -382,6 +381,27 @@ mod tests {
         assert!(!def_with_image("C:\\app\\runner.exe --label ngsm.exe").is_managed());
         assert!(!def_with_image("C:\\Windows\\System32\\svchost.exe -k netsvcs").is_managed());
         assert!(!def_with_image("").is_managed());
+    }
+
+    #[test]
+    fn native_runner_arguments_and_directory_fragments_do_not_grant_ownership() {
+        for image in [
+            r"C:\app\worker.exe --runner C:\tools\ngsm.exe",
+            r#""C:\Program Files\Vendor\worker.exe" --runner C:\tools\NSSM.EXE"#,
+            r#""C:\tools\ngsm.exe data\worker.exe""#,
+            r"C:\native.com --runner C:\tools\ngsm.exe",
+            r"C:\native --runner C:\tools\ngsm.exe",
+            r"C:\Program Files\Vendor\native --runner C:\tools\ngsm.exe",
+            r"C:\Program Files\Vendor\native arguments\ngsm.exe",
+            r"C:\tools\ngsm.exe data\worker.exe",
+        ] {
+            let definition = def_with_image(image);
+            assert!(
+                !definition.is_managed(),
+                "native executable misclassified: {image}"
+            );
+            assert_eq!(definition.management_kind(), ManagementKind::Native);
+        }
     }
 
     #[test]

@@ -10,9 +10,9 @@ use crate::error::{message_error, OpResult};
 /// * `name` — service name (SCM key, not display name).
 /// * `force_native` — if `true`, bypass the NGSM-ownership check. Use for
 ///   removing native Windows services that were never managed by NGSM.
-/// * `purge_managed_config` — if `true`, also delete the NGSM registry config
-///   after the SCM service is removed. Pass `false` only when the config
-///   should survive (rare; normally you want `true`).
+/// * `purge_managed_config` — must be `true`. Preservation requests are
+///   rejected: SCM deletion removes the service's whole registry subtree,
+///   whether or not NGSM explicitly scrubs its managed values.
 ///
 /// The stopped-state check (M-03) runs unconditionally regardless of
 /// `force_native`: Windows SCM does not stop a service on `DeleteService` — it
@@ -24,6 +24,16 @@ use crate::error::{message_error, OpResult};
 /// user-visible path). The CLI adds `--force-native` / `ngsm stop <name>`
 /// hints in its own error formatting layer on top.
 pub fn remove(name: &str, force_native: bool, purge_managed_config: bool) -> OpResult {
+    if !purge_managed_config {
+        return Err(servicemanager_core::Error::InvalidConfig(
+            "cannot preserve managed config during removal: Windows SCM deletes the \
+             service registry subtree, including Parameters. Export or back up the \
+             configuration before removing the service; --no-purge-config is unsupported."
+                .into(),
+        ));
+    }
+
+    let _guard = servicemanager_registry::lock_service_config(name)?;
     // Query once; we need both the SCM state (for the stopped check) and the
     // managed config (for the ownership check, when force_native is false).
     let native = query_service(name)?;
@@ -108,6 +118,19 @@ fn is_managed_for_purge(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preservation_requests_fail_before_any_service_lookup_or_deletion() {
+        for force_native in [false, true] {
+            let error = remove("invalid\\service\\name", force_native, false)
+                .expect_err("preservation must be rejected before SCM access")
+                .to_string();
+            assert!(error.contains("SCM"), "{error}");
+            assert!(error.contains("Parameters"), "{error}");
+            assert!(error.contains("Export or back up"), "{error}");
+            assert!(error.contains("--no-purge-config"), "{error}");
+        }
+    }
 
     /// `ops::remove` itself touches the live SCM and the per-service
     /// `Parameters` key under HKLM, which neither test runner has — but

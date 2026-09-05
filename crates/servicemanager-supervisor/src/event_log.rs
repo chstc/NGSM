@@ -1,12 +1,7 @@
 //! Append-only JSON Lines event log shared across all NGSM supervisor
 //! processes.
 //!
-//! Each call to [`EventWriter::log`] (or its convenience wrappers) opens
-//! the log with `create + append`, formats one [`EventRecord`] as JSON,
-//! writes it with a single `write_all`, and closes the handle. On NTFS,
-//! a single `write_all` of less than ~4 KiB to a file opened with
-//! `FILE_APPEND_DATA` is atomic across processes — interleaved records
-//! from concurrent supervisors are never torn.
+//! Append and rotation share one destination-scoped interprocess lock.
 //!
 //! Failures (disk full, missing ACL, rotation race) are reported to
 //! stderr and swallowed. Service supervision MUST NOT depend on the log
@@ -16,6 +11,11 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 
+use crate::diagnostics;
+
+#[cfg(all(test, windows))]
+#[path = "event_log_tests_windows.rs"]
+mod windows_tests;
 use servicemanager_core::events::{EventKind, EventRecord, StopReason};
 use servicemanager_core::paths;
 use time::format_description::well_known::Rfc3339;
@@ -30,18 +30,36 @@ pub(crate) const ROTATION_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 /// don't pass it on every event.
 pub(crate) struct EventWriter {
     service: String,
+    diagnostic: diagnostics::Reporter,
 }
 
 impl EventWriter {
+    #[cfg(test)]
     pub fn for_service(service: impl Into<String>) -> Self {
         Self {
             service: service.into(),
+            diagnostic: diagnostics::reporter().clone(),
         }
     }
 
+    pub(crate) fn with_diagnostics(
+        service: impl Into<String>,
+        diagnostic: diagnostics::Reporter,
+    ) -> Self {
+        Self {
+            service: service.into(),
+            diagnostic,
+        }
+    }
+
+    #[cfg(test)]
     pub fn started(&self, pid: u32) {
+        self.started_at(pid, now_rfc3339());
+    }
+
+    pub(crate) fn started_at(&self, pid: u32, ts: String) {
         self.log(EventRecord {
-            ts: now_rfc3339(),
+            ts,
             service: self.service.clone(),
             event: EventKind::Started,
             pid: Some(pid),
@@ -52,9 +70,14 @@ impl EventWriter {
         });
     }
 
+    #[cfg(test)]
     pub fn restarted(&self, pid: u32, delay_ms: u64) {
+        self.restarted_at(pid, delay_ms, now_rfc3339());
+    }
+
+    pub(crate) fn restarted_at(&self, pid: u32, delay_ms: u64, ts: String) {
         self.log(EventRecord {
-            ts: now_rfc3339(),
+            ts,
             service: self.service.clone(),
             event: EventKind::Restarted,
             pid: Some(pid),
@@ -65,9 +88,14 @@ impl EventWriter {
         });
     }
 
+    #[cfg(test)]
     pub fn child_exited(&self, exit_code: i32, lived_ms: u64) {
+        self.child_exited_at(exit_code, lived_ms, now_rfc3339());
+    }
+
+    pub(crate) fn child_exited_at(&self, exit_code: i32, lived_ms: u64, ts: String) {
         self.log(EventRecord {
-            ts: now_rfc3339(),
+            ts,
             service: self.service.clone(),
             event: EventKind::ChildExited,
             pid: None,
@@ -104,12 +132,11 @@ impl EventWriter {
         });
     }
 
-    /// Best-effort append. All errors are reported on stderr (so they
-    /// land in the per-service stderr log when the supervisor is running
-    /// under SCM) and swallowed.
+    /// Best-effort append. Failure diagnostics use the independent host sink.
     pub fn log(&self, record: EventRecord) {
         if let Err(e) = self.try_log(record) {
-            eprintln!("[supervisor:{}] event log write failed: {e}", self.service);
+            self.diagnostic
+                .report(&self.service, "event log write", &e.to_string());
         }
     }
 
@@ -118,22 +145,20 @@ impl EventWriter {
         let mut line = serde_json::to_string(&record)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         line.push('\n');
-        with_event_log_write_lock(|| {
+        with_event_log_write_lock(&path, || {
             append_one(&path, line.as_bytes())?;
             // The record is already on disk; rotation failure is a housekeeping
             // problem, not a write failure. Log and continue.
             if let Err(e) = maybe_rotate(&path) {
-                eprintln!(
-                    "[supervisor:{}] event log rotation failed (ignored): {e}",
-                    self.service
-                );
+                self.diagnostic
+                    .report(&self.service, "event log rotation", &e.to_string());
             }
             Ok(())
         })
     }
 }
 
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| String::from("1970-01-01T00:00:00Z"))
@@ -147,48 +172,126 @@ fn append_one(path: &PathBuf, bytes: &[u8]) -> std::io::Result<()> {
 /// Serialize each event-log append/rotation cycle so concurrent writers never
 /// split records or rotate a file another writer is actively appending to.
 #[cfg(windows)]
-fn with_event_log_write_lock<F>(f: F) -> std::io::Result<()>
+fn with_event_log_write_lock<F>(path: &std::path::Path, f: F) -> std::io::Result<()>
 where
     F: FnOnce() -> std::io::Result<()>,
 {
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
-    use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
-
-    const TIMEOUT_MS: u32 = 5_000;
-
-    let name_wide: Vec<u16> = "Global\\NGSM-events-log-write\0".encode_utf16().collect();
-    let mutex: HANDLE = unsafe {
-        CreateMutexW(None, false, PCWSTR(name_wide.as_ptr())).map_err(std::io::Error::other)?
-    };
-
-    let wait_result = unsafe { WaitForSingleObject(mutex, TIMEOUT_MS) };
-    if wait_result != WAIT_OBJECT_0 && wait_result != WAIT_ABANDONED {
-        unsafe {
-            let _ = CloseHandle(mutex);
-        }
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("event log write mutex wait failed: {wait_result:?}"),
-        ));
-    }
-
-    struct MutexGuard(HANDLE);
-    impl Drop for MutexGuard {
-        fn drop(&mut self) {
-            unsafe {
-                let _ = ReleaseMutex(self.0);
-                let _ = CloseHandle(self.0);
-            }
-        }
-    }
-
-    let _guard = MutexGuard(mutex);
+    let _guard = EventLock::acquire(path, 5_000)?;
     f()
 }
 
+#[cfg(windows)]
+const EVENT_MUTEX_SDDL: &str =
+    "D:P(A;;0x00100001;;;SY)(A;;0x00100001;;;BA)(A;;0x00100001;;;SU)(A;;0x00100001;;;OW)";
+
+#[cfg(windows)]
+fn mutex_name(path: &std::path::Path) -> std::io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("event log has no parent"))?;
+    let canonical = std::fs::canonicalize(parent)?.join(
+        path.file_name()
+            .ok_or_else(|| std::io::Error::other("event log has no filename"))?,
+    );
+    let mut hash = 0xcbf29ce484222325u64;
+    for word in canonical.as_os_str().encode_wide() {
+        for byte in word.to_le_bytes() {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+        }
+    }
+    Ok(format!("Global\\NGSM-events-{hash:016x}\0")
+        .encode_utf16()
+        .collect())
+}
+
+#[cfg(windows)]
+fn create_event_mutex(
+    path: &std::path::Path,
+    descriptor: &str,
+    access: u32,
+) -> std::io::Result<windows::Win32::Foundation::HANDLE> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::{
+        Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1},
+        PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+    };
+    use windows::Win32::System::Threading::CreateMutexExW;
+
+    let name = mutex_name(path)?;
+    let descriptor: Vec<u16> = descriptor.encode_utf16().chain(Some(0)).collect();
+    let mut security = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: the SDDL input is terminated and security receives a LocalAlloc allocation.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(descriptor.as_ptr()),
+            SDDL_REVISION_1,
+            &mut security,
+            None,
+        )
+    }
+    .map_err(std::io::Error::other)?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: security.0,
+        bInheritHandle: false.into(),
+    };
+    // SAFETY: attributes and the descriptor remain alive throughout creation/opening.
+    let result = unsafe { CreateMutexExW(Some(&attributes), PCWSTR(name.as_ptr()), 0, access) };
+    // SAFETY: the converted descriptor is one LocalAlloc allocation, freed exactly once.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(security.0)));
+    }
+    result.map_err(|error| std::io::Error::from_raw_os_error(error.code().0 & 0xffff))
+}
+
+#[cfg(windows)]
+struct EventLock(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl EventLock {
+    fn acquire(path: &std::path::Path, timeout_ms: u32) -> std::io::Result<Self> {
+        use windows::Win32::Foundation::{
+            CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        };
+        use windows::Win32::System::Threading::WaitForSingleObject;
+        // SYNCHRONIZE | MUTEX_MODIFY_STATE; never request MUTEX_ALL_ACCESS.
+        let handle = create_event_mutex(path, EVENT_MUTEX_SDDL, 0x0010_0001)?;
+        // SAFETY: handle is the live mutex just created/opened.
+        let result = unsafe { WaitForSingleObject(handle, timeout_ms) };
+        if result == WAIT_OBJECT_0 || result == WAIT_ABANDONED {
+            Ok(Self(handle))
+        } else {
+            let error = if result == WAIT_TIMEOUT {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "event log mutex timed out")
+            } else {
+                std::io::Error::last_os_error()
+            };
+            // SAFETY: acquisition failed; close without releasing an unowned mutex.
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            Err(error)
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for EventLock {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::ReleaseMutex;
+        // SAFETY: this thread owns the mutex, and this guard owns its handle.
+        unsafe {
+            let _ = ReleaseMutex(self.0);
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
 #[cfg(not(windows))]
-fn with_event_log_write_lock<F>(f: F) -> std::io::Result<()>
+fn with_event_log_write_lock<F>(_path: &std::path::Path, f: F) -> std::io::Result<()>
 where
     F: FnOnce() -> std::io::Result<()>,
 {
@@ -199,100 +302,9 @@ where
     f()
 }
 
-/// On Windows: serialize rotation across all supervisor processes using a
-/// named mutex. Re-check file size after acquiring the lock; if a peer
-/// already rotated, skip.
-///
-/// On non-Windows (e.g. Linux CI): keep the original single-check behavior.
+/// Called while holding the same lock as the preceding append.
 fn maybe_rotate(active: &PathBuf) -> std::io::Result<()> {
     // Fast path: skip the mutex overhead if we are clearly under threshold.
-    let size = match std::fs::metadata(active) {
-        Ok(m) => m.len(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    if size < ROTATION_THRESHOLD_BYTES {
-        return Ok(());
-    }
-
-    #[cfg(windows)]
-    {
-        rotate_with_mutex(active)
-    }
-
-    #[cfg(not(windows))]
-    {
-        let oldest = paths::events_log_backup_n(paths::BACKUP_RETENTION_COUNT)?;
-        if let Err(e) = std::fs::remove_file(&oldest) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("[supervisor] event log rotation: cannot remove oldest backup: {e}");
-                return Ok(());
-            }
-        }
-        for i in (1..paths::BACKUP_RETENTION_COUNT).rev() {
-            let from = paths::events_log_backup_n(i)?;
-            let to = paths::events_log_backup_n(i + 1)?;
-            if from.exists() {
-                std::fs::rename(&from, &to)?;
-            }
-        }
-        let dest_1 = paths::events_log_backup_n(1)?;
-        std::fs::rename(active, &dest_1)
-    }
-}
-
-/// Windows-only: acquire `Global\NGSM-events-log-rotate`, re-check size, rename.
-#[cfg(windows)]
-fn rotate_with_mutex(active: &PathBuf) -> std::io::Result<()> {
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
-    use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
-
-    // 1 000 ms timeout so a stuck peer doesn't stall supervision indefinitely.
-    const TIMEOUT_MS: u32 = 1_000;
-
-    // Encode the name as a null-terminated UTF-16 string.
-    let name_wide: Vec<u16> = "Global\\NGSM-events-log-rotate\0".encode_utf16().collect();
-
-    // SAFETY: name_wide is a valid null-terminated UTF-16 string. We pass
-    // NULL for security attributes (default) and FALSE for bInitialOwner.
-    let mutex: HANDLE = unsafe {
-        CreateMutexW(None, false, PCWSTR(name_wide.as_ptr())).map_err(std::io::Error::other)?
-    };
-
-    // RAII guard — releases and closes the mutex handle on drop.
-    struct MutexGuard(HANDLE);
-    impl Drop for MutexGuard {
-        fn drop(&mut self) {
-            unsafe {
-                // Ignore errors: if the handle is invalid there's nothing we
-                // can do, and panicking inside Drop is worse.
-                let _ = ReleaseMutex(self.0);
-                let _ = CloseHandle(self.0);
-            }
-        }
-    }
-
-    let wait_result = unsafe { WaitForSingleObject(mutex, TIMEOUT_MS) };
-
-    // WAIT_ABANDONED means the previous owner died while holding the lock;
-    // we still own it now, so treat it like WAIT_OBJECT_0.
-    if wait_result != WAIT_OBJECT_0 && wait_result != WAIT_ABANDONED {
-        // Timeout or error — skip rotation; the next write will retry.
-        unsafe {
-            let _ = CloseHandle(mutex);
-        }
-        eprintln!(
-            "[supervisor] event log rotation skipped: could not acquire rotation mutex \
-             (WaitForSingleObject returned {wait_result:?})"
-        );
-        return Ok(());
-    }
-
-    // We own the mutex; the guard will release it on scope exit.
-    let _guard = MutexGuard(mutex);
-
-    // Re-check: a peer may have already rotated while we were waiting.
     let size = match std::fs::metadata(active) {
         Ok(m) => m.len(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -308,8 +320,7 @@ fn rotate_with_mutex(active: &PathBuf) -> std::io::Result<()> {
     let oldest = paths::events_log_backup_n(paths::BACKUP_RETENTION_COUNT)?;
     if let Err(e) = std::fs::remove_file(&oldest) {
         if e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!("[supervisor] event log rotation: cannot remove oldest backup: {e}");
-            return Ok(());
+            return Err(e);
         }
     }
     for i in (1..paths::BACKUP_RETENTION_COUNT).rev() {
@@ -318,10 +329,7 @@ fn rotate_with_mutex(active: &PathBuf) -> std::io::Result<()> {
         if !from.exists() {
             continue;
         }
-        if let Err(e) = std::fs::rename(&from, &to) {
-            eprintln!("[supervisor] event log rotation: cannot shift {from:?} → {to:?}: {e}");
-            return Ok(());
-        }
+        std::fs::rename(&from, &to)?;
     }
     let dest_1 = paths::events_log_backup_n(1)?;
     std::fs::rename(active, &dest_1)
@@ -459,7 +467,7 @@ mod tests {
         let (_g, _dir) = isolate();
         // Point at a path under a directory that does not and cannot be
         // created (a file masquerading as a directory).
-        let bogus = std::env::temp_dir().join("ngsm-test-bogus-file");
+        let bogus = _dir.path().join("ngsm-test-bogus-file");
         std::fs::write(&bogus, b"i am a file, not a dir").unwrap();
         std::env::set_var("NGSM_PROGRAM_DATA_DIR", &bogus);
         let w = EventWriter::for_service("Foo");

@@ -3,7 +3,8 @@
 //! `parse_config` / `to_json` are the pure, unit-tested core; `load` / `save`
 //! wrap them with file IO and are verified manually.
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -126,11 +127,60 @@ pub fn load() -> ConfigLoad {
 /// string on failure — non-fatal; the caller surfaces it in the status bar.
 pub fn save(config: &Config) -> Result<(), String> {
     let path = config_path().ok_or("APPDATA is not set")?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    save_to_path(&path, config)
+}
+
+fn save_to_path(path: &Path, config: &Config) -> Result<(), String> {
+    atomic_write_with(
+        path,
+        to_json(config)?.as_bytes(),
+        |file, bytes| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        },
+        persist_staged,
+    )
+}
+
+fn persist_staged(staged: tempfile::NamedTempFile, destination: &Path) -> Result<(), String> {
+    let mut path = staged.into_temp_path();
+    for attempt in 0..5 {
+        match path.persist(destination) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                // Concurrent Windows replacements can briefly leave the
+                // destination delete-pending. Retry only these transient codes,
+                // retaining ownership of the same fully prepared staging file.
+                if attempt == 4 || !matches!(e.error.raw_os_error(), Some(5 | 32 | 33)) {
+                    return Err(format!("replace config: {e}"));
+                }
+                path = e.path;
+                std::thread::sleep(std::time::Duration::from_millis(10 * (attempt + 1)));
+            }
+        }
     }
-    let json = to_json(config)?;
-    std::fs::write(&path, json).map_err(|e| format!("write config: {e}"))
+    unreachable!()
+}
+
+fn atomic_write_with(
+    path: &Path,
+    bytes: &[u8],
+    prepare: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+    replace: impl FnOnce(tempfile::NamedTempFile, &Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let mut staged = tempfile::Builder::new()
+        .prefix(".ngsm-config-")
+        .tempfile_in(dir)
+        .map_err(|e| format!("stage config: {e}"))?;
+    prepare(staged.as_file_mut(), bytes).map_err(|e| format!("write config: {e}"))?;
+    // The sibling staging file is on the same volume. tempfile's Windows
+    // implementation replaces atomically and owns cleanup on every error.
+    replace(staged, path)
 }
 
 #[cfg(test)]
@@ -183,7 +233,7 @@ mod tests {
         let json = format!(
             r#"{{"v":1,"auto_refresh":true,"auto_refresh_secs":{secs},"managed_only":true}}"#
         );
-        let mut f = tempfile::NamedTempFile::new().unwrap();
+        let mut f = tempfile::NamedTempFile::new_in(".").unwrap();
         f.write_all(json.as_bytes()).unwrap();
         f.flush().unwrap();
         let text = std::fs::read_to_string(f.path()).unwrap();
@@ -221,5 +271,106 @@ mod tests {
             "got warning: {:?}",
             result.warning
         );
+    }
+
+    #[test]
+    fn atomic_save_round_trips_and_replaces_without_staging_leaks() {
+        let dir = tempfile::tempdir_in(".").unwrap();
+        let path = dir.path().join("config.json");
+        for secs in [3600, 1, 30] {
+            let config = Config {
+                auto_refresh_secs: secs,
+                ..Default::default()
+            };
+            save_to_path(&path, &config).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(parse_config(&text).config, config);
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn failed_preparation_or_replacement_preserves_exact_old_bytes() {
+        let dir = tempfile::tempdir_in(".").unwrap();
+        let path = dir.path().join("config.json");
+        let original = to_json(&Config::default()).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let error = atomic_write_with(
+            &path,
+            b"new",
+            |file, bytes| {
+                file.write_all(bytes)?;
+                Err(std::io::Error::other("injected write failure"))
+            },
+            |_, _| panic!("must not replace after failed preparation"),
+        );
+        assert!(error.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        let error = atomic_write_with(
+            &path,
+            b"new",
+            |file, bytes| file.write_all(bytes),
+            |_, _| Err("injected replacement failure".into()),
+        );
+        assert!(error.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn concurrent_saves_leave_one_complete_snapshot() {
+        let dir = tempfile::tempdir_in(".").unwrap();
+        let path = dir.path().join("config.json");
+        let configs = [
+            Config {
+                auto_refresh_secs: 3600,
+                auto_refresh: false,
+                ..Default::default()
+            },
+            Config {
+                auto_refresh_secs: 1,
+                auto_refresh: true,
+                ..Default::default()
+            },
+        ];
+        save_to_path(&path, &configs[0]).unwrap();
+        std::thread::scope(|scope| {
+            for config in &configs {
+                let path = &path;
+                scope.spawn(move || {
+                    for _ in 0..20 {
+                        save_to_path(path, config).unwrap();
+                    }
+                });
+            }
+        });
+        let loaded = parse_config(&std::fs::read_to_string(&path).unwrap());
+        assert!(loaded.warning.is_none());
+        assert!(configs.contains(&loaded.config));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn actual_windows_replacement_failure_keeps_old_file_and_cleans_staging() {
+        let dir = tempfile::tempdir_in(".").unwrap();
+        let path = dir.path().join("config.json");
+        save_to_path(&path, &Config::default()).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let permissions = std::fs::metadata(&path).unwrap().permissions();
+        let mut read_only = permissions.clone();
+        read_only.set_readonly(true);
+        std::fs::set_permissions(&path, read_only).unwrap();
+        let result = save_to_path(
+            &path,
+            &Config {
+                auto_refresh: true,
+                ..Default::default()
+            },
+        );
+        std::fs::set_permissions(&path, permissions).unwrap();
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

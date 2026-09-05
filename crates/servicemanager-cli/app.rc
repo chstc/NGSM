@@ -3,4 +3,34 @@
 // `IDI_ICON1` (numeric ID 1) is the convention Explorer/the Shell uses
 // when displaying an executable's file icon. We point it at the
 // multi-resolution .ico we generate from the source logo.
+#include <winver.h>
+
 1 ICON "assets/logo.ico"
+
+1 VERSIONINFO
+FILEVERSION NGSM_FILE_VERSION
+PRODUCTVERSION NGSM_FILE_VERSION
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE 0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "NGSM contributors\0"
+            VALUE "FileDescription", "NGSM - Next-Gen Service Manager\0"
+            VALUE "FileVersion", NGSM_VERSION_STRING
+            VALUE "InternalName", "ngsm\0"
+            VALUE "OriginalFilename", "ngsm.exe\0"
+            VALUE "ProductName", "Next-Gen Service Manager\0"
+            VALUE "ProductVersion", NGSM_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

@@ -7,6 +7,10 @@ use servicemanager_core::{ServiceDefinition, ServiceState, StartupType};
 use std::collections::HashMap;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use windows::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL};
+
+type TimedEvent<'a> = (OffsetDateTime, &'a EventRecord);
+type ServiceEvents<'a> = HashMap<&'a str, Vec<TimedEvent<'a>>>;
 
 /// Numbers driving the four Dashboard stat tiles + the 30-day sparkline.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -22,29 +26,39 @@ pub struct DashboardMetrics {
     /// `availability_unknown`).
     pub availability_pct: f32,
     pub availability_window_days: u32,
-    /// 30 entries oldest→newest. Each is mean availability across services
-    /// for that UTC calendar day in 0..=100. Days with no data carry
-    /// forward from the previous day; the first day with no data uses 100.0.
+    /// 30 UTC-day buckets, oldest→newest, or empty for unknown coverage.
+    /// Leading unobserved buckets are placeholders; the UI plots only the
+    /// tail corresponding to `availability_window_days`.
     pub availability_daily: Vec<f32>,
-    /// True when the availability metric is not trustworthy — set by the
-    /// caller (worker) when `read_since` errored. `compute_metrics` itself
-    /// never sets this. The UI must render "—" instead of the numeric
-    /// percentage when this is true.
+    /// Conservative fleet coverage: every managed service needs a usable
+    /// timeline and an unambiguous tail. I/O failure also makes it unknown.
     pub availability_unknown: bool,
 }
 
-/// Top-level entry: deterministic given inputs. `events` MUST be ascending
-/// by `ts` (as returned by `event_log_reader::read_since`).
+/// Deterministic given inputs. Invalid and future records are excluded before
+/// indexing or interval construction so they cannot shadow valid state.
 pub fn compute_metrics(
     defs: &[ServiceDefinition],
     events: &[EventRecord],
     now: OffsetDateTime,
 ) -> DashboardMetrics {
-    let counts = compute_counts(defs, events, now);
+    let mut events: Vec<_> = events
+        .iter()
+        .filter_map(|event| parse_ts(&event.ts).map(|ts| (ts, event)))
+        .filter(|(ts, _)| *ts <= now)
+        .collect();
+    events.sort_by_key(|(ts, _)| *ts);
+    let events = group_service_events(defs, &events, ordinal_name_eq);
+    let counts = compute_counts(defs, &events, now);
     let window_start = now - time::Duration::days(30);
-    let timelines = build_service_timelines(defs, events, window_start, now);
+    let (timelines, unknown) = build_service_timelines(defs, &events, window_start, now);
     let avail = compute_availability(&timelines, window_start, now);
-    let daily = compute_daily_sparkline(&timelines, now);
+    let unknown = unknown || counts.total == 0;
+    let daily = if unknown {
+        Vec::new()
+    } else {
+        compute_daily_sparkline(&timelines, now)
+    };
     DashboardMetrics {
         total: counts.total,
         running: counts.running,
@@ -55,8 +69,56 @@ pub fn compute_metrics(
         availability_pct: avail.aggregate_pct,
         availability_window_days: avail.window_days,
         availability_daily: daily,
-        availability_unknown: false,
+        availability_unknown: unknown,
     }
+}
+
+fn ordinal_name_eq(left: &[u16], right: &[u16]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    // Both counted strings are bounded valid service names. Ordinal casing
+    // follows Windows identity rules without linguistic multi-character folds.
+    unsafe { CompareStringOrdinal(left, right, true) == CSTR_EQUAL }
+}
+
+fn group_service_events<'a>(
+    defs: &'a [ServiceDefinition],
+    events: &[TimedEvent<'a>],
+    mut compare: impl FnMut(&[u16], &[u16]) -> bool,
+) -> ServiceEvents<'a> {
+    let names: Vec<_> = defs
+        .iter()
+        .filter(|def| def.is_managed())
+        .map(|def| {
+            (
+                def.native.name.as_str(),
+                def.native.name.encode_utf16().collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    let mut grouped = ServiceEvents::new();
+    if names.is_empty() {
+        return grouped;
+    }
+    let mut aliases: HashMap<&str, Option<&str>> =
+        names.iter().map(|(name, _)| (*name, Some(*name))).collect();
+    for &(ts, event) in events {
+        let canonical = *aliases.entry(&event.service).or_insert_with(|| {
+            let candidate: Vec<u16> = event.service.encode_utf16().take(257).collect();
+            if candidate.is_empty() || candidate.len() > 256 {
+                return None;
+            }
+            names
+                .iter()
+                .find(|(_, name)| compare(&candidate, name))
+                .map(|(name, _)| *name)
+        });
+        if let Some(name) = canonical {
+            grouped.entry(name).or_default().push((ts, event));
+        }
+    }
+    grouped
 }
 
 /// One service's up/down history across the 30-day window. Intervals are
@@ -76,51 +138,50 @@ struct AvailabilityResult {
 
 fn build_service_timelines(
     defs: &[ServiceDefinition],
-    events: &[EventRecord],
+    events: &ServiceEvents<'_>,
     window_start: OffsetDateTime,
     now: OffsetDateTime,
-) -> Vec<ServiceTimeline> {
+) -> (Vec<ServiceTimeline>, bool) {
     let mut out = Vec::new();
+    let mut unknown = false;
     for def in defs.iter().filter(|d| d.is_managed()) {
         let svc = def.native.name.as_str();
-        let svc_events: Vec<&EventRecord> = events.iter().filter(|e| e.service == svc).collect();
-        if svc_events.is_empty() {
-            continue;
-        }
-        let Some(first_ts) = parse_ts(&svc_events[0].ts) else {
+        let Some(svc_events) = events.get(svc) else {
+            unknown = true;
             continue;
         };
-        let svc_window_start = first_ts.max(window_start);
+        let svc_window_start = svc_events[0].0.max(window_start);
+        if svc_window_start >= now {
+            unknown = true;
+            continue;
+        }
         let state = def.runtime.as_ref().map(|r| r.state);
-        let intervals = build_up_intervals(&svc_events, svc_window_start, now, state);
+        let (intervals, uncertain_tail) =
+            build_up_intervals(svc_events, svc_window_start, now, state);
+        unknown |= uncertain_tail;
         out.push(ServiceTimeline {
             window_start: svc_window_start,
             intervals,
         });
     }
-    out
+    (out, unknown)
 }
 
 /// Build the list of up-intervals for one service across `[start, now]`.
-/// `state` decides whether a still-open `up_since` at end-of-log extends
-/// to `now`. Future timestamps are clamped to `now` (clock skew safety).
+/// A pre-window state seeds the boundary. Availability measures recorded child
+/// lifetime, not whether a paused child is currently serving requests. Live-host
+/// transitions therefore do not retroactively erase that lifetime. A stopped or
+/// missing host with an unclosed start is ambiguous, not evidence of zero uptime.
 fn build_up_intervals(
-    events: &[&EventRecord],
+    events: &[(OffsetDateTime, &EventRecord)],
     start: OffsetDateTime,
     now: OffsetDateTime,
     state: Option<ServiceState>,
-) -> Vec<(OffsetDateTime, OffsetDateTime)> {
+) -> (Vec<(OffsetDateTime, OffsetDateTime)>, bool) {
     let mut intervals: Vec<(OffsetDateTime, OffsetDateTime)> = Vec::new();
     let mut up_since: Option<OffsetDateTime> = None;
-    let mut last_event_kind: Option<EventKind> = None;
-    for rec in events {
-        let Some(ts) = parse_ts(&rec.ts) else {
-            continue;
-        };
-        let ts = ts.min(now); // Clamp future skew.
-        if ts < start {
-            continue;
-        }
+    for &(ts, rec) in events {
+        let ts = ts.max(start);
         match rec.event {
             EventKind::Started | EventKind::Restarted => {
                 if up_since.is_none() {
@@ -135,24 +196,26 @@ fn build_up_intervals(
                 }
             }
         }
-        last_event_kind = Some(rec.event);
     }
-    // Extend an open `up_since` to `now` only when (a) the SCM thinks the
-    // service is Running AND (b) the last event was a start-like event.
-    // A Throttled event would already have closed `up_since`; this is a
-    // consistency safeguard for the SCM-state safeguard test.
     if let Some(s) = up_since {
-        if state == Some(ServiceState::Running)
-            && matches!(
-                last_event_kind,
-                Some(EventKind::Started | EventKind::Restarted)
+        if matches!(
+            state,
+            Some(
+                ServiceState::Running
+                    | ServiceState::Paused
+                    | ServiceState::PausePending
+                    | ServiceState::ContinuePending
+                    | ServiceState::StopPending
             )
-            && now > s
-        {
-            intervals.push((s, now));
+        ) {
+            if now > s {
+                intervals.push((s, now));
+            }
+        } else {
+            return (intervals, true);
         }
     }
-    intervals
+    (intervals, false)
 }
 
 /// Sum the milliseconds of `intervals` overlap with `[win_start, win_end]`.
@@ -211,8 +274,8 @@ fn compute_availability(
 /// Reads from already-built `ServiceTimeline`s and clips each interval
 /// into the day bucket — events in distant days still contribute to
 /// today's bucket via the "up" interval they opened. Days with no
-/// contributing service carry forward from the previous bucket; the
-/// first bucket with no data falls back to 100.
+/// contributing service carry forward from the previous bucket. Leading
+/// unobserved buckets are zero placeholders, excluded from the displayed chart.
 fn compute_daily_sparkline(timelines: &[ServiceTimeline], now: OffsetDateTime) -> Vec<f32> {
     let mut out: Vec<f32> = Vec::with_capacity(30);
     // Day boundaries in UTC for stability. `today_start` = midnight UTC of
@@ -235,7 +298,7 @@ fn compute_daily_sparkline(timelines: &[ServiceTimeline], now: OffsetDateTime) -
         }
 
         let value = if ratios.is_empty() {
-            *out.last().unwrap_or(&100.0)
+            *out.last().unwrap_or(&0.0)
         } else {
             ratios.iter().sum::<f32>() / ratios.len() as f32
         };
@@ -285,12 +348,9 @@ struct Counts {
 
 fn compute_counts(
     defs: &[ServiceDefinition],
-    events: &[EventRecord],
+    events: &ServiceEvents<'_>,
     now: OffsetDateTime,
 ) -> Counts {
-    // Index the most-recent event per service for O(1) lookups in the loop.
-    let last_event = last_event_per_service(events);
-
     let mut c = Counts::default();
     for def in defs.iter().filter(|d| d.is_managed()) {
         c.total += 1;
@@ -305,25 +365,18 @@ fn compute_counts(
             }
             _ => {}
         }
-        let last = last_event.get(def.native.name.as_str());
+        let last = events
+            .get(def.native.name.as_str())
+            .and_then(|events| events.last())
+            .map(|(_, event)| event);
         if classify_failed(state, last, now) {
             c.failed += 1;
         }
-        if classify_auto_recovering(state, last, events, &def.native.name, now) {
+        if classify_auto_recovering(state, last, now) {
             c.auto_recovering += 1;
         }
     }
     c
-}
-
-/// Build `service_name → most-recent EventRecord`. Walks events once.
-fn last_event_per_service(events: &[EventRecord]) -> HashMap<&str, &EventRecord> {
-    let mut map: HashMap<&str, &EventRecord> = HashMap::new();
-    for ev in events {
-        // events is ascending; later overwrites earlier — correct.
-        map.insert(ev.service.as_str(), ev);
-    }
-    map
 }
 
 fn parse_ts(ts: &str) -> Option<OffsetDateTime> {
@@ -358,18 +411,18 @@ fn classify_failed(
     (now - ts) <= time::Duration::hours(24)
 }
 
-/// `auto_recovering` = state != Running + last event is either `throttled`,
-/// or a `restarted` immediately following a `child_exited` with no
-/// `stopped` between them — within the last 5 minutes. Future-dated
-/// events excluded (see `classify_failed` rationale).
+/// The supervisor stays SCM Running while waiting for a replacement child.
+/// A recorded successful restart ends recovery. Permit a bounded scheduling
+/// grace after a recorded delay, or five minutes for legacy records without it.
 fn classify_auto_recovering(
     state: Option<ServiceState>,
     last: Option<&&EventRecord>,
-    events: &[EventRecord],
-    service: &str,
     now: OffsetDateTime,
 ) -> bool {
-    if state == Some(ServiceState::Running) {
+    if !matches!(
+        state,
+        Some(ServiceState::Running | ServiceState::StartPending)
+    ) {
         return false;
     }
     let Some(rec) = last else { return false };
@@ -379,28 +432,11 @@ fn classify_auto_recovering(
     if ts > now {
         return false;
     }
-    if (now - ts) > time::Duration::minutes(5) {
-        return false;
-    }
-    match rec.event {
-        EventKind::Throttled => true,
-        EventKind::Restarted => {
-            // Look back: is the most-recent prior event for this service a
-            // `child_exited`, with no `stopped` in between?
-            for prior in events.iter().rev().filter(|e| e.service == service) {
-                if std::ptr::eq(prior, *rec) {
-                    continue;
-                }
-                match prior.event {
-                    EventKind::Stopped => return false,
-                    EventKind::ChildExited => return true,
-                    _ => continue,
-                }
-            }
-            false
-        }
-        _ => false,
-    }
+    let wait_ms = rec
+        .delay_ms
+        .map(|ms| ms.min(u32::MAX as u64).saturating_add(30_000))
+        .unwrap_or(5 * 60 * 1000);
+    rec.event == EventKind::Throttled && (now - ts).whole_milliseconds() <= i128::from(wait_ms)
 }
 
 #[cfg(test)]
@@ -468,6 +504,217 @@ mod tests {
         assert_eq!(m.total, 0);
         assert_eq!(m.running, 0);
         assert_eq!(m.failed, 0);
+    }
+
+    #[test]
+    fn service_identity_case_aliases_share_recovery_and_uptime() {
+        let now = datetime!(2026-05-23 12:00:00 UTC);
+        let defs = [ngsm(
+            "CaseSvc",
+            StartupType::Manual,
+            Some(ServiceState::Running),
+        )];
+        let mut throttle = ev(
+            "CASESVC",
+            now - time::Duration::minutes(5),
+            EventKind::Throttled,
+            None,
+        );
+        throttle.delay_ms = Some(600_000);
+        let events = [
+            ev(
+                "CaseSvc",
+                now - time::Duration::minutes(10),
+                EventKind::Started,
+                None,
+            ),
+            ev(
+                "casesvc",
+                now - time::Duration::minutes(5),
+                EventKind::ChildExited,
+                Some(7),
+            ),
+            throttle,
+        ];
+        let metrics = compute_metrics(&defs, &events, now);
+        assert_eq!(metrics.auto_recovering, 1);
+        assert!(!metrics.availability_unknown);
+        assert!((metrics.availability_pct - 50.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn service_identity_non_ascii_aliases_keep_the_pre_window_seed() {
+        let now = datetime!(2026-05-23 12:00:00 UTC);
+        let defs = [ngsm(
+            "\u{03a3}ervice",
+            StartupType::Manual,
+            Some(ServiceState::Stopped),
+        )];
+        let events = [
+            ev(
+                "\u{03c3}ervice",
+                now - time::Duration::days(31),
+                EventKind::Started,
+                None,
+            ),
+            ev(
+                "\u{03a3}ERVICE",
+                now - time::Duration::days(1),
+                EventKind::ChildExited,
+                Some(7),
+            ),
+        ];
+        let metrics = compute_metrics(&defs, &events, now);
+        assert!(!metrics.availability_unknown);
+        assert_eq!(metrics.failed, 1);
+        assert!((metrics.availability_pct - 100.0 * 29.0 / 30.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn service_identity_does_not_merge_distinct_linguistic_spellings() {
+        let now = datetime!(2026-05-23 12:00:00 UTC);
+        let defs = [
+            ngsm(
+                "Stra\u{00df}e",
+                StartupType::Manual,
+                Some(ServiceState::Running),
+            ),
+            ngsm("STRASSE", StartupType::Manual, Some(ServiceState::Stopped)),
+        ];
+        let events = [
+            ev(
+                "STRA\u{00df}E",
+                now - time::Duration::hours(1),
+                EventKind::Started,
+                None,
+            ),
+            ev(
+                "strasse",
+                now - time::Duration::hours(1),
+                EventKind::ChildExited,
+                Some(7),
+            ),
+        ];
+        let metrics = compute_metrics(&defs, &events, now);
+        assert_eq!(metrics.total, 2);
+        assert_eq!(metrics.failed, 1);
+        assert!(!metrics.availability_unknown);
+        assert!((metrics.availability_pct - 50.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn service_identity_comparison_is_cached_per_distinct_event_spelling() {
+        let now = datetime!(2026-05-23 12:00:00 UTC);
+        let defs = [
+            ngsm("CaseSvc", StartupType::Manual, Some(ServiceState::Running)),
+            ngsm("OtherSvc", StartupType::Manual, Some(ServiceState::Stopped)),
+        ];
+        let events: Vec<_> = (0..200)
+            .map(|index| {
+                ev(
+                    if index % 2 == 0 { "casesvc" } else { "unknown" },
+                    now,
+                    EventKind::Started,
+                    None,
+                )
+            })
+            .collect();
+        let parsed: Vec<_> = events.iter().map(|event| (now, event)).collect();
+        let mut comparisons = 0;
+        let grouped = group_service_events(&defs, &parsed, |left, right| {
+            comparisons += 1;
+            ordinal_name_eq(left, right)
+        });
+        assert_eq!(grouped["CaseSvc"].len(), 100);
+        assert!(!grouped.contains_key("OtherSvc"));
+        assert_eq!(comparisons, 3);
+        assert_eq!(events[0].service, "casesvc", "stored names stay unchanged");
+    }
+
+    #[test]
+    fn availability_is_unknown_without_managed_service_history() {
+        for state in [ServiceState::Running, ServiceState::Stopped] {
+            let defs = [ngsm("A", StartupType::Manual, Some(state))];
+            let metrics = compute_metrics(&defs, &[], datetime!(2026-05-23 12:00:00 UTC));
+            assert!(
+                metrics.availability_unknown,
+                "missing history must not imply healthy availability for {state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn running_supervisor_can_be_waiting_in_its_recorded_recovery_delay() {
+        let now = datetime!(2026-05-23 12:00:00 UTC);
+        let defs = [ngsm("A", StartupType::Manual, Some(ServiceState::Running))];
+        for (age_ms, delay_ms) in [(500_i64, 1500_u64), (360_000, 600_000)] {
+            let exited_at = now - time::Duration::milliseconds(age_ms);
+            let mut throttle = ev("A", exited_at, EventKind::Throttled, None);
+            throttle.delay_ms = Some(delay_ms);
+            let events = [
+                ev(
+                    "A",
+                    exited_at - time::Duration::seconds(2),
+                    EventKind::Started,
+                    None,
+                ),
+                ev("A", exited_at, EventKind::ChildExited, Some(7)),
+                throttle,
+            ];
+            let metrics = compute_metrics(&defs, &events, now);
+            assert_eq!(
+                metrics.auto_recovering, 1,
+                "SCM Running does not imply a live child during the {delay_ms}ms retry delay"
+            );
+        }
+    }
+
+    #[test]
+    fn availability_retains_a_pre_window_start_as_state_evidence() {
+        let now = datetime!(2026-05-23 12:00:00 UTC);
+        let defs = [ngsm("A", StartupType::Manual, Some(ServiceState::Stopped))];
+        let events = [
+            ev(
+                "A",
+                now - time::Duration::days(31),
+                EventKind::Started,
+                None,
+            ),
+            ev("A", now - time::Duration::days(1), EventKind::Stopped, None),
+        ];
+        let metrics = compute_metrics(&defs, &events, now);
+        let expected = 100.0 * 29.0 / 30.0;
+        assert!(
+            (metrics.availability_pct - expected).abs() < 0.001,
+            "retained history should show 29 up days out of 30, got {}",
+            metrics.availability_pct
+        );
+        assert_eq!(metrics.availability_window_days, 30);
+    }
+
+    #[test]
+    fn paused_or_pending_snapshot_does_not_invent_historical_downtime() {
+        let now = datetime!(2026-05-23 12:00:00 UTC);
+        let events = [ev(
+            "A",
+            now - time::Duration::days(7),
+            EventKind::Started,
+            None,
+        )];
+        for state in [
+            ServiceState::Paused,
+            ServiceState::PausePending,
+            ServiceState::ContinuePending,
+            ServiceState::StopPending,
+        ] {
+            let defs = [ngsm("A", StartupType::Manual, Some(state))];
+            let metrics = compute_metrics(&defs, &events, now);
+            assert!(
+                metrics.availability_unknown
+                    || (metrics.availability_daily[27] - 100.0).abs() < 0.001,
+                "{state:?} cannot retroactively erase observed uptime"
+            );
+        }
     }
 
     #[test]
@@ -566,7 +813,7 @@ mod tests {
         let defs = vec![ngsm(
             "A",
             StartupType::Automatic,
-            Some(ServiceState::Stopped),
+            Some(ServiceState::Running),
         )];
         let events = vec![ev(
             "A",
@@ -578,12 +825,12 @@ mod tests {
     }
 
     #[test]
-    fn auto_recovering_for_restarted_following_child_exited() {
+    fn successful_restart_clears_auto_recovery_after_child_exit() {
         let now = datetime!(2026-05-23 12:00:00 UTC);
         let defs = vec![ngsm(
             "A",
             StartupType::Automatic,
-            Some(ServiceState::StartPending),
+            Some(ServiceState::Running),
         )];
         let events = vec![
             ev(
@@ -599,16 +846,16 @@ mod tests {
                 None,
             ),
         ];
-        assert_eq!(compute_metrics(&defs, &events, now).auto_recovering, 1);
+        assert_eq!(compute_metrics(&defs, &events, now).auto_recovering, 0);
     }
 
     #[test]
-    fn auto_recovering_excluded_when_running_and_old() {
+    fn auto_recovering_excluded_when_stopped_or_legacy_event_is_old() {
         let now = datetime!(2026-05-23 12:00:00 UTC);
         let defs = vec![ngsm(
             "A",
             StartupType::Automatic,
-            Some(ServiceState::Running),
+            Some(ServiceState::Stopped),
         )];
         let events = vec![ev(
             "A",
@@ -618,10 +865,10 @@ mod tests {
         )];
         assert_eq!(compute_metrics(&defs, &events, now).auto_recovering, 0);
 
-        let stopped = vec![ngsm(
+        let running = vec![ngsm(
             "A",
             StartupType::Automatic,
-            Some(ServiceState::Stopped),
+            Some(ServiceState::Running),
         )];
         let old = vec![ev(
             "A",
@@ -629,7 +876,7 @@ mod tests {
             EventKind::Throttled,
             None,
         )];
-        assert_eq!(compute_metrics(&stopped, &old, now).auto_recovering, 0);
+        assert_eq!(compute_metrics(&running, &old, now).auto_recovering, 0);
     }
 
     #[test]
@@ -710,21 +957,12 @@ mod tests {
 
     #[test]
     fn auto_recovering_isolated_per_service() {
-        // A `stopped` or `child_exited` event for a DIFFERENT service must
-        // not affect the classification of the target. The Restarted walk
-        // filters by service name; this test pins that filter.
+        // Another service's stop must not clear A's outstanding retry delay.
         let now = datetime!(2026-05-23 12:00:00 UTC);
         let defs = vec![
-            ngsm(
-                "A",
-                StartupType::Automatic,
-                Some(ServiceState::StartPending),
-            ),
+            ngsm("A", StartupType::Automatic, Some(ServiceState::Running)),
             ngsm("B", StartupType::Automatic, Some(ServiceState::Running)),
         ];
-        // B's `stopped` is interleaved between A's `child_exited` and A's
-        // `restarted`. A must still classify as auto_recovering because
-        // B's event is unrelated.
         let events = vec![
             ev(
                 "A",
@@ -741,7 +979,7 @@ mod tests {
             ev(
                 "A",
                 now - time::Duration::minutes(2),
-                EventKind::Restarted,
+                EventKind::Throttled,
                 None,
             ),
         ];
@@ -1014,5 +1252,164 @@ mod tests {
         let (line, area) = sparkline_paths(&[]);
         assert!(line.is_empty());
         assert!(area.is_empty());
+    }
+
+    #[test]
+    fn coverage_is_unknown_for_invalid_future_only_or_partially_observed_fleets() {
+        let now = datetime!(2026-05-23 12:00:00 UTC);
+        let a = ngsm("A", StartupType::Manual, Some(ServiceState::Running));
+        let mut invalid = ev("A", now, EventKind::Started, None);
+        invalid.ts = "invalid".into();
+        for events in [
+            vec![invalid],
+            vec![ev(
+                "A",
+                now + time::Duration::hours(1),
+                EventKind::Started,
+                None,
+            )],
+            vec![ev("A", now, EventKind::Started, None)],
+        ] {
+            let metrics = compute_metrics(std::slice::from_ref(&a), &events, now);
+            assert!(metrics.availability_unknown);
+            assert!(metrics.availability_daily.is_empty());
+        }
+        let events = [ev(
+            "A",
+            now - time::Duration::days(2),
+            EventKind::Started,
+            None,
+        )];
+        let metrics = compute_metrics(
+            &[
+                a,
+                ngsm("B", StartupType::Manual, Some(ServiceState::Stopped)),
+            ],
+            &events,
+            now,
+        );
+        assert!(metrics.availability_unknown);
+        assert!(metrics.availability_daily.is_empty());
+    }
+
+    #[test]
+    fn pre_window_down_state_and_exact_boundary_starts_have_full_window_coverage() {
+        let now = datetime!(2026-05-23 12:00:00 UTC);
+        let defs = [ngsm("A", StartupType::Manual, Some(ServiceState::Running))];
+        let events = [
+            ev(
+                "A",
+                now - time::Duration::days(35),
+                EventKind::Stopped,
+                None,
+            ),
+            ev(
+                "A",
+                now - time::Duration::days(15),
+                EventKind::Restarted,
+                None,
+            ),
+        ];
+        let metrics = compute_metrics(&defs, &events, now);
+        assert!(!metrics.availability_unknown);
+        assert!((metrics.availability_pct - 50.0).abs() < 0.01);
+        assert_eq!(metrics.availability_window_days, 30);
+        for age in [30, 31] {
+            let events = [ev(
+                "A",
+                now - time::Duration::days(age),
+                EventKind::Started,
+                None,
+            )];
+            let metrics = compute_metrics(&defs, &events, now);
+            assert!(!metrics.availability_unknown);
+            assert!((metrics.availability_pct - 100.0).abs() < 0.01);
+            assert_eq!(metrics.availability_window_days, 30);
+        }
+    }
+
+    #[test]
+    fn future_events_cannot_shadow_current_failure_recovery_or_uptime() {
+        let now = datetime!(2026-05-23 12:00:00 UTC);
+        let running = [ngsm("A", StartupType::Manual, Some(ServiceState::Running))];
+        let events = [
+            ev("A", now - time::Duration::days(2), EventKind::Started, None),
+            ev("A", now + time::Duration::days(1), EventKind::Stopped, None),
+        ];
+        assert_eq!(
+            compute_metrics(&running, &events, now).availability_pct,
+            100.0
+        );
+        let events = [
+            ev(
+                "A",
+                now - time::Duration::seconds(1),
+                EventKind::Throttled,
+                None,
+            ),
+            ev(
+                "A",
+                now + time::Duration::days(1),
+                EventKind::Restarted,
+                None,
+            ),
+        ];
+        assert_eq!(compute_metrics(&running, &events, now).auto_recovering, 1);
+        let stopped = [ngsm("A", StartupType::Manual, Some(ServiceState::Stopped))];
+        let events = [
+            ev(
+                "A",
+                now - time::Duration::seconds(1),
+                EventKind::ChildExited,
+                Some(7),
+            ),
+            ev("A", now + time::Duration::days(1), EventKind::Started, None),
+        ];
+        assert_eq!(compute_metrics(&stopped, &events, now).failed, 1);
+    }
+
+    #[test]
+    fn retry_delay_grace_is_bounded_and_ignore_or_restart_ends_recovery() {
+        let now = datetime!(2026-05-23 12:00:00 UTC);
+        let defs = [ngsm("A", StartupType::Manual, Some(ServiceState::Running))];
+        for (age, expected) in [(10_000, 1), (40_001, 0)] {
+            let mut throttle = ev(
+                "A",
+                now - time::Duration::milliseconds(age),
+                EventKind::Throttled,
+                None,
+            );
+            throttle.delay_ms = Some(10_000);
+            assert_eq!(
+                compute_metrics(&defs, &[throttle], now).auto_recovering,
+                expected
+            );
+        }
+        for event in [
+            EventKind::ChildExited,
+            EventKind::Restarted,
+            EventKind::Started,
+            EventKind::Stopped,
+        ] {
+            let events = [ev("A", now - time::Duration::seconds(1), event, Some(1))];
+            assert_eq!(compute_metrics(&defs, &events, now).auto_recovering, 0);
+        }
+    }
+
+    #[test]
+    fn missing_close_is_unknown_instead_of_fabricated_history() {
+        let now = datetime!(2026-05-23 12:00:00 UTC);
+        for state in [Some(ServiceState::Stopped), None] {
+            let defs = [ngsm("A", StartupType::Manual, state)];
+            let events = [ev(
+                "A",
+                now - time::Duration::days(7),
+                EventKind::Started,
+                None,
+            )];
+            let metrics = compute_metrics(&defs, &events, now);
+            assert!(metrics.availability_unknown);
+            assert!(metrics.availability_daily.is_empty());
+        }
     }
 }

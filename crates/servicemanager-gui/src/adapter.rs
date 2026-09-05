@@ -127,7 +127,7 @@ pub fn to_service_row(d: &ServiceDefinition, elevated: bool) -> ServiceRow {
         // Restart only makes sense when the service is currently running or
         // paused — i.e. when we could issue a Stop. A stopped service should
         // just use Start.
-        can_restart: can_stop,
+        can_restart: enabled && can_stop,
         can_pause: elevated && managed_cfg && matches!(state, Some(ServiceState::Running)),
         can_continue: elevated && managed_cfg && matches!(state, Some(ServiceState::Paused)),
         can_rotate: elevated
@@ -381,6 +381,29 @@ mod tests {
             row.can_start,
             "a stopped manual managed service stays startable"
         );
+    }
+
+    #[test]
+    fn disabled_live_services_can_stop_but_cannot_restart() {
+        for state in [
+            ServiceState::Running,
+            ServiceState::Paused,
+            ServiceState::StartPending,
+        ] {
+            let disabled = def(
+                "DisabledSvc",
+                "Disabled Svc",
+                "C:\\NGSM\\ngsm.exe run-service DisabledSvc",
+                StartupType::Disabled,
+                Some(state),
+            );
+            let row = to_service_row(&disabled, true);
+            assert!(row.can_stop, "Stop must remain available for {state:?}");
+            assert!(
+                !row.can_restart,
+                "Restart must respect disabled startup even while {state:?}"
+            );
+        }
     }
 
     #[test]

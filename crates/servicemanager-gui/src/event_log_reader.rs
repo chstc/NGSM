@@ -37,9 +37,11 @@ pub fn read_recent(max: usize) -> Vec<EventRecord> {
     for path in iter_log_paths() {
         parse_tail_into(&path, &mut all);
     }
+    let now = time::OffsetDateTime::now_utc();
     let mut parsed: Vec<(time::OffsetDateTime, EventRecord)> = all
         .into_iter()
         .filter_map(|rec| parse_rfc3339_ts(&rec.ts).ok().map(|ts| (ts, rec)))
+        .filter(|(ts, _)| *ts <= now)
         .collect();
     parsed.sort_by(|(a, _), (b, _)| b.cmp(a));
     parsed.truncate(max);
@@ -55,35 +57,29 @@ fn parse_rfc3339_ts(ts: &str) -> Result<time::OffsetDateTime, time::error::Parse
 /// line when the seek landed mid-file, and JSON-parse every remaining
 /// non-empty line into `out`. Malformed lines are silently skipped.
 fn parse_tail_into(path: &std::path::Path, out: &mut Vec<EventRecord>) {
-    use std::io::{Read, Seek, SeekFrom};
     const TAIL_BYTES: u64 = 64 * 1024;
     let Ok(mut f) = std::fs::File::open(path) else {
         return;
     };
     let Ok(meta) = f.metadata() else { return };
     let len = meta.len();
-    let partial = len > TAIL_BYTES;
-    if partial && f.seek(SeekFrom::Start(len - TAIL_BYTES)).is_err() {
-        return;
+    if let Ok(records) = read_records(&mut f, len, TAIL_BYTES) {
+        out.extend(records);
     }
-    let mut buf = Vec::with_capacity(TAIL_BYTES as usize);
-    if f.read_to_end(&mut buf).is_err() {
-        return;
-    }
-    let text = String::from_utf8_lossy(&buf);
-    let mut lines = text.lines();
-    // A mid-file seek leaves the first line truncated — drop it.
-    if partial {
-        let _ = lines.next();
-    }
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(rec) = serde_json::from_str::<EventRecord>(line) {
-            out.push(rec);
-        }
-    }
+}
+
+fn read_records(
+    reader: &mut (impl std::io::Read + std::io::Seek),
+    len: u64,
+    budget: u64,
+) -> std::io::Result<Vec<EventRecord>> {
+    let tail = crate::bounded_log::read_tail(reader, len, budget, false)?;
+    Ok(tail
+        .bytes
+        .split(|b| *b == b'\n')
+        .skip(usize::from(tail.partial))
+        .filter_map(|line| serde_json::from_slice::<EventRecord>(line).ok())
+        .collect())
 }
 
 /// Maximum bytes scanned per log file. 2× the supervisor's rotation
@@ -93,8 +89,9 @@ fn parse_tail_into(path: &std::path::Path, out: &mut Vec<EventRecord>) {
 /// not error.
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Read every record across all retained log files whose parsed `ts`
-/// is `>= since`, returned ascending by parsed `OffsetDateTime` (NOT by
+/// Read every record since `since`, plus the nearest older state record per
+/// service to seed availability at the window boundary. Returns ascending
+/// parsed `OffsetDateTime` order (NOT by
 /// the raw `ts` string — fractional seconds and non-Z offsets can lex-
 /// sort differently from their chronological order).
 ///
@@ -104,9 +101,7 @@ const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 /// skipped. Per-file size capped at `MAX_FILE_BYTES`; over that, the
 /// file is tail-read and the first (partial) line dropped.
 pub fn read_since(since: time::OffsetDateTime) -> std::io::Result<Vec<EventRecord>> {
-    use std::io::{BufRead, BufReader, Seek, SeekFrom};
-
-    let mut parsed: Vec<(time::OffsetDateTime, EventRecord)> = Vec::new();
+    let mut records = Vec::new();
 
     // Scan oldest backup first (.N) through active. The final sort makes
     // file order irrelevant for correctness, but oldest-first keeps the
@@ -122,40 +117,44 @@ pub fn read_since(since: time::OffsetDateTime) -> std::io::Result<Vec<EventRecor
             Err(e) => return Err(e),
         };
         let len = file.metadata()?.len();
-        let mut partial = false;
-        if len > MAX_FILE_BYTES {
-            file.seek(SeekFrom::Start(len - MAX_FILE_BYTES))?;
-            partial = true;
+        records.extend(read_records(&mut file, len, MAX_FILE_BYTES)?);
+    }
+    Ok(history_window(
+        records,
+        since,
+        time::OffsetDateTime::now_utc(),
+    ))
+}
+
+fn history_window(
+    records: Vec<EventRecord>,
+    since: time::OffsetDateTime,
+    now: time::OffsetDateTime,
+) -> Vec<EventRecord> {
+    let mut seeds =
+        std::collections::HashMap::<String, (time::OffsetDateTime, usize, EventRecord)>::new();
+    let mut parsed = Vec::new();
+    for (order, rec) in records.into_iter().enumerate() {
+        let Ok(ts) = parse_rfc3339_ts(&rec.ts) else {
+            continue;
+        };
+        if ts > now {
+            continue;
         }
-        let reader = BufReader::new(file);
-        let mut lines = reader.lines();
-        if partial {
-            // The seek landed mid-line; drop the truncated first record.
-            let _ = lines.next();
-        }
-        for line_res in lines {
-            let line = line_res?; // I/O failure mid-read → propagate.
-            if line.is_empty() {
-                continue;
-            }
-            let Ok(rec) = serde_json::from_str::<EventRecord>(&line) else {
-                continue;
-            };
-            let Ok(ts) = parse_rfc3339_ts(&rec.ts) else {
-                continue;
-            };
-            if ts >= since {
-                parsed.push((ts, rec));
-            }
+        if ts >= since {
+            parsed.push((ts, order, rec));
+        } else if seeds
+            .get(&rec.service)
+            .is_none_or(|(previous, _, _)| ts >= *previous)
+        {
+            seeds.insert(rec.service.clone(), (ts, order, rec));
         }
     }
-
-    // Sort by parsed instant — NOT the raw ts string. RFC 3339 with
-    // fractional seconds or non-Z offsets parses correctly but does not
-    // lex-sort chronologically, and downstream interval math depends on
-    // true chronological order.
-    parsed.sort_by_key(|(ts, _)| *ts);
-    Ok(parsed.into_iter().map(|(_, rec)| rec).collect())
+    parsed.extend(seeds.into_values());
+    // Different spellings can identify the same Windows service. Preserve
+    // source order on timestamp ties even when their seeds came from the map.
+    parsed.sort_by_key(|(ts, order, _)| (*ts, *order));
+    parsed.into_iter().map(|(_, _, rec)| rec).collect()
 }
 
 /// Convert an RFC 3339 UTC `ts` (as produced by the supervisor) into a
@@ -163,15 +162,19 @@ pub fn read_since(since: time::OffsetDateTime) -> std::io::Result<Vec<EventRecor
 /// characters of the input (or the empty string) on parse failure — the
 /// timestamp display must never derail rendering.
 pub fn format_local_hms(ts: &str) -> String {
+    format_hms_with(ts, |instant| time::UtcOffset::local_offset_at(instant).ok())
+}
+
+fn format_hms_with(
+    ts: &str,
+    offset_at: impl FnOnce(time::OffsetDateTime) -> Option<time::UtcOffset>,
+) -> String {
     use time::format_description::well_known::Rfc3339;
     use time::OffsetDateTime;
     let Ok(parsed) = OffsetDateTime::parse(ts, &Rfc3339) else {
         return ts.chars().take(8).collect();
     };
-    let local = match time::UtcOffset::current_local_offset() {
-        Ok(off) => parsed.to_offset(off),
-        Err(_) => parsed,
-    };
+    let local = parsed.to_offset(offset_at(parsed).unwrap_or(time::UtcOffset::UTC));
     format!(
         "{:02}:{:02}:{:02}",
         local.hour(),
@@ -188,9 +191,27 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    #[test]
+    fn history_seed_ties_keep_source_order_across_service_case_aliases() {
+        let records: Vec<EventRecord> = [
+            r#"{"ts":"2026-04-22T00:00:00Z","service":"CaseSvc","event":"started"}"#,
+            r#"{"ts":"2026-04-22T00:00:00Z","service":"CASESVC","event":"stopped"}"#,
+        ]
+        .into_iter()
+        .map(|json| serde_json::from_str(json).unwrap())
+        .collect();
+        let since = parse_rfc3339_ts("2026-04-23T00:00:00Z").unwrap();
+        let now = parse_rfc3339_ts("2026-05-23T00:00:00Z").unwrap();
+        for _ in 0..32 {
+            let history = history_window(records.clone(), since, now);
+            assert_eq!(history[0].event, EventKind::Started);
+            assert_eq!(history[1].event, EventKind::Stopped);
+        }
+    }
+
     fn isolate() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
         let guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(".").unwrap();
         std::env::set_var("NGSM_PROGRAM_DATA_DIR", dir.path());
         (guard, dir)
     }
@@ -408,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn read_since_filters_older_records() {
+    fn read_since_preserves_the_last_older_record_as_boundary_evidence() {
         let (_g, _dir) = isolate();
         write_active(&[
             r#"{"ts":"2026-04-01T00:00:00Z","service":"Old","event":"started","pid":1}"#,
@@ -416,8 +437,9 @@ mod tests {
         ]);
         let since = datetime!(2026-05-01 00:00:00 UTC);
         let out = read_since(since).unwrap();
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].service, "New");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].service, "Old");
+        assert_eq!(out[1].service, "New");
     }
 
     #[test]
@@ -571,5 +593,91 @@ mod tests {
             .expect("over-cap file should tail-read, not error");
         // Pad lines are not valid JSON → skipped. The tail record survives.
         assert!(out.iter().any(|r| r.service == "tail"));
+    }
+
+    #[test]
+    fn both_event_reader_budgets_stop_growing_unterminated_records() {
+        for budget in [64 * 1024, MAX_FILE_BYTES] {
+            for len in [10, budget * 2] {
+                let mut reader = crate::bounded_log::tests::GrowingReader::default();
+                assert!(read_records(&mut reader, len, budget).unwrap().is_empty());
+                assert_eq!(reader.read, len.min(budget));
+            }
+        }
+    }
+
+    #[test]
+    fn event_reader_handles_empty_truncated_and_partial_records() {
+        use std::io::Cursor;
+        let record = br#"{"ts":"2026-05-23T12:00:00Z","service":"A","event":"started"}"#;
+        assert!(read_records(&mut Cursor::new(b""), 0, 64)
+            .unwrap()
+            .is_empty());
+        let mut bytes = record.to_vec();
+        bytes.extend_from_slice(b"\n{\"unfinished\":");
+        let records = read_records(&mut Cursor::new(&bytes), 1000, 2000).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].service, "A");
+        assert!(read_records(&mut Cursor::new(record), 1000, 64)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn history_keeps_only_nearest_seed_and_ignores_invalid_and_future_events() {
+        let parse = |ts: &str, kind: &str| {
+            serde_json::from_str::<EventRecord>(&format!(
+                r#"{{"ts":"{ts}","service":"A","event":"{kind}"}}"#
+            ))
+            .unwrap()
+        };
+        let records = vec![
+            parse("2026-04-01T00:00:00Z", "started"),
+            parse("2026-04-20T00:00:00Z", "stopped"),
+            parse("2026-05-10T00:00:00Z", "started"),
+            parse("2026-06-01T00:00:00Z", "stopped"),
+            parse("invalid", "stopped"),
+        ];
+        let out = history_window(
+            records,
+            datetime!(2026-05-01 0:00 UTC),
+            datetime!(2026-05-23 0:00 UTC),
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].event, EventKind::Stopped);
+        assert_eq!(out[0].ts, "2026-04-20T00:00:00Z");
+        assert_eq!(out[1].event, EventKind::Started);
+    }
+
+    #[test]
+    fn local_time_uses_each_event_instant_and_falls_back_to_utc() {
+        let offset = |instant: time::OffsetDateTime| {
+            Some(
+                time::UtcOffset::from_hms(
+                    if instant.month() == time::Month::January {
+                        -5
+                    } else {
+                        -4
+                    },
+                    0,
+                    0,
+                )
+                .unwrap(),
+            )
+        };
+        assert_eq!(format_hms_with("2026-01-10T12:00:00Z", offset), "07:00:00");
+        assert_eq!(format_hms_with("2026-07-10T12:00:00Z", offset), "08:00:00");
+        assert_eq!(
+            format_hms_with("2026-07-10T12:00:00+01:00", |_| None),
+            "11:00:00"
+        );
+        assert_eq!(
+            format_hms_with("2026-07-10T12:00:00Z", |_| Some(time::UtcOffset::UTC)),
+            "12:00:00"
+        );
+        assert_eq!(
+            format_hms_with("garbage", |_| panic!("must not look up invalid date")),
+            "garbage"
+        );
     }
 }

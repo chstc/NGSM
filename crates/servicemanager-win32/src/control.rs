@@ -68,6 +68,7 @@ const DIRECTORY_DANGEROUS_ACCESS: u32 =
 enum AclObjectKind {
     File,
     Directory,
+    VolumeRoot,
 }
 
 impl AclObjectKind {
@@ -75,6 +76,7 @@ impl AclObjectKind {
         match self {
             AclObjectKind::File => "file",
             AclObjectKind::Directory => "directory",
+            AclObjectKind::VolumeRoot => "volume root",
         }
     }
 }
@@ -229,6 +231,11 @@ impl InstallStartType {
 }
 
 fn validate_service_dependency_name(value: &str) -> Result<()> {
+    if value.starts_with('+') {
+        return Err(Error::InvalidConfig(
+            "service dependency must not begin with '+'; use a group dependency instead".into(),
+        ));
+    }
     validate_service_name(value).map_err(|_| {
         Error::InvalidConfig(
             "service dependency entry must be a valid service name (non-empty, \
@@ -300,6 +307,53 @@ fn validate_password(password: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_native_string(field: &str, value: &str) -> Result<()> {
+    if value.contains('\0') {
+        return Err(Error::InvalidConfig(format!(
+            "{field} must not contain an embedded NUL"
+        )));
+    }
+    Ok(())
+}
+
+/// Pure preflight for native edits. Call before any managed or SCM mutation.
+pub fn validate_native_update(
+    name: &str,
+    display_name: Option<&str>,
+    description: Option<&str>,
+    dependencies: Option<&ServiceDependencies>,
+    account: Option<&str>,
+    password: Option<&str>,
+) -> Result<()> {
+    validate_service_name(name)?;
+    if let Some(display) = display_name {
+        validate_native_string("display name", display)?;
+        if display.encode_utf16().count() > 256 {
+            return Err(Error::InvalidConfig(
+                "display name exceeds 256 UTF-16 code units".into(),
+            ));
+        }
+    }
+    if let Some(description) = description {
+        validate_native_string("description", description)?;
+    }
+    if let Some(dependencies) = dependencies {
+        dependencies.validate()?;
+    }
+    if let Some(account) = account {
+        validate_account(account)?;
+    }
+    if let Some(password) = password {
+        validate_password(password)?;
+        if account.is_none() {
+            return Err(Error::InvalidConfig(
+                "--password-stdin requires --account so the SCM can apply the password".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn zeroize_wide_buffer(buf: &mut [u16]) {
     for unit in buf {
         // SAFETY: `unit` is a valid mutable reference. Volatile writes prevent
@@ -315,7 +369,23 @@ fn zeroize_wide_buffer(buf: &mut [u16]) {
 /// `binary_path` (which should already include any args the service runner
 /// needs, e.g. `\"C:\\…\\ngsm.exe\" run-service MyService`).
 pub fn install_service(opts: &InstallOptions) -> Result<()> {
-    validate_service_name(&opts.name)?;
+    validate_install_options(opts)?;
+    install_validated_service(opts)
+}
+
+fn validate_install_options(opts: &InstallOptions) -> Result<()> {
+    validate_native_update(
+        &opts.name,
+        Some(&opts.display_name),
+        opts.description.as_deref(),
+        Some(&opts.dependencies),
+        opts.account.as_deref(),
+        opts.password.as_deref(),
+    )?;
+    validate_native_string("binary path", &opts.binary_path)
+}
+
+fn install_validated_service(opts: &InstallOptions) -> Result<()> {
     let scm = open_scm(SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE)?;
     let name = to_wide(&opts.name);
     let display = to_wide(&opts.display_name);
@@ -351,12 +421,12 @@ pub fn install_service(opts: &InstallOptions) -> Result<()> {
     // `name`, `display`, `path`, and optional dependency/account/password buffers
     // are null-terminated UTF-16 vecs that outlive the call. The returned service
     // handle is wrapped in ScHandle for RAII close.
-    unsafe {
-        let handle_result = CreateServiceW(
+    let handle_result = unsafe {
+        CreateServiceW(
             scm.0,
             PCWSTR::from_raw(name.as_ptr()),
             PCWSTR::from_raw(display.as_ptr()),
-            SERVICE_QUERY_STATUS | SERVICE_CHANGE_CONFIG,
+            SERVICE_QUERY_STATUS | SERVICE_CHANGE_CONFIG | DELETE_ACCESS,
             SERVICE_WIN32_OWN_PROCESS,
             opts.start_type.to_win32(),
             SERVICE_ERROR_NORMAL,
@@ -366,16 +436,41 @@ pub fn install_service(opts: &InstallOptions) -> Result<()> {
             dependencies_pcwstr,
             account_pcwstr,
             password_pcwstr,
-        );
-        if let Some(password) = &mut password_wide {
-            zeroize_wide_buffer(password);
-        }
-        let handle = handle_result
-            .map_err(|e| map_win_error(&format!("CreateService({})", opts.name), e))?;
-        let svc = crate::handles::ScHandle(handle);
-        if let Some(description) = opts.description.as_deref() {
-            change_service_description(&svc, &opts.name, description)?;
-        }
+        )
+    };
+    if let Some(password) = &mut password_wide {
+        zeroize_wide_buffer(password);
+    }
+    complete_install(
+        handle_result
+            .map(crate::handles::ScHandle)
+            .map_err(|e| map_win_error(&format!("CreateService({})", opts.name), e)),
+        |svc| match opts.description.as_deref() {
+            Some(description) => change_service_description(svc, &opts.name, description),
+            None => Ok(()),
+        },
+        |svc| {
+            // SAFETY: only the just-created service reaches this closure, and
+            // its still-owned handle explicitly includes DELETE access.
+            unsafe { DeleteService(svc.0) }
+                .map_err(|e| map_win_error("DeleteService(install rollback)", e))
+        },
+    )
+}
+
+fn complete_install<T>(
+    created: Result<T>,
+    configure: impl FnOnce(&T) -> Result<()>,
+    rollback: impl FnOnce(&T) -> Result<()>,
+) -> Result<()> {
+    let service = created?;
+    if let Err(primary) = configure(&service) {
+        return Err(Error::Scm(match rollback(&service) {
+            Ok(()) => format!("service installation failed and was rolled back: {primary}"),
+            Err(cleanup) => {
+                format!("service installation failed ({primary}); rollback also failed ({cleanup})")
+            }
+        }));
     }
     Ok(())
 }
@@ -387,22 +482,21 @@ pub fn install_service(opts: &InstallOptions) -> Result<()> {
 pub fn build_run_service_command(name: &str) -> Result<String> {
     validate_service_name(name)?;
     let exe = std::env::current_exe().map_err(|e| Error::other(format!("current_exe: {e}")))?;
-    validate_runner_location(&exe)?;
-    let exe_str = exe.to_string_lossy();
-    // Reject paths that do not round-trip cleanly through UTF-8. The SCM stores
-    // image paths as wide strings and we need what's on disk to match what we
-    // write. Lossy conversion silently substitutes U+FFFD for unrepresentable
-    // characters, which would corrupt the stored path.
-    if exe_str.contains('\u{FFFD}') {
-        return Err(Error::other(format!(
-            "runner path contains non-UTF-8 characters and cannot be safely \
-             stored in the SCM image path: {}",
-            exe.display()
-        )));
-    }
+    command_for_validated_runner(name, &exe, validate_runner_location)
+}
+
+fn command_for_validated_runner(
+    name: &str,
+    original: &Path,
+    validate: impl FnOnce(&Path) -> Result<PathBuf>,
+) -> Result<String> {
+    let canonical = validate(original)?;
+    let exe_str = canonical.to_str().ok_or_else(|| {
+        Error::other("runner path contains invalid Unicode and cannot be stored losslessly")
+    })?;
     Ok(format!(
         "{} run-service {}",
-        quote_windows_arg(&exe_str),
+        quote_windows_arg(exe_str),
         quote_windows_arg(name)
     ))
 }
@@ -412,11 +506,11 @@ pub fn build_run_service_command(name: &str) -> Result<String> {
 /// runner kept under the user profile, a temp directory, a network share, or
 /// a permissive ACL could later be swapped for an attacker-controlled binary
 /// that then runs with the service account's privileges.
-fn validate_runner_location(exe: &Path) -> Result<()> {
+fn validate_runner_location(exe: &Path) -> Result<PathBuf> {
     let canonical = canonicalize_runner_path(exe)?;
     validate_runner_location_heuristics(&canonical)?;
     validate_runner_acl_chain(&canonical)?;
-    Ok(())
+    Ok(canonical)
 }
 
 fn canonicalize_runner_path(exe: &Path) -> Result<PathBuf> {
@@ -426,11 +520,7 @@ fn canonicalize_runner_path(exe: &Path) -> Result<PathBuf> {
             exe.display()
         ))
     })?;
-    let canonical_lossy = canonical.to_string_lossy();
-    // Fail closed: if the canonical path cannot be represented in UTF-8, the
-    // comparison below would silently match U+FFFD replacement characters and
-    // could pass the security check against a different path.
-    if canonical_lossy.contains('\u{FFFD}') {
+    if canonical.to_str().is_none() {
         return Err(Error::other(format!(
             "cannot validate runner location: path contains non-UTF-8 characters: {}",
             canonical.display()
@@ -440,14 +530,10 @@ fn canonicalize_runner_path(exe: &Path) -> Result<PathBuf> {
 }
 
 fn validate_runner_location_heuristics(canonical: &Path) -> Result<()> {
-    let canonical_lossy = canonical.to_string_lossy();
-    if canonical_lossy.contains('\u{FFFD}') {
-        return Err(Error::other(format!(
-            "cannot validate runner location: path contains non-UTF-8 characters: {}",
-            canonical.display()
-        )));
-    }
-    let lower = canonical_lossy.to_ascii_lowercase();
+    let canonical_text = canonical.to_str().ok_or_else(|| {
+        Error::other("cannot validate runner location: path contains invalid Unicode")
+    })?;
+    let lower = canonical_text.to_ascii_lowercase();
 
     // A network / UNC location is outside this machine's administrative
     // control and is never a trusted install location. `canonicalize` emits
@@ -482,13 +568,10 @@ fn validate_runner_location_heuristics(canonical: &Path) -> Result<()> {
         let Ok(dir) = std::fs::canonicalize(&raw_dir) else {
             continue;
         };
-        let dir_lossy = dir.to_string_lossy();
-        // Skip env-var directories whose paths contain non-UTF-8 characters:
-        // a U+FFFD substitution could make the prefix check match incorrectly.
-        if dir_lossy.contains('\u{FFFD}') {
+        let Some(dir_text) = dir.to_str() else {
             continue;
-        }
-        let dir_lower = dir_lossy.to_ascii_lowercase();
+        };
+        let dir_lower = dir_text.to_ascii_lowercase();
         let dir_path = dir_lower.strip_prefix(r"\\?\").unwrap_or(&dir_lower);
         if dir_path.is_empty() {
             continue;
@@ -525,28 +608,33 @@ fn runner_acl_targets(canonical: &Path) -> Vec<(PathBuf, AclObjectKind)> {
     let mut targets = vec![(canonical.to_path_buf(), AclObjectKind::File)];
     let mut parent = canonical.parent();
     while let Some(dir) = parent {
-        if !dir
+        let is_root = !dir
             .components()
-            .any(|component| matches!(component, Component::Normal(_)))
-        {
+            .any(|component| matches!(component, Component::Normal(_)));
+        targets.push((
+            dir.to_path_buf(),
+            if is_root {
+                AclObjectKind::VolumeRoot
+            } else {
+                AclObjectKind::Directory
+            },
+        ));
+        if is_root {
             break;
         }
-        targets.push((dir.to_path_buf(), AclObjectKind::Directory));
         parent = dir.parent();
     }
     targets
 }
 
 fn validate_path_acl(path: &Path, object_kind: AclObjectKind) -> std::result::Result<(), String> {
-    let path_lossy = path.to_string_lossy();
-    if path_lossy.contains('\u{FFFD}') {
-        return Err(format!(
-            "cannot validate ACL for {} '{}': path contains non-UTF-8 characters",
-            object_kind.label(),
-            path.display()
-        ));
-    }
-    let wide_path = to_wide(path_lossy.as_ref());
+    let path_text = path.to_str().ok_or_else(|| {
+        format!(
+            "cannot validate ACL for {}: path contains invalid Unicode",
+            object_kind.label()
+        )
+    })?;
+    let wide_path = to_wide(path_text);
 
     let mut owner = PSID::default();
     let mut sd = PSECURITY_DESCRIPTOR::default();
@@ -687,6 +775,11 @@ fn dangerous_access_mask(object_kind: AclObjectKind) -> u32 {
     match object_kind {
         AclObjectKind::File => FILE_DANGEROUS_ACCESS,
         AclObjectKind::Directory => DIRECTORY_DANGEROUS_ACCESS,
+        // Creating siblings under a volume root cannot replace this existing
+        // protected path. Deleting children or taking over the root can.
+        AclObjectKind::VolumeRoot => {
+            GENERIC_ALL.0 | WRITE_DAC.0 | WRITE_OWNER.0 | FILE_DELETE_CHILD.0
+        }
     }
 }
 
@@ -883,7 +976,14 @@ pub fn update_native_config(
     account: Option<&str>,
     password: Option<&str>,
 ) -> Result<()> {
-    validate_service_name(name)?;
+    validate_native_update(
+        name,
+        display_name,
+        description,
+        dependencies,
+        account,
+        password,
+    )?;
     let scm = open_scm(SC_MANAGER_CONNECT)?;
     let svc = open_service_handle(&scm, name, SERVICE_CHANGE_CONFIG)?;
 
@@ -952,7 +1052,20 @@ pub fn update_native_config(
     }
 
     if let Some(description) = description {
-        change_service_description(&svc, name, description)?;
+        if let Err(error) = change_service_description(&svc, name, description) {
+            if display_name.is_some()
+                || start_type.is_some()
+                || dependencies.is_some()
+                || account.is_some()
+                || password.is_some()
+            {
+                return Err(Error::Scm(format!(
+                    "native fields were changed, but description update failed: {error}; \
+                     no automatic rollback was attempted (prior account passwords are unreadable)"
+                )));
+            }
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -997,6 +1110,7 @@ fn change_service_description(
     name: &str,
     value: &str,
 ) -> Result<()> {
+    validate_native_string("description", value)?;
     let mut description_wide = to_wide(value);
     let description = SERVICE_DESCRIPTIONW {
         lpDescription: PWSTR(description_wide.as_mut_ptr()),
@@ -1085,6 +1199,205 @@ pub fn control_service(name: &str, signal: ServiceControlSignal) -> Result<Servi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_install_preflight_rejects_a_nul_binary_command_without_scm() {
+        let options = InstallOptions {
+            name: "NeverCreated".into(),
+            display_name: "NeverCreated".into(),
+            description: None,
+            binary_path: "C:\\ngsm.exe\0hidden".into(),
+            start_type: InstallStartType::Manual,
+            dependencies: ServiceDependencies::default(),
+            account: None,
+            password: None,
+        };
+        let error = validate_install_options(&options).unwrap_err();
+        assert!(matches!(error, Error::InvalidConfig(_)));
+        assert!(error.to_string().contains("binary path"));
+    }
+    #[test]
+    fn install_transaction_rolls_back_only_successfully_created_services() {
+        use std::cell::Cell;
+        let rollback_count = Cell::new(0);
+        let result = complete_install::<()>(
+            Err(Error::Scm("already exists".into())),
+            |_| panic!("configure must not run after failed creation"),
+            |_| {
+                rollback_count.set(rollback_count.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(result.unwrap_err().to_string().contains("already exists"));
+        assert_eq!(rollback_count.get(), 0);
+        let result = complete_install(
+            Ok(()),
+            |_| Err(Error::Scm("description failed".into())),
+            |_| {
+                rollback_count.set(rollback_count.get() + 1);
+                Ok(())
+            },
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("description failed") && message.contains("rolled back"));
+        assert_eq!(rollback_count.get(), 1);
+        let message = complete_install(
+            Ok(()),
+            |_| Err(Error::Scm("primary".into())),
+            |_| Err(Error::Scm("cleanup".into())),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("primary") && message.contains("cleanup"));
+        assert!(complete_install(Ok(()), |_| Ok(()), |_| panic!("no rollback on success")).is_ok());
+    }
+
+    #[test]
+    fn install_transaction_releases_owned_handles_on_all_outcomes() {
+        use std::cell::Cell;
+        struct Owned<'a>(&'a Cell<u32>);
+        impl Drop for Owned<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let closed = Cell::new(0);
+        assert!(complete_install(Ok(Owned(&closed)), |_| Ok(()), |_| Ok(())).is_ok());
+        assert_eq!(closed.get(), 1);
+        assert!(complete_install(
+            Ok(Owned(&closed)),
+            |_| Err(Error::other("failure")),
+            |_| Err(Error::other("rollback"))
+        )
+        .is_err());
+        assert_eq!(closed.get(), 2);
+    }
+
+    #[test]
+    fn runner_command_persists_only_the_validated_canonical_target() {
+        let original = Path::new(r"C:\ReplaceableAlias\ngsm.exe");
+        let target = PathBuf::from(r"\\?\C:\Program Files\NGSM\ngsm.exe");
+        let command = command_for_validated_runner("Name With Spaces", original, |path| {
+            assert_eq!(path, original);
+            Ok(target.clone())
+        })
+        .unwrap();
+        assert_eq!(
+            command,
+            format!(
+                "{} run-service \"Name With Spaces\"",
+                quote_windows_arg(target.to_str().unwrap())
+            )
+        );
+        assert!(!command.contains("ReplaceableAlias"));
+    }
+
+    #[test]
+    fn runner_command_preserves_literal_replacement_character_but_rejects_bad_utf16() {
+        use std::os::windows::ffi::OsStringExt;
+        let valid = PathBuf::from("C:\\\u{fffd}\\ngsm.exe");
+        assert!(
+            command_for_validated_runner("Svc", &valid, |path| Ok(path.into()))
+                .unwrap()
+                .contains('\u{fffd}')
+        );
+        let invalid = PathBuf::from(std::ffi::OsString::from_wide(&[67, 58, 92, 0xd800]));
+        assert!(command_for_validated_runner("Svc", &invalid, |path| Ok(path.into())).is_err());
+    }
+
+    #[test]
+    fn root_acl_allows_new_siblings_but_not_replacement_or_takeover() {
+        let principal = AclPrincipal::KnownUntrusted("Authenticated Users");
+        evaluate_acl_decision(
+            trusted_owner(),
+            &[grant(principal, FILE_ADD_SUBDIRECTORY.0 | FILE_ADD_FILE.0)],
+            AclObjectKind::VolumeRoot,
+        )
+        .unwrap();
+        for mask in [
+            FILE_DELETE_CHILD.0,
+            WRITE_DAC.0,
+            WRITE_OWNER.0,
+            GENERIC_ALL.0,
+        ] {
+            assert!(evaluate_acl_decision(
+                trusted_owner(),
+                &[grant(principal, mask)],
+                AclObjectKind::VolumeRoot
+            )
+            .is_err());
+        }
+        assert!(
+            evaluate_acl_decision(AclPrincipal::Unknown, &[], AclObjectKind::VolumeRoot).is_err()
+        );
+    }
+
+    #[test]
+    fn native_update_preflight_rejects_nuls_and_keeps_secrets_private() {
+        assert!(validate_native_update("Svc", Some("a\0b"), None, None, None, None).is_err());
+        assert!(validate_native_update("Svc", None, Some("a\0b"), None, None, None).is_err());
+        assert!(validate_native_update("Svc", None, None, None, Some("a\0b"), None).is_err());
+        let error = validate_native_update(
+            "Svc",
+            None,
+            None,
+            None,
+            Some(".\\account"),
+            Some("secret\0secret"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!error.contains("secret"));
+        assert!(validate_native_update("Svc", None, None, None, None, Some("secret")).is_err());
+    }
+
+    #[test]
+    fn native_update_preflight_preserves_supported_empty_and_unicode_values() {
+        assert!(validate_native_update(
+            "服务",
+            Some("Display \u{fffd}"),
+            Some("one\ntwo"),
+            None,
+            None,
+            None,
+        )
+        .is_ok());
+        assert!(validate_native_update("Svc", None, Some(""), None, None, None).is_ok());
+        assert!(
+            validate_native_update("Svc", Some(&"x".repeat(257)), None, None, None, None).is_err()
+        );
+    }
+
+    #[test]
+    fn service_dependencies_do_not_reinterpret_plus_names_as_groups() {
+        for name in ["+", "+Worker"] {
+            let dependencies = ServiceDependencies {
+                services: vec![name.to_string()],
+                groups: Vec::new(),
+            };
+            assert!(
+                dependencies.validate().is_err(),
+                "{name} cannot be encoded as a service dependency"
+            );
+            assert!(encode_dependencies(&dependencies).is_err());
+        }
+    }
+
+    #[test]
+    fn runner_acl_chain_includes_the_volume_root() {
+        for (runner, root) in [
+            (r"C:\NGSM\ngsm.exe", r"C:\"),
+            (r"C:\ngsm.exe", r"C:\"),
+            (r"\\?\C:\NGSM\ngsm.exe", r"\\?\C:\"),
+        ] {
+            assert!(
+                runner_acl_targets(std::path::Path::new(runner))
+                    .iter()
+                    .any(|(path, _)| path == std::path::Path::new(root)),
+                "replacement-safety proof omitted the root of {runner}"
+            );
+        }
+    }
     use std::sync::Mutex;
 
     /// The six env vars that `validate_runner_location_heuristics` inspects.

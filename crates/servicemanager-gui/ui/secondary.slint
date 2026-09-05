@@ -110,6 +110,7 @@ export struct RecoveryRow {
 // 4-way exit-action picker: 0 Restart, 1 Ignore, 2 Exit, 3 Suicide.
 component ActionPick inherits Rectangle {
     in property <int> value;
+    in property <bool> enabled: true;
     callback changed(int);
     width: 354px;
     height: 32px;
@@ -131,6 +132,7 @@ component ActionPick inherits Rectangle {
                 vertical-alignment: center;
             }
             TouchArea {
+                enabled: root.enabled;
                 mouse-cursor: pointer;
                 clicked => { root.changed(i); }
             }
@@ -141,6 +143,7 @@ component ActionPick inherits Rectangle {
 // A labelled millisecond text field.
 component NumField inherits Rectangle {
     in property <string> label;
+    in property <bool> enabled: true;
     in-out property <string> text;
     width: 230px;
     height: 58px;
@@ -162,6 +165,7 @@ component NumField inherits Rectangle {
                 padding-right: 10px;
                 ti := TextInput {
                     text <=> root.text;
+                    enabled: root.enabled;
                     color: Theme.text;
                     font-size: 13px;
                     single-line: true;
@@ -175,6 +179,7 @@ component NumField inherits Rectangle {
 // One editable per-exit-code row.
 component ExitRow inherits Rectangle {
     in property <int> index;
+    in property <bool> enabled: true;
     in property <string> exit-code;
     in property <int> action;
     callback code-changed(int, string);
@@ -195,6 +200,7 @@ component ExitRow inherits Rectangle {
                 padding-right: 10px;
                 cti := TextInput {
                     text: root.exit-code;
+                    enabled: root.enabled;
                     color: Theme.text;
                     font-size: 13px;
                     single-line: true;
@@ -205,10 +211,12 @@ component ExitRow inherits Rectangle {
         }
         ActionPick {
             value: root.action;
+            enabled: root.enabled;
             changed(a) => { root.action-changed(root.index, a); }
         }
         GhostButton {
             text: "Remove";
+            enabled: root.enabled;
             tint: Theme.red;
             clicked => { root.remove(root.index); }
         }
@@ -217,6 +225,7 @@ component ExitRow inherits Rectangle {
 
 export component RecoveryView inherits Rectangle {
     in property <bool> available;
+    in property <bool> busy;
     in property <string> service-name;
     in property <string> placeholder;
     in-out property <string> restart-delay;
@@ -234,6 +243,7 @@ export component RecoveryView inherits Rectangle {
 
     if !root.available : Card {
         VerticalLayout {
+            padding: 24px;
             alignment: center;
             spacing: 6px;
             Text {
@@ -248,15 +258,20 @@ export component RecoveryView inherits Rectangle {
                 color: Theme.text-faint;
                 font-size: 13px;
                 horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+            HorizontalLayout {
+                alignment: center;
+                GhostButton { text: "Reload"; enabled: !root.busy; clicked => { root.reload(); } }
             }
         }
     }
 
     if root.available : Card {
+        min-height: 0px;
         VerticalLayout {
             padding: 24px;
             spacing: 14px;
-            alignment: start;
             Text {
                 text: "Recovery policy — " + root.service-name;
                 color: Theme.text;
@@ -269,10 +284,12 @@ export component RecoveryView inherits Rectangle {
                 NumField {
                     label: "Restart delay (ms)";
                     text <=> root.restart-delay;
+                    enabled: !root.busy;
                 }
                 NumField {
                     label: "Throttle window (ms)";
                     text <=> root.throttle;
+                    enabled: !root.busy;
                 }
             }
             Text {
@@ -282,6 +299,7 @@ export component RecoveryView inherits Rectangle {
             }
             ActionPick {
                 value: root.default-action;
+                enabled: !root.busy;
                 changed(a) => { root.default-action = a; }
             }
             Rectangle { height: 1px; background: Theme.divider; }
@@ -298,34 +316,51 @@ export component RecoveryView inherits Rectangle {
                 Rectangle { }
                 GhostButton {
                     text: "Add exit code";
+                    enabled: !root.busy;
                     clicked => { root.add-row(); }
                 }
             }
-            for row[i] in root.rows : ExitRow {
-                index: i;
-                exit-code: row.exit-code;
-                action: row.action;
-                code-changed(idx, t) => { root.code-changed(idx, t); }
-                action-changed(idx, a) => { root.action-changed(idx, a); }
-                remove(idx) => { root.remove-row(idx); }
+            ScrollView {
+                min-height: 0px;
+                vertical-stretch: 1;
+                VerticalLayout {
+                    alignment: start;
+                    spacing: 10px;
+                    for row[i] in root.rows : ExitRow {
+                        index: i;
+                        enabled: !root.busy;
+                        exit-code: row.exit-code;
+                        action: row.action;
+                        code-changed(idx, t) => { root.code-changed(idx, t); }
+                        action-changed(idx, a) => { root.action-changed(idx, a); }
+                        remove(idx) => { root.remove-row(idx); }
+                    }
+                }
             }
-            Rectangle { }
             HorizontalLayout {
                 spacing: 10px;
                 alignment: start;
                 AccentButton {
                     text: "Save recovery policy";
+                    enabled: !root.busy;
                     clicked => { root.save(); }
                 }
                 GhostButton {
                     text: "Reload";
+                    enabled: !root.busy;
                     clicked => { root.reload(); }
                 }
-                Text {
-                    text: root.status;
-                    color: Theme.text-faint;
-                    font-size: 12px;
-                    vertical-alignment: center;
+            }
+            ScrollView {
+                height: root.status == "" ? 0px : 44px;
+                VerticalLayout {
+                    alignment: start;
+                    Text {
+                        text: root.status;
+                        color: Theme.text-faint;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
                 }
             }
         }

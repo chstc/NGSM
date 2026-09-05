@@ -44,8 +44,8 @@ Only the latest published release receives fixes. There is no LTS line.
 
 | Version | Status |
 |---|---|
-| v0.3.2 | Supported (current) |
-| < v0.3.2 | Not supported — upgrade to v0.3.2 |
+| v0.3.3 | Supported (current) |
+| < v0.3.3 | Not supported — upgrade to v0.3.3 |
 
 NGSM is not yet at v1.0; expect occasional breaking changes between minor
 versions until then. The on-disk schema (registry layout, event log format)
@@ -115,14 +115,23 @@ Signing is on the project's backlog but not yet committed to a timeline.
 
 ### Build provenance
 
-- **Release source is public.** Release binaries are produced from the public
-  repository/tag for the release being published.
-- **Current public CI is PR validation only.** The workflow at
-  `src-rust/.github/workflows/ci.yml` runs fmt, clippy, tests, debug build,
-  and release build on `windows-latest` with Rust 1.90, but it does not run
-  on release tags and does not upload release artifacts. Until a release
-  workflow exists, do not treat the PR CI build as provenance for a published
-  `ngsm.exe`.
+- **Release source is public and bundled.** Releases include the exact
+  tagged project source and vendored Cargo dependencies with their license
+  files. The packaged executable is built from those bundled sources with
+  `cargo build --frozen`, disabling Cargo network access during compilation.
+- **Tag-triggered release builds.** `.github/workflows/release.yml` reuses
+  `.github/workflows/ci.yml` to gate releases on formatting, Clippy, tests
+  in default and broker-enabled configurations, and builds with Rust 1.90.0.
+  Actions are pinned to immutable revisions. Packaging rejects a dirty
+  worktree or mismatched tag/package/binary version and creates a draft
+  release for inspection, rather than silently publishing it.
+- **Integrity and build metadata.** `SHA256SUMS.txt` covers the executable,
+  source bundle, notices, and `BUILD-INFO.json`, which records the source
+  commit, target, toolchain, and GitHub Actions run when built in CI.
+  These are integrity/provenance records, not an Authenticode signature or
+  a claim that arbitrary local toolchains produce byte-identical binaries.
+- **Earlier releases.** Releases before v0.3.3 were uploaded manually and
+  do not have this bundled-source release workflow or metadata.
 - **No telemetry, no network calls** outside what the managed child process
   itself does. NGSM does not phone home.
 
@@ -136,6 +145,10 @@ The single `ngsm.exe` statically links:
 - Standard Rust ecosystem crates (serde, time, clap, etc.) — see
   [Cargo.lock](Cargo.lock) in the repo for the exact resolved dependency
   graph.
+
+See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) and the release's
+`GPL-3.0.txt`, `DEPENDENCIES.txt`, and source archive for the license text,
+package inventory, and corresponding dependency sources.
 
 ### What's not bundled
 
@@ -162,14 +175,21 @@ The single `ngsm.exe` statically links:
 
 ### Audit history
 
-The codebase has been through two end-to-end code reviews since v0.3.0:
+The codebase has received multiple end-to-end review and remediation
+cycles since v0.3.0:
 
 - **v0.3.1 remediation cycle** — 20 findings addressed across HIGH /
   MEDIUM / LOW. See [CHANGELOG.md](CHANGELOG.md) v0.3.1 entry.
 - **v0.3.2 remediation cycle** — 15 additional findings addressed. See
   CHANGELOG.md v0.3.2 entry.
+- **v0.3.3 quality and stability cycle** — independent domain reviews and
+  architect validation across runtime lifecycle, logging, native ownership
+  and ACLs, registry/configuration consistency, broker request lifetime,
+  desktop state, and release provenance. The behavioral specifications,
+  regression criteria, and completion ledger are in
+  [QUALITY-REVIEW.md](QUALITY-REVIEW.md).
 
-Both cycles' commit history is preserved in the repository.
+The review cycles' commit history is preserved in the repository.
 
 ---
 
